@@ -65,6 +65,10 @@ The web UI provides:
 - session auto-pass toggle
 - agent online/last-seen status
 
+The MVP web implementation is a Vite + Vue 3 + TypeScript application under
+`web/`. The Go server serves the built `web/dist` directory in production, while
+Vite proxies API calls to the Go server during local frontend development.
+
 ### Lark Bot
 
 The bot supports text commands:

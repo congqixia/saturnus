@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -25,7 +26,7 @@ type server struct {
 func main() {
 	addr := flag.String("addr", ":8787", "listen address")
 	data := flag.String("data", "saturnus.db", "sqlite data file")
-	staticDir := flag.String("static", "web/static", "static web directory")
+	staticDir := flag.String("static", "web/dist", "static web directory")
 	flag.Parse()
 
 	st, err := store.Open(*data)
@@ -53,7 +54,7 @@ func main() {
 	mux.HandleFunc("GET /api/approvals/{request_id}", s.getApproval)
 	mux.HandleFunc("POST /api/approvals/{request_id}/decision", s.decideApproval)
 	mux.HandleFunc("POST /lark/events", s.larkEvents)
-	mux.Handle("/", http.FileServer(http.Dir(*staticDir)))
+	mux.Handle("/", spaFileServer(*staticDir))
 
 	log.Printf("saturnus server listening on http://localhost%s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, withCORS(mux)))
@@ -397,5 +398,21 @@ func withCORS(next http.Handler) http.Handler {
 			return
 		}
 		next.ServeHTTP(w, r)
+	})
+}
+
+func spaFileServer(staticDir string) http.Handler {
+	files := http.FileServer(http.Dir(staticDir))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			files.ServeHTTP(w, r)
+			return
+		}
+		path := filepath.Join(staticDir, filepath.Clean(r.URL.Path))
+		if info, err := os.Stat(path); err == nil && !info.IsDir() {
+			files.ServeHTTP(w, r)
+			return
+		}
+		http.ServeFile(w, r, filepath.Join(staticDir, "index.html"))
 	})
 }

@@ -6,6 +6,15 @@ Lark bot webhook.
 
 ## Run
 
+Build the frontend first:
+
+```sh
+cd web
+npm install
+npm run build
+cd ..
+```
+
 ```sh
 go run ./cmd/saturnus-server -addr :8787
 ```
@@ -17,6 +26,15 @@ http://localhost:8787
 ```
 
 Data is stored in `saturnus.db` by default.
+
+For frontend development:
+
+```sh
+cd web
+npm run dev
+```
+
+The Vite dev server proxies `/api` and `/lark` to `http://localhost:8787`.
 
 ## Agent CLI
 

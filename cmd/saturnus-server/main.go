@@ -24,7 +24,7 @@ type server struct {
 
 func main() {
 	addr := flag.String("addr", ":8787", "listen address")
-	data := flag.String("data", "saturnus-data.json", "json data file")
+	data := flag.String("data", "saturnus.db", "sqlite data file")
 	staticDir := flag.String("static", "web/static", "static web directory")
 	flag.Parse()
 

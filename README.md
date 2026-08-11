@@ -16,7 +16,7 @@ Open:
 http://localhost:8787
 ```
 
-Data is stored in `saturnus-data.json` by default.
+Data is stored in `saturnus.db` by default.
 
 ## Agent CLI
 
@@ -50,6 +50,11 @@ curl -X PATCH http://localhost:8787/api/sessions/<session_id>/autopass \
 
 Auto-pass is intentionally bounded. Only low-risk requests are approved
 automatically.
+
+## Storage
+
+The MVP uses SQLite through `internal/store`. The server creates and migrates
+the schema on startup. Use `-data <path>` to point at a different database file.
 
 ## Lark Bot
 

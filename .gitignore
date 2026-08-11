@@ -1,4 +1,7 @@
 saturnus-data.json
 saturnus-data.json.tmp
+saturnus.db
+saturnus.db-shm
+saturnus.db-wal
 bin/
 .DS_Store

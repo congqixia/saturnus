@@ -99,9 +99,9 @@ Auto-pass must be bounded rather than globally unconditional.
 
 ## MVP Data Storage
 
-The first version uses a single JSON file, defaulting to `saturnus-data.json`.
-This keeps development dependency-free. The storage layer is isolated under
-`internal/store` so SQLite/Postgres can replace it later.
+The first version now uses SQLite, defaulting to `saturnus.db`. The storage
+layer is isolated under `internal/store` so Postgres can replace it later if
+team deployment needs it.
 
 ## API Sketch
 

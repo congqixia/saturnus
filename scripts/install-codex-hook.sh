@@ -4,7 +4,7 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 mkdir -p "$root/bin"
-go build -o "$root/bin/saturnus-agent" "$root/cmd/saturnus-agent"
+make -C "$root" build-agent
 
 cat <<MSG
 Built:
@@ -14,7 +14,7 @@ Codex hook config:
   $root/.codex/hooks.json
 
 Before starting Codex, make sure Saturnus is running:
-  go run ./cmd/saturnus-server -addr :8787
+  make run-server
 
 Optional environment:
   export SATURNUS_SERVER=http://localhost:8787

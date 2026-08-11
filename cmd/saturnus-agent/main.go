@@ -2,14 +2,19 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
+
+	"saturnus/internal/larkbridge"
 )
 
 type apiClient struct {
@@ -26,7 +31,7 @@ func main() {
 	client := apiClient{base: strings.TrimRight(*serverURL, "/"), http: &http.Client{Timeout: 30 * time.Second}}
 	args := flag.Args()
 	if len(args) == 0 {
-		fatalf("usage: saturnus-agent [flags] register|heartbeat|event|approval|codex-hook")
+		fatalf("usage: saturnus-agent [flags] register|heartbeat|event|approval|codex-hook|lark-bridge")
 	}
 	switch args[0] {
 	case "register":
@@ -42,6 +47,8 @@ func main() {
 		runApproval(client, *sessionID)
 	case "codex-hook":
 		runCodexHook(client, *agentID, *sessionID)
+	case "lark-bridge":
+		runLarkBridge()
 	default:
 		fatalf("unknown command: %s", args[0])
 	}
@@ -201,6 +208,15 @@ func runCodexHook(client apiClient, agentID, sessionID string) {
 			hookLog("event upload failed: %v", err)
 		}
 		printJSON(map[string]any{})
+	}
+}
+
+func runLarkBridge() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	bridge := larkbridge.New(larkbridge.DefaultConfig())
+	if err := bridge.Run(ctx); err != nil {
+		fatalf("%v", err)
 	}
 }
 

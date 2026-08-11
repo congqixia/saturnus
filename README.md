@@ -15,8 +15,10 @@ npm run build
 cd ..
 ```
 
+Build and run the server binary:
+
 ```sh
-go run ./cmd/saturnus-server -addr :8787
+make run-server
 ```
 
 Open:
@@ -82,7 +84,7 @@ Set credentials before starting the server:
 export LARK_APP_ID=cli_xxx
 export LARK_APP_SECRET=xxx
 export LARK_NOTIFY_CHAT_ID=oc_xxx
-go run ./cmd/saturnus-server -addr :8787
+make run-server
 ```
 
 Configure the Lark event callback URL to:
@@ -100,6 +102,45 @@ Supported text commands:
 - `/sat deny <request_id> <reason>`
 - `/sat autopass on <session_id>`
 - `/sat autopass off <session_id>`
+
+### Local Lark CLI Bridge
+
+For local development, you can receive Lark messages through `lark-cli` instead
+of exposing `/lark/events` with a public callback URL.
+
+Start Saturnus in one terminal:
+
+```sh
+export LARK_APP_ID=cli_xxx
+export LARK_APP_SECRET=xxx
+export LARK_NOTIFY_CHAT_ID=oc_xxx
+make run-server
+```
+
+Start the bridge in another terminal:
+
+```sh
+make lark-bridge
+```
+
+The bridge runs:
+
+```text
+lark-cli event consume im.message.receive_v1 --as bot
+```
+
+It converts each consumed message into the same `/lark/events` shape the server
+already handles. This mode does not need ngrok or a public callback URL, but it
+does require `lark-cli` to be configured with the app and bot scopes.
+
+Useful bridge environment variables:
+
+```sh
+export SATURNUS_SERVER=http://localhost:8787
+export SATURNUS_LARK_CLI=lark-cli
+export SATURNUS_LARK_EVENT_KEY=im.message.receive_v1
+export SATURNUS_LARK_AS=bot
+```
 
 ## Codex Hook Direction
 

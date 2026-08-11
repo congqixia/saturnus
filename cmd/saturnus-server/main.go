@@ -229,11 +229,12 @@ func (s *server) larkEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	text, chatID := extractLarkText(payload)
-	if !strings.HasPrefix(strings.TrimSpace(text), "/sat") {
+	command := satCommand(text)
+	if command == "" {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 		return
 	}
-	reply := s.handleBotCommand(text)
+	reply := s.handleBotCommand(command)
 	if chatID != "" {
 		_ = s.lark.SendText("chat_id", chatID, reply)
 	}
@@ -348,6 +349,17 @@ func extractLarkText(payload map[string]any) (string, string) {
 		return parsed.Text, chatID
 	}
 	return content, chatID
+}
+
+func satCommand(text string) string {
+	text = strings.TrimSpace(text)
+	if strings.HasPrefix(text, "/sat") {
+		return text
+	}
+	if idx := strings.Index(text, "/sat"); idx >= 0 {
+		return strings.TrimSpace(text[idx:])
+	}
+	return ""
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, out any) bool {

@@ -107,18 +107,29 @@ Use `saturnus-agent codex-hook` as the bridge command. It reads hook JSON from
 stdin and maps `SessionStart`, `PermissionRequest`, and other hook events into
 Saturnus API calls.
 
+Build the local hook binary:
+
+```sh
+./scripts/install-codex-hook.sh
+```
+
 For a practical setup, export:
 
 ```sh
 export SATURNUS_SERVER=http://localhost:8787
-export SATURNUS_SESSION_ID=<session_id>
+export SATURNUS_CODEX_APPROVAL_WAIT=9m
 ```
 
-Then configure the AI CLI hook command to invoke:
+The repo-local Codex hook config is checked in at:
 
-```sh
-go run ./cmd/saturnus-agent codex-hook
+```text
+.codex/hooks.json
 ```
 
-The MVP intentionally keeps the hook adapter generic; the next iteration should
-pin the exact Codex hook response schema and add installation helpers.
+It invokes:
+
+```text
+scripts/saturnus-codex-hook.sh
+```
+
+See `docs/plan/codex-integration.md` for the full setup and behavior guide.

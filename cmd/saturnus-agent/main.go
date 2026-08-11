@@ -134,43 +134,168 @@ func runApproval(client apiClient, sessionID string) {
 func runCodexHook(client apiClient, agentID, sessionID string) {
 	payload := readStdinObject()
 	hookType := firstString(payload, "hook_event_name", "type", "event")
+	if sessionID == "" {
+		sessionID = firstString(payload, "session_id")
+	}
 	switch hookType {
 	case "SessionStart":
-		runRegister(client, agentID)
+		session, err := registerCodexSession(client, agentID, sessionID, payload)
+		if err != nil {
+			hookLog("session registration failed: %v", err)
+			printJSON(map[string]any{})
+			return
+		}
+		printJSON(map[string]any{
+			"hookSpecificOutput": map[string]any{
+				"hookEventName":     "SessionStart",
+				"additionalContext": "Saturnus is tracking this Codex session as " + session.ID + ".",
+			},
+		})
 	case "PermissionRequest":
 		if sessionID == "" {
-			sessionID = firstString(payload, "session_id")
+			hookLog("permission request missing session_id")
+			printJSON(map[string]any{})
+			return
 		}
-		require(sessionID, "session id")
+		if err := ensureCodexSession(client, agentID, sessionID, payload); err != nil {
+			hookLog("session ensure failed: %v", err)
+		}
 		req := map[string]any{
 			"session_id": sessionID,
-			"tool_name":  firstString(payload, "tool_name", "command", "permission"),
-			"tool_input": payload,
+			"tool_name":  firstString(payload, "tool_name", "permission"),
+			"tool_input": codexToolInput(payload),
 		}
 		var out struct {
 			Approval map[string]any `json:"approval"`
 			Auto     bool           `json:"auto"`
 		}
-		client.post("/api/approvals", req, &out)
-		status, _ := out.Approval["status"].(string)
-		if out.Auto || status == "approved" {
-			printJSON(map[string]any{"decision": "allow"})
+		if err := client.postErr("/api/approvals", req, &out); err != nil {
+			hookLog("approval creation failed: %v", err)
+			printJSON(map[string]any{})
 			return
 		}
-		printJSON(map[string]any{"decision": "ask", "request_id": out.Approval["id"]})
+		status, _ := out.Approval["status"].(string)
+		if out.Auto || status == "approved" {
+			printCodexPermissionDecision("allow", "")
+			return
+		}
+		requestID, _ := out.Approval["id"].(string)
+		decision, reason := waitForCodexDecision(client, requestID)
+		switch decision {
+		case "approved":
+			printCodexPermissionDecision("allow", "")
+		case "denied":
+			printCodexPermissionDecision("deny", reason)
+		default:
+			hookLog("approval %s still pending; deferring to native Codex approval", requestID)
+			printJSON(map[string]any{})
+		}
 	default:
 		if sessionID == "" {
-			sessionID = firstString(payload, "session_id")
-		}
-		if sessionID == "" {
-			printJSON(map[string]any{"ignored": true, "reason": "missing session id"})
+			printJSON(map[string]any{})
 			return
 		}
 		event := map[string]any{"type": hookType, "payload": payload}
 		var out map[string]any
-		client.post("/api/sessions/"+sessionID+"/events", event, &out)
-		printJSON(out)
+		if err := client.postErr("/api/sessions/"+sessionID+"/events", event, &out); err != nil {
+			hookLog("event upload failed: %v", err)
+		}
+		printJSON(map[string]any{})
 	}
+}
+
+func registerCodexSession(client apiClient, agentID string, sessionID string, hook map[string]any) (struct{ ID string }, error) {
+	host, _ := os.Hostname()
+	if agentID == "" {
+		agentID = env("SATURNUS_AGENT_ID", "codex-"+host)
+	}
+	if sessionID == "" {
+		sessionID = firstString(hook, "session_id")
+	}
+	payload := map[string]any{
+		"agent": map[string]any{
+			"id":      agentID,
+			"name":    env("SATURNUS_AGENT_NAME", "codex"),
+			"type":    "codex",
+			"host":    host,
+			"version": env("SATURNUS_AGENT_VERSION", "codex-hook"),
+		},
+		"session": map[string]any{
+			"id":              sessionID,
+			"cwd":             firstString(hook, "cwd"),
+			"repo":            env("SATURNUS_REPO", ""),
+			"branch":          env("SATURNUS_BRANCH", ""),
+			"model":           firstString(hook, "model"),
+			"auto_pass":       env("SATURNUS_AUTO_PASS", "") == "1",
+			"auto_pass_scope": "codex",
+		},
+	}
+	var out struct {
+		Session struct {
+			ID string `json:"id"`
+		} `json:"session"`
+	}
+	if err := client.postErr("/api/agents/register", payload, &out); err != nil {
+		return struct{ ID string }{}, err
+	}
+	return struct{ ID string }{ID: out.Session.ID}, nil
+}
+
+func ensureCodexSession(client apiClient, agentID, sessionID string, hook map[string]any) error {
+	var out map[string]any
+	if err := client.getErr("/api/sessions/"+sessionID, &out); err == nil {
+		return nil
+	}
+	_, err := registerCodexSession(client, agentID, sessionID, hook)
+	return err
+}
+
+func codexToolInput(payload map[string]any) any {
+	if value, ok := payload["tool_input"]; ok {
+		return value
+	}
+	return payload
+}
+
+func waitForCodexDecision(client apiClient, requestID string) (string, string) {
+	wait := env("SATURNUS_CODEX_APPROVAL_WAIT", env("SATURNUS_APPROVAL_WAIT", "9m"))
+	timeout, err := time.ParseDuration(wait)
+	if err != nil {
+		timeout = 9 * time.Minute
+	}
+	if timeout <= 0 {
+		return "", ""
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		time.Sleep(2 * time.Second)
+		var got struct {
+			Approval map[string]any `json:"approval"`
+		}
+		if err := client.getErr("/api/approvals/"+requestID, &got); err != nil {
+			hookLog("approval poll failed: %v", err)
+			continue
+		}
+		status, _ := got.Approval["status"].(string)
+		reason, _ := got.Approval["reason"].(string)
+		if status == "approved" || status == "denied" {
+			return status, reason
+		}
+	}
+	return "", ""
+}
+
+func printCodexPermissionDecision(behavior, message string) {
+	decision := map[string]any{"behavior": behavior}
+	if message != "" {
+		decision["message"] = message
+	}
+	printJSON(map[string]any{
+		"hookSpecificOutput": map[string]any{
+			"hookEventName": "PermissionRequest",
+			"decision":      decision,
+		},
+	})
 }
 
 func (c apiClient) get(path string, out any) {
@@ -178,34 +303,51 @@ func (c apiClient) get(path string, out any) {
 	if err != nil {
 		fatalf("%v", err)
 	}
-	c.do(req, out)
+	if err := c.do(req, out); err != nil {
+		fatalf("%v", err)
+	}
 }
 
 func (c apiClient) post(path string, payload any, out any) {
+	if err := c.postErr(path, payload, out); err != nil {
+		fatalf("%v", err)
+	}
+}
+
+func (c apiClient) getErr(path string, out any) error {
+	req, err := http.NewRequest(http.MethodGet, c.base+path, nil)
+	if err != nil {
+		return err
+	}
+	return c.do(req, out)
+}
+
+func (c apiClient) postErr(path string, payload any, out any) error {
 	body, _ := json.Marshal(payload)
 	req, err := http.NewRequest(http.MethodPost, c.base+path, bytes.NewReader(body))
 	if err != nil {
-		fatalf("%v", err)
+		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	c.do(req, out)
+	return c.do(req, out)
 }
 
-func (c apiClient) do(req *http.Request, out any) {
+func (c apiClient) do(req *http.Request, out any) error {
 	resp, err := c.http.Do(req)
 	if err != nil {
-		fatalf("%v", err)
+		return err
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 300 {
-		fatalf("%s: %s", resp.Status, strings.TrimSpace(string(body)))
+		return fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(body)))
 	}
 	if out != nil && len(body) > 0 {
 		if err := json.Unmarshal(body, out); err != nil {
-			fatalf("%v", err)
+			return err
 		}
 	}
+	return nil
 }
 
 func readStdinObject() map[string]any {
@@ -254,4 +396,8 @@ func printJSON(v any) {
 func fatalf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 	os.Exit(1)
+}
+
+func hookLog(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "saturnus-agent: "+format+"\n", args...)
 }

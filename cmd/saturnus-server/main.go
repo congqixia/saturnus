@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -9,8 +10,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"saturnus/internal/lark"
@@ -23,16 +26,32 @@ type server struct {
 	lark  *lark.Client
 }
 
+const shutdownTimeout = 15 * time.Second
+
 func main() {
 	addr := flag.String("addr", ":8787", "listen address")
 	data := flag.String("data", "saturnus.db", "sqlite data file")
 	staticDir := flag.String("static", "web/dist", "static web directory")
 	flag.Parse()
 
-	st, err := store.Open(*data)
-	if err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := run(ctx, *addr, *data, *staticDir); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func run(ctx context.Context, addr, data, staticDir string) (err error) {
+	st, err := store.Open(data)
+	if err != nil {
+		return fmt.Errorf("open store: %w", err)
+	}
+	defer func() {
+		if closeErr := st.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close store: %w", closeErr))
+		}
+	}()
 	s := &server{
 		store: st,
 		lark: lark.New(lark.Config{
@@ -54,10 +73,62 @@ func main() {
 	mux.HandleFunc("GET /api/approvals/{request_id}", s.getApproval)
 	mux.HandleFunc("POST /api/approvals/{request_id}/decision", s.decideApproval)
 	mux.HandleFunc("POST /lark/events", s.larkEvents)
-	mux.Handle("/", spaFileServer(*staticDir))
+	mux.Handle("/", spaFileServer(staticDir))
 
-	log.Printf("saturnus server listening on http://localhost%s", *addr)
-	log.Fatal(http.ListenAndServe(*addr, withCORS(mux)))
+	httpServer := &http.Server{
+		Addr:              addr,
+		Handler:           withCORS(mux),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	log.Printf("saturnus server listening on %s", addr)
+	return serveUntilShutdown(ctx, httpServer, shutdownTimeout)
+}
+
+type gracefulHTTPServer interface {
+	ListenAndServe() error
+	Shutdown(context.Context) error
+	Close() error
+}
+
+func serveUntilShutdown(ctx context.Context, srv gracefulHTTPServer, timeout time.Duration) error {
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- srv.ListenAndServe()
+	}()
+
+	select {
+	case err := <-serveErr:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return fmt.Errorf("serve: %w", err)
+	case <-ctx.Done():
+		log.Printf("shutdown signal received; allowing up to %s for active requests", timeout)
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		if closeErr := srv.Close(); closeErr != nil {
+			return fmt.Errorf("graceful shutdown: %w; force close: %v", err, closeErr)
+		}
+		return fmt.Errorf("graceful shutdown: %w", err)
+	}
+
+	select {
+	case err := <-serveErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("serve during shutdown: %w", err)
+		}
+		log.Printf("saturnus server stopped")
+		return nil
+	case <-shutdownCtx.Done():
+		if err := srv.Close(); err != nil {
+			return fmt.Errorf("server did not stop after shutdown: %w; force close: %v", shutdownCtx.Err(), err)
+		}
+		return fmt.Errorf("server did not stop after shutdown: %w", shutdownCtx.Err())
+	}
 }
 
 func (s *server) health(w http.ResponseWriter, r *http.Request) {

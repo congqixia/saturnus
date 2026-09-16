@@ -21,11 +21,12 @@ type ToolArgs struct {
 	BaseBranch string
 	Worktree   string
 	Guide      string
+	ReviewID   string
 }
 
 const maxResultBytes = 512 * 1024
 
-var DefaultCommandTemplate = `run "Review GitHub PR {{.Repo}}#{{.PRNumber}} ({{.PRURL}}). The repository is already checked out at {{.Worktree}}. Fetch and check out the PR head yourself, then review the changes. Focus on correctness, security and style; be concise with file:line references.{{if .Guide}} Review guidelines: {{.Guide | shellquote}}{{end}} End your review with a line starting with REVIEW SUMMARY: followed by your conclusion."`
+var DefaultCommandTemplate = `run --title "saturnus-review-{{.ReviewID}}" "Review GitHub PR {{.Repo}}#{{.PRNumber}} ({{.PRURL}}). The repository is already checked out at {{.Worktree}}. Fetch and check out the PR head yourself, then review the changes. Focus on correctness, security and style; be concise with file:line references.{{if .Guide}} Review guidelines: {{.Guide | shellquote}}{{end}} End your review with a line starting with REVIEW SUMMARY: followed by your conclusion."`
 
 func RenderCommand(templateText string, args ToolArgs) ([]string, error) {
 	tmpl, err := template.New("review").Funcs(template.FuncMap{"shellquote": shellquote}).Parse(templateText)

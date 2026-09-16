@@ -106,6 +106,7 @@ type ReviewRequest struct {
 	MessageID       string    `json:"message_id"`
 	Tool            string    `json:"tool"`
 	TaskID          string    `json:"task_id"`
+	SessionID       string    `json:"session_id"`
 	ResultText      string    `json:"result_text"`
 	Error           string    `json:"error"`
 	CreatedAt       time.Time `json:"created_at"`
@@ -242,6 +243,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			message_id TEXT NOT NULL DEFAULT '',
 			tool TEXT NOT NULL DEFAULT '',
 			task_id TEXT NOT NULL DEFAULT '',
+			session_id TEXT NOT NULL DEFAULT '',
 			result_text TEXT NOT NULL DEFAULT '',
 			error TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL,
@@ -257,7 +259,35 @@ func (s *Store) migrate(ctx context.Context) error {
 			return err
 		}
 	}
+	if err := s.ensureColumn(ctx, "review_requests", "session_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (s *Store) ensureColumn(ctx context.Context, table, column, definition string) error {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull, pk int
+		var dflt any
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if rows.Err() != nil {
+		return rows.Err()
+	}
+	_, err = s.db.ExecContext(ctx, `ALTER TABLE `+table+` ADD COLUMN `+column+` `+definition)
+	return err
 }
 
 func (s *Store) RegisterAgentSession(agent Agent, session Session) (Agent, Session, error) {
@@ -707,12 +737,12 @@ func (s *Store) CreateReview(req ReviewRequest) (ReviewRequest, error) {
 		INSERT INTO review_requests (
 			id, thread_id, status, pr_url, repo, pr_number, title, base_branch,
 			requester_open_id, requester_name, chat_id, message_id, tool, task_id,
-			result_text, error, created_at, updated_at, completed_at
+			session_id, result_text, error, created_at, updated_at, completed_at
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, req.ID, req.ThreadID, req.Status, req.PRURL, req.Repo, req.PRNumber, req.Title, req.BaseBranch,
 		req.RequesterOpenID, req.RequesterName, req.ChatID, req.MessageID, req.Tool, req.TaskID,
-		req.ResultText, req.Error, timeText(req.CreatedAt), timeText(req.UpdatedAt), nullableTimeText(req.CompletedAt)); err != nil {
+		req.SessionID, req.ResultText, req.Error, timeText(req.CreatedAt), timeText(req.UpdatedAt), nullableTimeText(req.CompletedAt)); err != nil {
 		return ReviewRequest{}, err
 	}
 	if err := audit(ctx, tx, "requester:"+req.RequesterOpenID, "review.create", req.ID, mustJSON(req)); err != nil {
@@ -725,10 +755,30 @@ func (s *Store) GetReview(id string) (ReviewRequest, error) {
 	row := s.db.QueryRow(`
 		SELECT id, thread_id, status, pr_url, repo, pr_number, title, base_branch,
 			requester_open_id, requester_name, chat_id, message_id, tool, task_id,
-			result_text, error, created_at, updated_at, completed_at
+			session_id, result_text, error, created_at, updated_at, completed_at
 		FROM review_requests
 		WHERE id = ?
 	`, id)
+	req, err := scanReviewRequest(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ReviewRequest{}, ErrNotFound
+	}
+	if err != nil {
+		return ReviewRequest{}, err
+	}
+	return req, nil
+}
+
+func (s *Store) GetReviewByPR(repo string, prNumber int) (ReviewRequest, error) {
+	row := s.db.QueryRow(`
+		SELECT id, thread_id, status, pr_url, repo, pr_number, title, base_branch,
+			requester_open_id, requester_name, chat_id, message_id, tool, task_id,
+			session_id, result_text, error, created_at, updated_at, completed_at
+		FROM review_requests
+		WHERE repo = ? AND pr_number = ?
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, repo, prNumber)
 	req, err := scanReviewRequest(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ReviewRequest{}, ErrNotFound
@@ -743,7 +793,7 @@ func (s *Store) ListReviews(status string) []ReviewRequest {
 	query := `
 		SELECT id, thread_id, status, pr_url, repo, pr_number, title, base_branch,
 			requester_open_id, requester_name, chat_id, message_id, tool, task_id,
-			result_text, error, created_at, updated_at, completed_at
+			session_id, result_text, error, created_at, updated_at, completed_at
 		FROM review_requests
 	`
 	args := []any{}
@@ -781,11 +831,11 @@ func (s *Store) UpdateReview(req ReviewRequest) (ReviewRequest, error) {
 		UPDATE review_requests
 		SET status = ?, pr_url = ?, repo = ?, pr_number = ?, title = ?, base_branch = ?,
 			requester_open_id = ?, requester_name = ?, chat_id = ?, message_id = ?, tool = ?,
-			task_id = ?, result_text = ?, error = ?, updated_at = ?, completed_at = ?
+			task_id = ?, session_id = ?, result_text = ?, error = ?, updated_at = ?, completed_at = ?
 		WHERE id = ?
 	`, req.Status, req.PRURL, req.Repo, req.PRNumber, req.Title, req.BaseBranch,
 		req.RequesterOpenID, req.RequesterName, req.ChatID, req.MessageID, req.Tool,
-		req.TaskID, req.ResultText, req.Error, timeText(req.UpdatedAt), nullableTimeText(req.CompletedAt),
+		req.TaskID, req.SessionID, req.ResultText, req.Error, timeText(req.UpdatedAt), nullableTimeText(req.CompletedAt),
 		req.ID); err != nil {
 		return ReviewRequest{}, err
 	}
@@ -962,7 +1012,7 @@ func scanReviewRequest(row reviewRequestScanner) (ReviewRequest, error) {
 	if err := row.Scan(
 		&req.ID, &req.ThreadID, &req.Status, &req.PRURL, &req.Repo, &req.PRNumber, &req.Title, &req.BaseBranch,
 		&req.RequesterOpenID, &req.RequesterName, &req.ChatID, &req.MessageID, &req.Tool, &req.TaskID,
-		&req.ResultText, &req.Error, &createdAt, &updatedAt, &completedAt,
+		&req.SessionID, &req.ResultText, &req.Error, &createdAt, &updatedAt, &completedAt,
 	); err != nil {
 		return ReviewRequest{}, err
 	}

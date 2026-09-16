@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"saturnus/internal/lark"
 	"saturnus/internal/store"
@@ -243,6 +244,131 @@ func TestLoadGuide(t *testing.T) {
 	}
 	if got != "" {
 		t.Fatalf("expected empty guide for checkout without guide file, got %q", got)
+	}
+}
+
+func TestServiceSubmitRerunsTerminatedReview(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	svc := New(st, lark.New(lark.Config{}), Config{
+		Enabled:      true,
+		AllowedUsers: []string{"ou_me"},
+		Repos:        map[string]string{"a/b": t.TempDir()},
+	})
+	ctx := MessageContext{
+		Text:         "review https://github.com/a/b/pull/9",
+		ChatID:       "oc_c",
+		SenderOpenID: "ou_me",
+		MessageID:    "om_1",
+	}
+	req, err := svc.Submit(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Status = "succeeded"
+	req.ResultText = "done"
+	req.CompletedAt = time.Now()
+	if _, err := st.UpdateReview(req); err != nil {
+		t.Fatal(err)
+	}
+
+	req2, err := svc.Submit(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req2.ID != req.ID {
+		t.Fatalf("expected same review id for re-run, got %q want %q", req2.ID, req.ID)
+	}
+	if req2.Status != "pending" {
+		t.Fatalf("expected reset to pending, got %q", req2.Status)
+	}
+	if req2.ResultText != "" {
+		t.Fatalf("expected cleared result, got %q", req2.ResultText)
+	}
+}
+
+func TestServiceSubmitRejectsActiveDuplicate(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	svc := New(st, lark.New(lark.Config{}), Config{
+		Enabled:      true,
+		AllowedUsers: []string{"ou_me"},
+		Repos:        map[string]string{"a/b": t.TempDir()},
+	})
+	ctx := MessageContext{
+		Text:         "review https://github.com/a/b/pull/5",
+		ChatID:       "oc_c",
+		SenderOpenID: "ou_me",
+		MessageID:    "om_1",
+	}
+	if _, err := svc.Submit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Submit(ctx); err != ErrAlreadyPending {
+		t.Fatalf("expected ErrAlreadyPending for active duplicate, got %v", err)
+	}
+}
+
+func TestIsReviewer(t *testing.T) {
+	svc := New(nil, lark.New(lark.Config{}), Config{
+		AllowedUsers:   []string{"ou_a"},
+		ReviewerOpenID: "ou_r",
+	})
+	if !svc.isReviewer("ou_r") {
+		t.Fatal("expected configured reviewer")
+	}
+	if !svc.isReviewer("ou_a") {
+		t.Fatal("expected allowed user to be treated as reviewer")
+	}
+	if svc.isReviewer("ou_x") {
+		t.Fatal("expected unrelated user rejected")
+	}
+	if svc.isReviewer("") {
+		t.Fatal("expected empty sender rejected")
+	}
+}
+
+func TestCaptureSessionID(t *testing.T) {
+	repoDir := t.TempDir()
+	script := filepath.Join(t.TempDir(), "tool.sh")
+	content := `#!/bin/sh
+cat <<'EOF'
+[{"id":"ses_new","title":"saturnus-review-rvw_x","directory":"` + repoDir + `","updated":2000},{"id":"ses_old","title":"other","directory":"` + repoDir + `","updated":1000},{"id":"ses_otherdir","title":"saturnus-review-rvw_x","directory":"/elsewhere","updated":3000}]
+EOF
+`
+	if err := os.WriteFile(script, []byte(content), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	svc := New(nil, lark.New(lark.Config{}), Config{Tool: script})
+
+	if got := svc.captureSessionID(repoDir, "rvw_x"); got != "ses_new" {
+		t.Fatalf("title match = %q, want ses_new", got)
+	}
+	if got := svc.captureSessionID(repoDir, "rvw_z"); got != "ses_new" {
+		t.Fatalf("fallback by dir recency = %q, want ses_new", got)
+	}
+}
+
+func TestTaskMembers(t *testing.T) {
+	got := taskMembers("ou_r", "ou_q")
+	if len(got) != 2 || got[0] != "ou_r" || got[1] != "ou_q" {
+		t.Fatalf("taskMembers = %#v", got)
+	}
+	got = taskMembers("ou_same", "ou_same")
+	if len(got) != 1 || got[0] != "ou_same" {
+		t.Fatalf("expected dedupe, got %#v", got)
+	}
+	got = taskMembers("", "")
+	if len(got) != 0 {
+		t.Fatalf("expected empty members, got %#v", got)
 	}
 }
 

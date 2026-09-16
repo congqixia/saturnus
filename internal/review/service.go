@@ -32,6 +32,8 @@ type Config struct {
 	Guides          map[string]string
 }
 
+var ErrAlreadyPending = errors.New("review already in progress")
+
 type MessageContext struct {
 	Text          string
 	ChatID        string
@@ -116,6 +118,7 @@ func (s *Service) Start() {
 	if _, err := s.store.FailInterruptedReviews(); err != nil {
 		logf("fail interrupted reviews: %v", err)
 	}
+	s.BackfillRequesterNames()
 	for i := 0; i < s.cfg.MaxConcurrent; i++ {
 		s.wg.Add(1)
 		go s.worker()
@@ -164,23 +167,35 @@ func (s *Service) Submit(ctx MessageContext) (store.ReviewRequest, error) {
 	if _, ok := s.repoDirFor(pr.Repo); !ok {
 		return store.ReviewRequest{}, fmt.Errorf("repo %s is not in the review whitelist (SATURNUS_REVIEW_REPOS)", pr.Repo)
 	}
-	for _, existing := range s.store.ListReviews("pending") {
-		if existing.Repo == pr.Repo && existing.PRNumber == pr.PRNumber {
-			return existing, errors.New("review already pending: " + existing.ID)
-		}
-	}
 	thread, err := s.store.GetOrCreateReviewThread(ctx.ChatID, ctx.RootMessageID, ctx.Topic, []string{ctx.SenderOpenID})
 	if err != nil {
 		return store.ReviewRequest{}, err
 	}
-	requesterName := ctx.SenderName
-	if requesterName == "" && s.lark.Enabled() {
-		if name, err := s.lark.GetUserName(ctx.SenderOpenID); err != nil {
-			logf("resolve requester name: %v", err)
-		} else {
-			requesterName = name
+	requesterName := s.resolveName(ctx)
+
+	existing, err := s.store.GetReviewByPR(pr.Repo, pr.PRNumber)
+	if err == nil {
+		switch existing.Status {
+		case "pending", "reviewing":
+			return existing, ErrAlreadyPending
 		}
+		existing.Status = "pending"
+		existing.ResultText, existing.Error = "", ""
+		existing.CompletedAt = time.Time{}
+		existing.SessionID = ""
+		existing.RequesterOpenID = ctx.SenderOpenID
+		existing.RequesterName = requesterName
+		existing.ChatID = ctx.ChatID
+		existing.MessageID = ctx.MessageID
+		existing.ThreadID = thread.ID
+		if _, err := s.store.UpdateReview(existing); err != nil {
+			return store.ReviewRequest{}, err
+		}
+		s.maybeCreateTask(&existing)
+		s.enqueue(existing.ID)
+		return existing, nil
 	}
+
 	req := store.ReviewRequest{
 		ThreadID:        thread.ID,
 		Status:          "pending",
@@ -197,19 +212,39 @@ func (s *Service) Submit(ctx MessageContext) (store.ReviewRequest, error) {
 	if err != nil {
 		return store.ReviewRequest{}, err
 	}
-	if s.cfg.CreateTask {
-		taskID, err := s.createTask(req)
-		if err != nil {
-			logf("create feishu task: %v", err)
-		} else if taskID != "" {
-			req.TaskID = taskID
-			if _, err := s.store.UpdateReview(req); err != nil {
-				logf("store task id: %v", err)
-			}
-		}
-	}
+	s.maybeCreateTask(&req)
 	s.enqueue(req.ID)
 	return req, nil
+}
+
+func (s *Service) resolveName(ctx MessageContext) string {
+	name := ctx.SenderName
+	if name == "" && ctx.SenderOpenID != "" && s.lark.Enabled() {
+		if n, err := s.lark.GetUserName(ctx.SenderOpenID); err != nil {
+			logf("resolve requester name: %v", err)
+		} else {
+			name = n
+		}
+	}
+	return name
+}
+
+func (s *Service) maybeCreateTask(req *store.ReviewRequest) {
+	if !s.cfg.CreateTask {
+		return
+	}
+	taskID, err := s.createTask(*req)
+	if err != nil {
+		logf("create feishu task: %v", err)
+		return
+	}
+	if taskID == "" {
+		return
+	}
+	req.TaskID = taskID
+	if _, err := s.store.UpdateReview(*req); err != nil {
+		logf("store task id: %v", err)
+	}
 }
 
 func (s *Service) List(status string) []store.ReviewRequest {
@@ -242,6 +277,9 @@ func (s *Service) FormatOne(req store.ReviewRequest) string {
 	}
 	if req.TaskID != "" {
 		fmt.Fprintf(&b, "\ntask_id=%s", req.TaskID)
+	}
+	if req.SessionID != "" {
+		fmt.Fprintf(&b, "\nsession=%s (continue: %s run --session %s)", req.SessionID, s.cfg.Tool, req.SessionID)
 	}
 	if req.RequesterName != "" || req.RequesterOpenID != "" {
 		name := req.RequesterName
@@ -279,6 +317,46 @@ func (s *Service) repoDirFor(repo string) (string, bool) {
 	return dir, ok
 }
 
+func (s *Service) isReviewer(openID string) bool {
+	if openID == "" {
+		return false
+	}
+	if s.cfg.ReviewerOpenID != "" && openID == s.cfg.ReviewerOpenID {
+		return true
+	}
+	return s.allowed(openID)
+}
+
+func (s *Service) ReplyToRequester(reviewID, senderOpenID, text string) error {
+	if !s.lark.Enabled() {
+		return errors.New("lark client disabled")
+	}
+	if !s.isReviewer(senderOpenID) {
+		return errors.New("sender is not the reviewer")
+	}
+	req, err := s.store.GetReview(reviewID)
+	if err != nil {
+		return err
+	}
+	if req.RequesterOpenID == "" {
+		return errors.New("review has no requester")
+	}
+	msg := fmt.Sprintf("[reply to review %s] %s\n%s", req.ID, req.PRURL, text)
+	return s.lark.SendTextToUser(req.RequesterOpenID, msg)
+}
+
+func (s *Service) BackfillRequesterNames() {
+	for _, r := range s.store.ListReviews("") {
+		if r.RequesterName == "" && r.RequesterOpenID != "" {
+			s.resolveRequesterName(&r)
+		}
+	}
+}
+
+func (s *Service) ResolveRequesterName(req *store.ReviewRequest) {
+	s.resolveRequesterName(req)
+}
+
 func (s *Service) loadGuide(repo, repoRoot string) (string, error) {
 	if path, ok := s.cfg.Guides[repo]; ok && path != "" {
 		data, err := os.ReadFile(path)
@@ -312,14 +390,42 @@ func (s *Service) createTask(req store.ReviewRequest) (string, error) {
 	if !s.lark.Enabled() {
 		return "", nil
 	}
+	members := taskMembers(s.cfg.ReviewerOpenID, req.RequesterOpenID)
+	if len(members) == 0 {
+		return "", nil
+	}
+	requester := req.RequesterName
+	if requester == "" {
+		requester = req.RequesterOpenID
+	}
 	return s.lark.CreateTask(lark.CreateTaskInput{
-		Summary:      fmt.Sprintf("Review PR %s#%d", req.Repo, req.PRNumber),
-		Description:  fmt.Sprintf("PR review request %s\n%s", req.ID, req.PRURL),
-		Due:          time.Now().Add(time.Duration(s.cfg.TaskDueHours) * time.Hour),
-		MemberOpenID: s.cfg.ReviewerOpenID,
-		SourceTitle:  "Saturnus PR Review",
-		SourceURL:    req.PRURL,
+		Summary:       fmt.Sprintf("Review PR %s#%d", req.Repo, req.PRNumber),
+		Description:   fmt.Sprintf("PR review request %s\n%s\nrequester=%s", req.ID, req.PRURL, requester),
+		Due:           time.Now().Add(time.Duration(s.cfg.TaskDueHours) * time.Hour),
+		MemberOpenIDs: members,
+		SourceTitle:   "Saturnus PR Review",
+		SourceURL:     req.PRURL,
 	})
+}
+
+func taskMembers(reviewerOpenID, requesterOpenID string) []string {
+	var out []string
+	for _, id := range []string{reviewerOpenID, requesterOpenID} {
+		if id == "" {
+			continue
+		}
+		dup := false
+		for _, existing := range out {
+			if existing == id {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 func (s *Service) process(id string) {
@@ -376,6 +482,7 @@ func (s *Service) process(id string) {
 		BaseBranch: req.BaseBranch,
 		Worktree:   repoRoot,
 		Guide:      guide,
+		ReviewID:   req.ID,
 	})
 	if err != nil {
 		s.finish(&req, "failed", "", "render command: "+err.Error())
@@ -422,6 +529,9 @@ func (s *Service) process(id string) {
 	}
 
 	output, runErr := Run(ctx, s.cfg.Tool, args, repoRoot, sink)
+	if sessionID := s.captureSessionID(repoRoot, req.ID); sessionID != "" {
+		req.SessionID = sessionID
+	}
 	clean := stripANSI(output)
 	if runErr != nil {
 		s.finish(&req, "failed", clean, runErr.Error())
@@ -465,6 +575,9 @@ func (s *Service) FormatResult(req store.ReviewRequest) string {
 	}
 	if req.TaskID != "" {
 		fmt.Fprintf(&b, "\ntask_id=%s", req.TaskID)
+	}
+	if req.SessionID != "" {
+		fmt.Fprintf(&b, "\nsession=%s (continue: %s run --session %s)", req.SessionID, s.cfg.Tool, req.SessionID)
 	}
 	if req.Error != "" {
 		fmt.Fprintf(&b, "\nerror=%s", req.Error)

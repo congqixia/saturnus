@@ -67,12 +67,12 @@ func (c *Client) ReplyMessage(messageID, text string) error {
 }
 
 type CreateTaskInput struct {
-	Summary      string
-	Description  string
-	Due          time.Time
-	MemberOpenID string
-	SourceTitle  string
-	SourceURL    string
+	Summary       string
+	Description   string
+	Due           time.Time
+	MemberOpenIDs []string
+	SourceTitle   string
+	SourceURL     string
 }
 
 func (c *Client) CreateTask(input CreateTaskInput) (string, error) {
@@ -83,10 +83,17 @@ func (c *Client) CreateTask(input CreateTaskInput) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	members := []map[string]any{}
+	for _, id := range input.MemberOpenIDs {
+		if id == "" {
+			continue
+		}
+		members = append(members, map[string]any{"id": id, "type": "user", "role": "assignee"})
+	}
 	payload := map[string]any{
 		"summary":     input.Summary,
 		"description": input.Description,
-		"members":     []map[string]any{{"id": input.MemberOpenID, "type": "user"}},
+		"members":     members,
 	}
 	if !input.Due.IsZero() {
 		payload["due"] = map[string]any{"timestamp": fmt.Sprintf("%d", input.Due.UnixMilli())}
@@ -119,7 +126,7 @@ func (c *Client) CreateTask(input CreateTaskInput) (string, error) {
 		return "", err
 	}
 	if resp.StatusCode >= 300 || out.Code != 0 {
-		return "", fmt.Errorf("lark create task failed: %s %s", resp.Status, out.Msg)
+		return "", fmt.Errorf("lark create task failed: code=%d msg=%q status=%s", out.Code, out.Msg, resp.Status)
 	}
 	return out.Data.Task.GUID, nil
 }

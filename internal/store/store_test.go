@@ -171,8 +171,17 @@ func TestStoreReviewFlow(t *testing.T) {
 	}
 	req.Status = "succeeded"
 	req.ResultText = "LGTM"
+	req.SessionID = "ses_x"
 	if _, err := st.UpdateReview(req); err != nil {
 		t.Fatal(err)
+	}
+
+	byPR, err := st.GetReviewByPR("congqixia/saturnus", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if byPR.ID != req.ID || byPR.SessionID != "ses_x" || byPR.Status != "succeeded" {
+		t.Fatalf("GetReviewByPR mismatch: %#v", byPR)
 	}
 
 	reviews := st.ListReviews("")

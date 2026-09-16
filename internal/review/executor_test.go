@@ -39,15 +39,18 @@ func TestSplitCommand(t *testing.T) {
 }
 
 func TestRenderCommand(t *testing.T) {
-	args := ToolArgs{Repo: "congqixia/saturnus", PRNumber: 42, PRURL: "https://github.com/congqixia/saturnus/pull/42"}
+	args := ToolArgs{Repo: "congqixia/saturnus", PRNumber: 42, PRURL: "https://github.com/congqixia/saturnus/pull/42", ReviewID: "rvw_x"}
 	got, err := RenderCommand(DefaultCommandTemplate, args)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 2 || got[0] != "run" {
+	if len(got) != 4 || got[0] != "run" || got[1] != "--title" {
 		t.Fatalf("unexpected args: %#v", got)
 	}
-	if got[1] == "" {
+	if got[2] != "saturnus-review-rvw_x" {
+		t.Fatalf("expected title arg, got %q", got[2])
+	}
+	if got[3] == "" {
 		t.Fatal("expected non-empty prompt")
 	}
 }
@@ -58,16 +61,17 @@ func TestRenderCommandWithGuide(t *testing.T) {
 		PRNumber: 1,
 		PRURL:    "https://github.com/milvus-io/milvus/pull/1",
 		Worktree: "/tmp/milvus",
+		ReviewID: "rvw_y",
 		Guide:    "Do NOT run compilation.\nKeep comments in \"English\".",
 	}
 	got, err := RenderCommand(DefaultCommandTemplate, args)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 2 {
-		t.Fatalf("expected 2 args, got %#v", got)
+	if len(got) != 4 {
+		t.Fatalf("expected 4 args, got %#v", got)
 	}
-	prompt := got[1]
+	prompt := got[3]
 	if !strings.Contains(prompt, "Do NOT run compilation.\nKeep comments in \"English\".") {
 		t.Fatalf("guide not embedded correctly: %q", prompt)
 	}

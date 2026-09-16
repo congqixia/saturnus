@@ -310,6 +310,7 @@ func (s *server) getReview(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
+	s.reviews.ResolveRequesterName(&req)
 	writeJSON(w, http.StatusOK, map[string]any{"review": req})
 }
 
@@ -336,6 +337,10 @@ func (s *server) createReview(w http.ResponseWriter, r *http.Request) {
 		RootMessageID: req.MessageID,
 	})
 	if err != nil {
+		if errors.Is(err, review.ErrAlreadyPending) {
+			writeJSON(w, http.StatusOK, map[string]any{"review": created, "reused": true})
+			return
+		}
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -376,6 +381,9 @@ func (s *server) maybeReview(msg review.MessageContext) string {
 	}
 	req, err := s.reviews.Submit(msg)
 	if err != nil {
+		if errors.Is(err, review.ErrAlreadyPending) {
+			return "Review already in progress: " + req.ID + " (" + req.PRURL + ")"
+		}
 		return "Review failed: " + err.Error()
 	}
 	return "Review started " + req.ID + " (" + req.PRURL + ")"
@@ -384,7 +392,7 @@ func (s *server) maybeReview(msg review.MessageContext) string {
 func (s *server) handleBotCommand(text string, msg review.MessageContext) string {
 	fields := strings.Fields(text)
 	if len(fields) < 2 {
-		return "Commands: /sat sessions, /sat pending, /sat session <id>, /sat approve <id>, /sat deny <id> <reason>, /sat autopass on|off <session_id>, /sat review <url|id>, /sat reviews, /sat repos, /sat whoami, /sat whois <name|email|mobile>"
+		return "Commands: /sat sessions, /sat pending, /sat session <id>, /sat approve <id>, /sat deny <id> <reason>, /sat autopass on|off <session_id>, /sat review <url|id>, /sat reviews, /sat repos, /sat whoami, /sat whois <name|email|mobile>, /sat reply <review_id> <message>"
 	}
 	switch fields[1] {
 	case "sessions":
@@ -514,14 +522,30 @@ func (s *server) handleBotCommand(text string, msg review.MessageContext) string
 			if err != nil {
 				return "Review not found."
 			}
+			s.reviews.ResolveRequesterName(&req)
 			return s.reviews.FormatOne(req)
 		}
 		msg.Text = text
 		req, err := s.reviews.Submit(msg)
 		if err != nil {
+			if errors.Is(err, review.ErrAlreadyPending) {
+				return "Review already in progress: " + req.ID + " (" + req.PRURL + ")"
+			}
 			return "Review failed: " + err.Error()
 		}
 		return "Review started " + req.ID + " (" + req.PRURL + ")"
+	case "reply":
+		if len(fields) < 4 {
+			return "Usage: /sat reply <review_id> <message>"
+		}
+		message := strings.TrimSpace(strings.TrimPrefix(text, strings.Join(fields[:3], " ")))
+		if message == "" {
+			return "Usage: /sat reply <review_id> <message>"
+		}
+		if err := s.reviews.ReplyToRequester(fields[2], msg.SenderOpenID, message); err != nil {
+			return "Reply failed: " + err.Error()
+		}
+		return "Replied to requester for " + fields[2]
 	default:
 		return "Unknown command."
 	}

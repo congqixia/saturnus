@@ -108,6 +108,7 @@ Supported text commands:
 - `/sat repos` — show the configured repo whitelist
 - `/sat whoami` — show the sender's own open_id
 - `/sat whois <name|email|mobile>` — resolve a user to open_id via the contact API
+- `/sat reply <review_id> <message>` — reviewer replies to the requester via DM
 
 ## PR Review
 
@@ -150,7 +151,7 @@ Environment variables:
 | `SATURNUS_REVIEW_COMMAND_TEMPLATE` | see below | `text/template` for command args |
 | `SATURNUS_REVIEW_MAX_CONCURRENT` | 1 | worker count |
 | `SATURNUS_REVIEW_TIMEOUT` | 15m | per-review timeout |
-| `SATURNUS_REVIEW_CREATE_TASK` | 0 | create a Feishu task |
+| `SATURNUS_REVIEW_CREATE_TASK` | 0 | create a Feishu task assigned to reviewer + requester |
 | `SATURNUS_REVIEW_TASK_DUE_HOURS` | 24 | task due offset in hours |
 | `SATURNUS_REVIEW_LOG_DIR` | `<tmp>/saturnus-review-logs` | per-review transcript logs |
 | `SATURNUS_REVIEW_GUIDES` | - | per-repo review guide files: `owner/repo=/path/to/guide.txt,...` |
@@ -167,6 +168,13 @@ shows that summary (falling back to a short excerpt). ANSI color codes are
 stripped from `result_text` and messages; the transcript log keeps the raw
 output.
 
+Repeated submissions of the same PR reuse one review record (and thread):
+an active one is reported as already in progress, a finished one is reset and
+re-run with the same id. Reviewer identities are resolved to names via the
+contact API (new submissions, result messages, and backfilled on startup), and
+the result message includes the opencode `session=` id so the reviewer can
+continue the session with `opencode run --session <id>`.
+
 The default command template is:
 
 ```text
@@ -174,8 +182,10 @@ run "Review GitHub PR {{.Repo}}#{{.PRNumber}} ({{.PRURL}}). The repository is al
 ```
 
 Placeholders available in the template: `Repo`, `PRNumber`, `PRURL`, `Title`,
-`BaseBranch`, `Worktree` (the mapped checkout path), and `Guide` (per-repo
-review guidelines). Set `SATURNUS_REVIEW_TOOL` and
+`BaseBranch`, `Worktree` (the mapped checkout path), `Guide` (per-repo review
+guidelines), and `ReviewID`. The default template passes
+`--title "saturnus-review-<id>"` so the opencode session can be located and
+surfaced after the run. Set `SATURNUS_REVIEW_TOOL` and
 `SATURNUS_REVIEW_COMMAND_TEMPLATE` together to swap in another tool.
 
 ### Per-repo review guides

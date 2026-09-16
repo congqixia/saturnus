@@ -102,6 +102,117 @@ Supported text commands:
 - `/sat deny <request_id> <reason>`
 - `/sat autopass on <session_id>`
 - `/sat autopass off <session_id>`
+- `/sat reviews`
+- `/sat review <pr-url>` (also works as natural language: any message containing a GitHub PR URL)
+- `/sat review <review_id>`
+- `/sat repos` — show the configured repo whitelist
+- `/sat whoami` — show the sender's own open_id
+- `/sat whois <name|email|mobile>` — resolve a user to open_id via the contact API
+
+## PR Review
+
+The server can accept PR review requests from the Lark bot conversation, record
+the review request together with its thread context, optionally create a Feishu
+task, and run a local tool (default `opencode`) to review the PR in a detached
+worktree. The result is sent to a fixed reviewer.
+
+Enable it with:
+
+```sh
+export SATURNUS_REVIEW_ENABLED=1
+export SATURNUS_REVIEW_ALLOWED_USERS=ou_xxx,ou_yyy     # senders who may request reviews
+export SATURNUS_REVIEW_REVIEWER_OPEN_ID=ou_reviewer    # who receives the result (or REVIEWER_CHAT_ID)
+export SATURNUS_REVIEW_REPOS='owner/repo=/path/to/local/checkout,owner2/repo2=/path/to/other'
+export SATURNUS_REVIEW_CREATE_TASK=1                   # optional: create a Feishu task
+export SATURNUS_REVIEW_REPLY_IN_THREAD=1               # optional: also reply in the original thread
+make run-server
+```
+
+`SATURNUS_REVIEW_REPOS` is a comma-separated whitelist of `owner/repo=/local/path`
+pairs. Only repos listed here can be reviewed; anything else is rejected
+immediately with "repo is not in the review whitelist". Each mapped path must be
+a git checkout. The server does not fetch or check out anything itself: it runs
+the review tool directly inside the mapped checkout and lets the tool fetch and
+check out the PR head on its own, so the shared checkout is left untouched by
+Saturnus.
+
+Environment variables:
+
+| variable | default | note |
+|---|---|---|
+| `SATURNUS_REVIEW_ENABLED` | 0 | master switch; set to `1` to enable |
+| `SATURNUS_REVIEW_ALLOWED_USERS` | - | comma-separated open_ids; `*` = allow everyone |
+| `SATURNUS_REVIEW_REPOS` | - | whitelist `owner/repo=/local/path,...` |
+| `SATURNUS_REVIEW_REVIEWER_OPEN_ID` | - | DM recipient for results |
+| `SATURNUS_REVIEW_REVIEWER_CHAT_ID` | - | chat recipient fallback |
+| `SATURNUS_REVIEW_REPLY_IN_THREAD` | 0 | also reply into the original thread |
+| `SATURNUS_REVIEW_TOOL` | opencode | review executable |
+| `SATURNUS_REVIEW_COMMAND_TEMPLATE` | see below | `text/template` for command args |
+| `SATURNUS_REVIEW_MAX_CONCURRENT` | 1 | worker count |
+| `SATURNUS_REVIEW_TIMEOUT` | 15m | per-review timeout |
+| `SATURNUS_REVIEW_CREATE_TASK` | 0 | create a Feishu task |
+| `SATURNUS_REVIEW_TASK_DUE_HOURS` | 24 | task due offset in hours |
+| `SATURNUS_REVIEW_LOG_DIR` | `<tmp>/saturnus-review-logs` | per-review transcript logs |
+| `SATURNUS_REVIEW_GUIDES` | - | per-repo review guide files: `owner/repo=/path/to/guide.txt,...` |
+
+While a review is running, the tool output is streamed: the accumulated text is
+flushed into `result_text` roughly every 5 seconds (poll
+`GET /api/reviews/{id}` to watch progress), and the full line-by-line
+transcript is written to `<SATURNUS_REVIEW_LOG_DIR>/<review_id>.log`. The
+review detail (and the bot result message) includes the `log=` path.
+
+Result messages sent to the reviewer contain a concise conclusion, not the raw
+log: the tool is asked to end with a `REVIEW SUMMARY:` line and the message
+shows that summary (falling back to a short excerpt). ANSI color codes are
+stripped from `result_text` and messages; the transcript log keeps the raw
+output.
+
+The default command template is:
+
+```text
+run "Review GitHub PR {{.Repo}}#{{.PRNumber}} ({{.PRURL}}). The repository is already checked out at {{.Worktree}}. Fetch and check out the PR head yourself, then review the changes. Focus on correctness, security and style; be concise with file:line references."
+```
+
+Placeholders available in the template: `Repo`, `PRNumber`, `PRURL`, `Title`,
+`BaseBranch`, `Worktree` (the mapped checkout path), and `Guide` (per-repo
+review guidelines). Set `SATURNUS_REVIEW_TOOL` and
+`SATURNUS_REVIEW_COMMAND_TEMPLATE` together to swap in another tool.
+
+### Per-repo review guides
+
+`SATURNUS_REVIEW_GUIDES` maps a repo to a guide file whose contents are injected
+into the review prompt:
+
+```sh
+export SATURNUS_REVIEW_GUIDES='milvus-io/milvus=/etc/saturnus/guides/milvus.md'
+```
+
+```text
+# /etc/saturnus/guides/milvus.md
+Do NOT run compilation. This is a huge C++/Go repo; review the diff without building.
+```
+
+If a repo has no explicit guide, a guide file named `.saturnus-review.md` (or
+`.saturnus/review.md`) inside the checkout root is picked up automatically.
+Explicit config wins over the in-repo file.
+
+Note: because the tool runs inside the mapped checkout, that path must be
+writable by the service user (e.g. listed under `ReadWritePaths` in the systemd
+unit) if the tool needs to fetch or create branches.
+
+Review records are exposed under `GET /api/reviews`, `GET /api/reviews/{id}`,
+and `POST /api/reviews`, and shown in the web UI under **PR Reviews**.
+
+Bot helpers: `/sat reviews` lists recent review requests, `/sat review <id>`
+shows one, `/sat repos` shows the configured repo whitelist, `/sat whoami`
+prints the sender's own open_id, and `/sat whois <name|email|mobile>` resolves a
+user to their open_id.
+
+Note: `whois` calls the Lark contact API (`users/search` for names,
+`users/batch_get_id` for email/mobile), so the app needs the corresponding
+contact read scope (e.g. `contact:user.base:readonly`).
+
+See `docs/plan/pr-review.md` for the full design.
 
 ### Local Lark CLI Bridge
 

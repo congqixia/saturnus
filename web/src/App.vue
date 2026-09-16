@@ -19,7 +19,7 @@ import {
   type DataTableColumns
 } from 'naive-ui'
 import { Check, RefreshCw, X, Zap, ZapOff } from 'lucide-vue-next'
-import { formatTime, pretty, type Approval, type Event, type Session } from './api'
+import { formatTime, pretty, type Approval, type Event, type Review, type Session } from './api'
 import { useControlPlaneStore } from './stores/controlPlane'
 
 const store = useControlPlaneStore()
@@ -128,6 +128,56 @@ const eventColumns = computed<DataTableColumns<Event>>(() => [
   }
 ])
 
+const reviewColumns = computed<DataTableColumns<Review>>(() => [
+  {
+    title: 'Review',
+    key: 'id',
+    width: 180
+  },
+  {
+    title: 'PR',
+    key: 'repo',
+    render(row) {
+      return `${row.repo}#${row.pr_number}`
+    }
+  },
+  {
+    title: 'Status',
+    key: 'status',
+    width: 110,
+    render(row) {
+      return h(
+        NTag,
+        { size: 'small', round: true, type: reviewTagType(row.status) },
+        { default: () => row.status }
+      )
+    }
+  },
+  {
+    title: 'Updated',
+    key: 'updated_at',
+    width: 168,
+    render(row) {
+      return formatTime(row.updated_at)
+    }
+  }
+])
+
+function reviewTagType(status: string): 'success' | 'error' | 'warning' | 'default' {
+  switch (status) {
+    case 'succeeded':
+      return 'success'
+    case 'failed':
+    case 'cancelled':
+      return 'error'
+    case 'reviewing':
+    case 'pending':
+      return 'warning'
+    default:
+      return 'default'
+  }
+}
+
 function hButton(
   label: string,
   icon: Component,
@@ -221,6 +271,10 @@ import { h } from 'vue'
                 <strong>{{ store.pendingCount }}</strong>
               </div>
               <div class="metric">
+                <span>Reviews</span>
+                <strong>{{ store.reviewCount }}</strong>
+              </div>
+              <div class="metric">
                 <span>Events</span>
                 <strong>{{ store.events.length }}</strong>
               </div>
@@ -241,6 +295,49 @@ import { h } from 'vue'
                 :single-line="false"
               />
               <NEmpty v-else class="empty-state" description="No pending approvals" />
+            </section>
+
+            <section class="panel">
+              <div class="panel-head">
+                <h2>PR Reviews</h2>
+                <NTag :type="store.reviewCount > 0 ? 'info' : 'default'" round>
+                  {{ store.reviewCount }}
+                </NTag>
+              </div>
+              <NDataTable
+                v-if="store.reviews.length"
+                :columns="reviewColumns"
+                :data="store.reviews"
+                :bordered="false"
+                :single-line="false"
+              />
+              <NEmpty v-else class="empty-state" description="No reviews" />
+              <template v-if="store.selectedReview">
+                <NDescriptions bordered :column="2" label-placement="left" size="small" class="review-detail">
+                  <NDescriptionsItem label="Repo">
+                    <code>{{ store.selectedReview.repo }}#{{ store.selectedReview.pr_number }}</code>
+                  </NDescriptionsItem>
+                  <NDescriptionsItem label="Status">
+                    {{ store.selectedReview.status }}
+                  </NDescriptionsItem>
+                  <NDescriptionsItem label="Requester">
+                    {{ store.selectedReview.requester_name || store.selectedReview.requester_open_id || '-' }}
+                  </NDescriptionsItem>
+                  <NDescriptionsItem label="Tool">
+                    {{ store.selectedReview.tool || '-' }}
+                  </NDescriptionsItem>
+                  <NDescriptionsItem label="Task">
+                    {{ store.selectedReview.task_id || '-' }}
+                  </NDescriptionsItem>
+                  <NDescriptionsItem label="Updated">
+                    {{ formatTime(store.selectedReview.updated_at) }}
+                  </NDescriptionsItem>
+                </NDescriptions>
+                <div v-if="store.selectedReview.error" class="review-error">
+                  {{ store.selectedReview.error }}
+                </div>
+                <pre v-if="store.selectedReview.result_text" class="review-result">{{ store.selectedReview.result_text }}</pre>
+              </template>
             </section>
 
             <section class="panel">

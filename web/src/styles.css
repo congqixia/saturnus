@@ -223,6 +223,35 @@ pre {
   overflow-wrap: anywhere;
 }
 
+.review-detail {
+  margin-top: 12px;
+}
+
+.review-error {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: #fef0f0;
+  color: #c62828;
+  font-size: 13px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.review-result {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid #e4e7ec;
+  border-radius: 6px;
+  background: #fafafa;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 420px;
+  overflow: auto;
+}
+
 @media (max-width: 860px) {
   .main {
     display: block;

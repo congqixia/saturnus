@@ -81,6 +81,38 @@ type AuditLog struct {
 	CreatedAt time.Time       `json:"created_at"`
 }
 
+type ReviewThread struct {
+	ID            string    `json:"id"`
+	ChatID        string    `json:"chat_id"`
+	RootMessageID string    `json:"root_message_id"`
+	Topic         string    `json:"topic"`
+	Participants  []string  `json:"participants"`
+	LastMessageAt time.Time `json:"last_message_at"`
+	CreatedAt     time.Time `json:"created_at"`
+}
+
+type ReviewRequest struct {
+	ID              string    `json:"id"`
+	ThreadID        string    `json:"thread_id"`
+	Status          string    `json:"status"`
+	PRURL           string    `json:"pr_url"`
+	Repo            string    `json:"repo"`
+	PRNumber        int       `json:"pr_number"`
+	Title           string    `json:"title"`
+	BaseBranch      string    `json:"base_branch"`
+	RequesterOpenID string    `json:"requester_open_id"`
+	RequesterName   string    `json:"requester_name"`
+	ChatID          string    `json:"chat_id"`
+	MessageID       string    `json:"message_id"`
+	Tool            string    `json:"tool"`
+	TaskID          string    `json:"task_id"`
+	ResultText      string    `json:"result_text"`
+	Error           string    `json:"error"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
+	CompletedAt     time.Time `json:"completed_at,omitempty"`
+}
+
 type Store struct {
 	db *sql.DB
 }
@@ -185,6 +217,40 @@ func (s *Store) migrate(ctx context.Context) error {
 			created_at TEXT NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC)`,
+		`CREATE TABLE IF NOT EXISTS review_threads (
+			id TEXT PRIMARY KEY,
+			chat_id TEXT NOT NULL,
+			root_message_id TEXT NOT NULL DEFAULT '',
+			topic TEXT NOT NULL DEFAULT '',
+			participants TEXT NOT NULL DEFAULT '[]',
+			last_message_at TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_review_threads_key ON review_threads(chat_id, root_message_id)`,
+		`CREATE TABLE IF NOT EXISTS review_requests (
+			id TEXT PRIMARY KEY,
+			thread_id TEXT NOT NULL REFERENCES review_threads(id) ON DELETE CASCADE,
+			status TEXT NOT NULL,
+			pr_url TEXT NOT NULL,
+			repo TEXT NOT NULL,
+			pr_number INTEGER NOT NULL,
+			title TEXT NOT NULL DEFAULT '',
+			base_branch TEXT NOT NULL DEFAULT '',
+			requester_open_id TEXT NOT NULL DEFAULT '',
+			requester_name TEXT NOT NULL DEFAULT '',
+			chat_id TEXT NOT NULL DEFAULT '',
+			message_id TEXT NOT NULL DEFAULT '',
+			tool TEXT NOT NULL DEFAULT '',
+			task_id TEXT NOT NULL DEFAULT '',
+			result_text TEXT NOT NULL DEFAULT '',
+			error TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			completed_at TEXT
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_review_requests_created ON review_requests(created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_review_requests_status ON review_requests(status, created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_review_requests_thread ON review_requests(thread_id)`,
 	}
 	for _, stmt := range statements {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
@@ -564,6 +630,196 @@ func (s *Store) GetApproval(id string) (ApprovalRequest, bool) {
 	return req, err == nil
 }
 
+func (s *Store) GetOrCreateReviewThread(chatID, rootMessageID, topic string, participants []string) (ReviewThread, error) {
+	ctx := context.Background()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return ReviewThread{}, err
+	}
+	defer rollback(tx)
+
+	row := tx.QueryRowContext(ctx, `
+		SELECT id, chat_id, root_message_id, topic, participants, last_message_at, created_at
+		FROM review_threads
+		WHERE chat_id = ? AND root_message_id = ?
+	`, chatID, rootMessageID)
+	thread, err := scanReviewThread(row)
+	if err == nil {
+		merged := mergeParticipants(thread.Participants, participants)
+		thread.Participants = merged
+		thread.LastMessageAt = time.Now().UTC()
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE review_threads
+			SET topic = ?, participants = ?, last_message_at = ?
+			WHERE id = ?
+		`, firstNonEmpty(topic, thread.Topic), mustJSON(merged), timeText(thread.LastMessageAt), thread.ID); err != nil {
+			return ReviewThread{}, err
+		}
+		return thread, tx.Commit()
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return ReviewThread{}, err
+	}
+
+	now := time.Now().UTC()
+	thread = ReviewThread{
+		ID:            "thr_" + newID(),
+		ChatID:        chatID,
+		RootMessageID: rootMessageID,
+		Topic:         topic,
+		Participants:  mergeParticipants(nil, participants),
+		LastMessageAt: now,
+		CreatedAt:     now,
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO review_threads (id, chat_id, root_message_id, topic, participants, last_message_at, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, thread.ID, thread.ChatID, thread.RootMessageID, thread.Topic, mustJSON(thread.Participants), timeText(thread.LastMessageAt), timeText(thread.CreatedAt)); err != nil {
+		return ReviewThread{}, err
+	}
+	return thread, tx.Commit()
+}
+
+func (s *Store) CreateReview(req ReviewRequest) (ReviewRequest, error) {
+	ctx := context.Background()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return ReviewRequest{}, err
+	}
+	defer rollback(tx)
+
+	if _, err := getReviewThreadTx(ctx, tx, req.ThreadID); errors.Is(err, sql.ErrNoRows) {
+		return ReviewRequest{}, ErrNotFound
+	} else if err != nil {
+		return ReviewRequest{}, err
+	}
+	if req.ID == "" {
+		req.ID = "rvw_" + newID()
+	}
+	if req.Status == "" {
+		req.Status = "pending"
+	}
+	if req.CreatedAt.IsZero() {
+		req.CreatedAt = time.Now().UTC()
+	}
+	req.UpdatedAt = req.CreatedAt
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO review_requests (
+			id, thread_id, status, pr_url, repo, pr_number, title, base_branch,
+			requester_open_id, requester_name, chat_id, message_id, tool, task_id,
+			result_text, error, created_at, updated_at, completed_at
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, req.ID, req.ThreadID, req.Status, req.PRURL, req.Repo, req.PRNumber, req.Title, req.BaseBranch,
+		req.RequesterOpenID, req.RequesterName, req.ChatID, req.MessageID, req.Tool, req.TaskID,
+		req.ResultText, req.Error, timeText(req.CreatedAt), timeText(req.UpdatedAt), nullableTimeText(req.CompletedAt)); err != nil {
+		return ReviewRequest{}, err
+	}
+	if err := audit(ctx, tx, "requester:"+req.RequesterOpenID, "review.create", req.ID, mustJSON(req)); err != nil {
+		return ReviewRequest{}, err
+	}
+	return req, tx.Commit()
+}
+
+func (s *Store) GetReview(id string) (ReviewRequest, error) {
+	row := s.db.QueryRow(`
+		SELECT id, thread_id, status, pr_url, repo, pr_number, title, base_branch,
+			requester_open_id, requester_name, chat_id, message_id, tool, task_id,
+			result_text, error, created_at, updated_at, completed_at
+		FROM review_requests
+		WHERE id = ?
+	`, id)
+	req, err := scanReviewRequest(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ReviewRequest{}, ErrNotFound
+	}
+	if err != nil {
+		return ReviewRequest{}, err
+	}
+	return req, nil
+}
+
+func (s *Store) ListReviews(status string) []ReviewRequest {
+	query := `
+		SELECT id, thread_id, status, pr_url, repo, pr_number, title, base_branch,
+			requester_open_id, requester_name, chat_id, message_id, tool, task_id,
+			result_text, error, created_at, updated_at, completed_at
+		FROM review_requests
+	`
+	args := []any{}
+	if status != "" {
+		query += ` WHERE status = ?`
+		args = append(args, status)
+	}
+	query += ` ORDER BY created_at DESC`
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return []ReviewRequest{}
+	}
+	defer rows.Close()
+
+	out := []ReviewRequest{}
+	for rows.Next() {
+		req, err := scanReviewRequest(rows)
+		if err == nil {
+			out = append(out, req)
+		}
+	}
+	return out
+}
+
+func (s *Store) UpdateReview(req ReviewRequest) (ReviewRequest, error) {
+	ctx := context.Background()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return ReviewRequest{}, err
+	}
+	defer rollback(tx)
+
+	req.UpdatedAt = time.Now().UTC()
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE review_requests
+		SET status = ?, pr_url = ?, repo = ?, pr_number = ?, title = ?, base_branch = ?,
+			requester_open_id = ?, requester_name = ?, chat_id = ?, message_id = ?, tool = ?,
+			task_id = ?, result_text = ?, error = ?, updated_at = ?, completed_at = ?
+		WHERE id = ?
+	`, req.Status, req.PRURL, req.Repo, req.PRNumber, req.Title, req.BaseBranch,
+		req.RequesterOpenID, req.RequesterName, req.ChatID, req.MessageID, req.Tool,
+		req.TaskID, req.ResultText, req.Error, timeText(req.UpdatedAt), nullableTimeText(req.CompletedAt),
+		req.ID); err != nil {
+		return ReviewRequest{}, err
+	}
+	if err := audit(ctx, tx, "system", "review.update", req.ID, mustJSON(req)); err != nil {
+		return ReviewRequest{}, err
+	}
+	return req, tx.Commit()
+}
+
+func (s *Store) FailInterruptedReviews() ([]string, error) {
+	ctx := context.Background()
+	rows, err := s.db.Query(`SELECT id FROM review_requests WHERE status = 'reviewing'`)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	rows.Close()
+	now := time.Now().UTC()
+	for _, id := range ids {
+		if _, err := s.db.ExecContext(ctx, `
+			UPDATE review_requests SET status = 'failed', error = ?, updated_at = ?, completed_at = ? WHERE id = ?
+		`, "interrupted by server restart", timeText(now), timeText(now), id); err != nil {
+			return nil, err
+		}
+	}
+	return ids, nil
+}
+
 type sessionScanner interface {
 	Scan(dest ...any) error
 }
@@ -573,6 +829,14 @@ type eventScanner interface {
 }
 
 type approvalScanner interface {
+	Scan(dest ...any) error
+}
+
+type reviewThreadScanner interface {
+	Scan(dest ...any) error
+}
+
+type reviewRequestScanner interface {
 	Scan(dest ...any) error
 }
 
@@ -665,6 +929,69 @@ func scanApproval(row approvalScanner) (ApprovalRequest, error) {
 	req.CreatedAt, _ = parseTime(createdAt)
 	req.ExpiresAt, _ = parseTime(expiresAt)
 	return req, nil
+}
+
+func getReviewThreadTx(ctx context.Context, tx *sql.Tx, id string) (ReviewThread, error) {
+	row := tx.QueryRowContext(ctx, `
+		SELECT id, chat_id, root_message_id, topic, participants, last_message_at, created_at
+		FROM review_threads
+		WHERE id = ?
+	`, id)
+	return scanReviewThread(row)
+}
+
+func scanReviewThread(row reviewThreadScanner) (ReviewThread, error) {
+	var thread ReviewThread
+	var participants string
+	var lastMessageAt string
+	var createdAt string
+	if err := row.Scan(&thread.ID, &thread.ChatID, &thread.RootMessageID, &thread.Topic, &participants, &lastMessageAt, &createdAt); err != nil {
+		return ReviewThread{}, err
+	}
+	_ = json.Unmarshal([]byte(participants), &thread.Participants)
+	thread.LastMessageAt, _ = parseTime(lastMessageAt)
+	thread.CreatedAt, _ = parseTime(createdAt)
+	return thread, nil
+}
+
+func scanReviewRequest(row reviewRequestScanner) (ReviewRequest, error) {
+	var req ReviewRequest
+	var createdAt string
+	var updatedAt string
+	var completedAt sql.NullString
+	if err := row.Scan(
+		&req.ID, &req.ThreadID, &req.Status, &req.PRURL, &req.Repo, &req.PRNumber, &req.Title, &req.BaseBranch,
+		&req.RequesterOpenID, &req.RequesterName, &req.ChatID, &req.MessageID, &req.Tool, &req.TaskID,
+		&req.ResultText, &req.Error, &createdAt, &updatedAt, &completedAt,
+	); err != nil {
+		return ReviewRequest{}, err
+	}
+	req.CreatedAt, _ = parseTime(createdAt)
+	req.UpdatedAt, _ = parseTime(updatedAt)
+	req.CompletedAt, _ = parseNullTime(completedAt)
+	return req, nil
+}
+
+func mergeParticipants(existing, extra []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, p := range append(append([]string{}, existing...), extra...) {
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	return out
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func audit(ctx context.Context, tx *sql.Tx, actor, action, target string, payload json.RawMessage) error {

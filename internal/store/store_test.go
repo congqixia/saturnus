@@ -113,3 +113,91 @@ func TestStoreAutoPassAndHeartbeat(t *testing.T) {
 		t.Fatalf("expected disabled auto-pass with zero expiry, got %#v", updated)
 	}
 }
+
+func TestStoreReviewFlow(t *testing.T) {
+	st, err := Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	thread, err := st.GetOrCreateReviewThread("oc_chat", "om_root", "topic-1", []string{"ou_a", "ou_b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if thread.ID == "" || len(thread.Participants) != 2 {
+		t.Fatalf("unexpected thread: %#v", thread)
+	}
+
+	updated, err := st.GetOrCreateReviewThread("oc_chat", "om_root", "topic-2", []string{"ou_a", "ou_c"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.ID != thread.ID {
+		t.Fatalf("expected same thread id, got %q want %q", updated.ID, thread.ID)
+	}
+	if len(updated.Participants) != 3 {
+		t.Fatalf("expected 3 merged participants, got %#v", updated.Participants)
+	}
+
+	req, err := st.CreateReview(ReviewRequest{
+		ThreadID:        thread.ID,
+		PRURL:           "https://github.com/congqixia/saturnus/pull/1",
+		Repo:            "congqixia/saturnus",
+		PRNumber:        1,
+		RequesterOpenID: "ou_a",
+		ChatID:          "oc_chat",
+		MessageID:       "om_1",
+		Tool:            "opencode",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.ID == "" || req.Status != "pending" {
+		t.Fatalf("unexpected review request: %#v", req)
+	}
+
+	got, err := st.GetReview(req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Repo != req.Repo || got.PRNumber != req.PRNumber {
+		t.Fatalf("review round-trip mismatch: %#v", got)
+	}
+
+	req.Status = "reviewing"
+	if _, err := st.UpdateReview(req); err != nil {
+		t.Fatal(err)
+	}
+	req.Status = "succeeded"
+	req.ResultText = "LGTM"
+	if _, err := st.UpdateReview(req); err != nil {
+		t.Fatal(err)
+	}
+
+	reviews := st.ListReviews("")
+	if len(reviews) != 1 || reviews[0].Status != "succeeded" {
+		t.Fatalf("unexpected reviews: %#v", reviews)
+	}
+
+	req.Status = "reviewing"
+	req.ResultText = ""
+	req.Error = ""
+	if _, err := st.UpdateReview(req); err != nil {
+		t.Fatal(err)
+	}
+	ids, err := st.FailInterruptedReviews()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 1 {
+		t.Fatalf("expected 1 interrupted review, got %#v", ids)
+	}
+	after, err := st.GetReview(req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Status != "failed" {
+		t.Fatalf("expected failed status, got %q", after.Status)
+	}
+}

@@ -12,18 +12,21 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"saturnus/internal/lark"
 	"saturnus/internal/policy"
+	"saturnus/internal/review"
 	"saturnus/internal/store"
 )
 
 type server struct {
-	store *store.Store
-	lark  *lark.Client
+	store   *store.Store
+	lark    *lark.Client
+	reviews *review.Service
 }
 
 const shutdownTimeout = 15 * time.Second
@@ -52,13 +55,17 @@ func run(ctx context.Context, addr, data, staticDir string) (err error) {
 			err = errors.Join(err, fmt.Errorf("close store: %w", closeErr))
 		}
 	}()
+	larkClient := lark.New(lark.Config{
+		AppID:     os.Getenv("LARK_APP_ID"),
+		AppSecret: os.Getenv("LARK_APP_SECRET"),
+	})
 	s := &server{
-		store: st,
-		lark: lark.New(lark.Config{
-			AppID:     os.Getenv("LARK_APP_ID"),
-			AppSecret: os.Getenv("LARK_APP_SECRET"),
-		}),
+		store:   st,
+		lark:    larkClient,
+		reviews: review.New(st, larkClient, reviewConfig()),
 	}
+	s.reviews.Start()
+	defer s.reviews.Stop()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", s.health)
@@ -72,6 +79,9 @@ func run(ctx context.Context, addr, data, staticDir string) (err error) {
 	mux.HandleFunc("POST /api/approvals", s.createApproval)
 	mux.HandleFunc("GET /api/approvals/{request_id}", s.getApproval)
 	mux.HandleFunc("POST /api/approvals/{request_id}/decision", s.decideApproval)
+	mux.HandleFunc("GET /api/reviews", s.listReviews)
+	mux.HandleFunc("GET /api/reviews/{review_id}", s.getReview)
+	mux.HandleFunc("POST /api/reviews", s.createReview)
 	mux.HandleFunc("POST /lark/events", s.larkEvents)
 	mux.Handle("/", spaFileServer(staticDir))
 
@@ -290,6 +300,48 @@ func (s *server) decideApproval(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"approval": req, "decision": dec})
 }
 
+func (s *server) listReviews(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"reviews": s.reviews.List(r.URL.Query().Get("status"))})
+}
+
+func (s *server) getReview(w http.ResponseWriter, r *http.Request) {
+	req, err := s.reviews.Get(r.PathValue("review_id"))
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"review": req})
+}
+
+func (s *server) createReview(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		PRURL         string `json:"pr_url"`
+		ChatID        string `json:"chat_id"`
+		MessageID     string `json:"message_id"`
+		RequesterID   string `json:"requester_open_id"`
+		RequesterName string `json:"requester_name"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.RequesterID == "" {
+		req.RequesterID = "api"
+	}
+	created, err := s.reviews.Submit(review.MessageContext{
+		Text:          req.PRURL,
+		ChatID:        req.ChatID,
+		MessageID:     req.MessageID,
+		SenderOpenID:  req.RequesterID,
+		SenderName:    req.RequesterName,
+		RootMessageID: req.MessageID,
+	})
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"review": created})
+}
+
 func (s *server) larkEvents(w http.ResponseWriter, r *http.Request) {
 	var payload map[string]any
 	if !decodeJSON(w, r, &payload) {
@@ -299,23 +351,40 @@ func (s *server) larkEvents(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"challenge": challenge})
 		return
 	}
-	text, chatID := extractLarkText(payload)
-	command := satCommand(text)
+	msg := extractLarkMessage(payload)
+	command := satCommand(msg.Text)
 	if command == "" {
+		if reply := s.maybeReview(msg); reply != "" {
+			_ = s.lark.SendText("chat_id", msg.ChatID, reply)
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 		return
 	}
-	reply := s.handleBotCommand(command)
-	if chatID != "" {
-		_ = s.lark.SendText("chat_id", chatID, reply)
+	reply := s.handleBotCommand(command, msg)
+	if msg.ChatID != "" {
+		_ = s.lark.SendText("chat_id", msg.ChatID, reply)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "reply": reply})
 }
 
-func (s *server) handleBotCommand(text string) string {
+func (s *server) maybeReview(msg review.MessageContext) string {
+	if !s.reviews.Enabled() {
+		return ""
+	}
+	if _, err := review.FindPRRequest(msg.Text); err != nil {
+		return ""
+	}
+	req, err := s.reviews.Submit(msg)
+	if err != nil {
+		return "Review failed: " + err.Error()
+	}
+	return "Review started " + req.ID + " (" + req.PRURL + ")"
+}
+
+func (s *server) handleBotCommand(text string, msg review.MessageContext) string {
 	fields := strings.Fields(text)
 	if len(fields) < 2 {
-		return "Commands: /sat sessions, /sat pending, /sat session <id>, /sat approve <id>, /sat deny <id> <reason>, /sat autopass on|off <session_id>"
+		return "Commands: /sat sessions, /sat pending, /sat session <id>, /sat approve <id>, /sat deny <id> <reason>, /sat autopass on|off <session_id>, /sat review <url|id>, /sat reviews, /sat repos, /sat whoami, /sat whois <name|email|mobile>"
 	}
 	switch fields[1] {
 	case "sessions":
@@ -394,6 +463,65 @@ func (s *server) handleBotCommand(text string) string {
 			return "Auto-pass update failed: " + err.Error()
 		}
 		return fmt.Sprintf("Auto-pass for %s is now %v until %s", session.ID, session.AutoPass, session.AutoPassUntil.Format(time.RFC3339))
+	case "whoami":
+		if msg.SenderOpenID == "" {
+			return "Unknown sender: no open_id in message context."
+		}
+		name := msg.SenderName
+		if name == "" && s.lark.Enabled() {
+			if resolved, err := s.lark.GetUserName(msg.SenderOpenID); err == nil {
+				name = resolved
+			}
+		}
+		if name == "" {
+			name = "unknown"
+		}
+		return fmt.Sprintf("%s open_id=%s", name, msg.SenderOpenID)
+	case "whois":
+		if len(fields) < 3 {
+			return "Usage: /sat whois <name|email|mobile>"
+		}
+		query := strings.TrimSpace(strings.TrimPrefix(text, strings.Join(fields[:2], " ")))
+		users, err := s.lark.ResolveUser(query)
+		if err != nil {
+			return "Whois failed: " + err.Error()
+		}
+		if len(users) == 0 {
+			return "No users found for " + query
+		}
+		var b strings.Builder
+		for _, user := range users {
+			fmt.Fprintf(&b, "%s open_id=%s", user.Name, user.OpenID)
+			if user.Email != "" {
+				fmt.Fprintf(&b, " email=%s", user.Email)
+			}
+			if user.Mobile != "" {
+				fmt.Fprintf(&b, " mobile=%s", user.Mobile)
+			}
+			b.WriteString("\n")
+		}
+		return strings.TrimSpace(b.String())
+	case "reviews":
+		return s.reviews.FormatList(s.reviews.List(""))
+	case "repos":
+		return s.reviews.FormatRepos()
+	case "review":
+		if len(fields) < 3 {
+			return "Usage: /sat review <pr-url> or /sat review <review_id>"
+		}
+		if strings.HasPrefix(fields[2], "rvw_") {
+			req, err := s.reviews.Get(fields[2])
+			if err != nil {
+				return "Review not found."
+			}
+			return s.reviews.FormatOne(req)
+		}
+		msg.Text = text
+		req, err := s.reviews.Submit(msg)
+		if err != nil {
+			return "Review failed: " + err.Error()
+		}
+		return "Review started " + req.ID + " (" + req.PRURL + ")"
 	default:
 		return "Unknown command."
 	}
@@ -408,18 +536,92 @@ func (s *server) notifyLarkApproval(req store.ApprovalRequest) {
 	_ = s.lark.SendText("chat_id", chatID, text)
 }
 
-func extractLarkText(payload map[string]any) (string, string) {
+func extractLarkMessage(payload map[string]any) review.MessageContext {
 	event, _ := payload["event"].(map[string]any)
 	message, _ := event["message"].(map[string]any)
-	chatID, _ := message["chat_id"].(string)
+	sender, _ := event["sender"].(map[string]any)
+	senderID, _ := sender["sender_id"].(map[string]any)
+
+	var msg review.MessageContext
+	msg.ChatID, _ = message["chat_id"].(string)
+	msg.MessageID, _ = message["message_id"].(string)
+	msg.RootMessageID, _ = message["thread_id"].(string)
+	if msg.RootMessageID == "" {
+		msg.RootMessageID, _ = message["root_id"].(string)
+	}
+	if msg.RootMessageID == "" {
+		msg.RootMessageID = msg.MessageID
+	}
+	msg.SenderOpenID, _ = senderID["open_id"].(string)
+	msg.SenderName, _ = sender["sender_name"].(string)
+
 	content, _ := message["content"].(string)
 	var parsed struct {
 		Text string `json:"text"`
 	}
 	if err := json.Unmarshal([]byte(content), &parsed); err == nil && parsed.Text != "" {
-		return parsed.Text, chatID
+		msg.Text = parsed.Text
+	} else {
+		msg.Text = content
 	}
-	return content, chatID
+	return msg
+}
+
+func reviewConfig() review.Config {
+	return review.Config{
+		Enabled:         os.Getenv("SATURNUS_REVIEW_ENABLED") == "1",
+		AllowedUsers:    splitCSV(os.Getenv("SATURNUS_REVIEW_ALLOWED_USERS")),
+		ReviewerOpenID:  os.Getenv("SATURNUS_REVIEW_REVIEWER_OPEN_ID"),
+		ReviewerChatID:  os.Getenv("SATURNUS_REVIEW_REVIEWER_CHAT_ID"),
+		ReplyInThread:   os.Getenv("SATURNUS_REVIEW_REPLY_IN_THREAD") == "1",
+		Repos:           review.ParseRepoMap(os.Getenv("SATURNUS_REVIEW_REPOS")),
+		Guides:          review.ParseRepoMap(os.Getenv("SATURNUS_REVIEW_GUIDES")),
+		Tool:            os.Getenv("SATURNUS_REVIEW_TOOL"),
+		CommandTemplate: os.Getenv("SATURNUS_REVIEW_COMMAND_TEMPLATE"),
+		MaxConcurrent:   envInt("SATURNUS_REVIEW_MAX_CONCURRENT", 1),
+		Timeout:         envDuration("SATURNUS_REVIEW_TIMEOUT", 15*time.Minute),
+		CreateTask:      os.Getenv("SATURNUS_REVIEW_CREATE_TASK") == "1",
+		TaskDueHours:    envInt("SATURNUS_REVIEW_TASK_DUE_HOURS", 24),
+		LogDir:          os.Getenv("SATURNUS_REVIEW_LOG_DIR"),
+	}
+}
+
+func splitCSV(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+func envInt(key string, fallback int) int {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func envDuration(key string, fallback time.Duration) time.Duration {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
 }
 
 func satCommand(text string) string {

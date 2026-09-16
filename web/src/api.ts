@@ -35,6 +35,28 @@ export type Approval = {
   expires_at: string
 }
 
+export type Review = {
+  id: string
+  thread_id: string
+  status: string
+  pr_url: string
+  repo: string
+  pr_number: number
+  title: string
+  base_branch: string
+  requester_open_id: string
+  requester_name: string
+  chat_id: string
+  message_id: string
+  tool: string
+  task_id: string
+  result_text: string
+  error: string
+  created_at: string
+  updated_at: string
+  completed_at?: string
+}
+
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(path, {
     headers: { 'Content-Type': 'application/json', ...(options.headers ?? {}) },

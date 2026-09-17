@@ -82,6 +82,7 @@ thread row.
 | chat_id / message_id | TEXT | where the result can be answered |
 | tool | TEXT | tool used (default `opencode`) |
 | task_id | TEXT | Feishu task GUID when created |
+| task_url | TEXT | clickable Feishu task applink |
 | result_text | TEXT | tool output |
 | error | TEXT | failure detail |
 | created_at / updated_at / completed_at | TEXT | |
@@ -131,7 +132,14 @@ check out anything.
   is already checked out at {{.Worktree}}. Fetch and check out the PR head
   yourself, then review the changes. Focus on correctness, security and style;
   be concise with file:line references.{{if .Guide}} Review guidelines:
-  {{.Guide | shellquote}}{{end}}"`
+  {{.Guide | shellquote}}{{end}} Finish with a structured review. The very last
+  block must be exactly:
+  REVIEW SUMMARY:
+  PR summary: <what the PR does in 2-3 sentences>
+  Issues: <each concrete problem with file:line references, one per line, or None>
+  Review suggestions: <verdict and next steps: LGTM, or the specific changes required, or a design/refactor suggestion>"`
+  The three-section block is parsed from the tool output and rendered as the
+  result message; if the tool omits the headers the raw summary is shown.
 
 The `shellquote` template function escapes backslashes and double quotes so the
 guide content survives the quoted-arg parsing.
@@ -157,7 +165,9 @@ children.
 When `SATURNUS_REVIEW_CREATE_TASK=1`, the server calls
 `POST /open-apis/task/v2/tasks` (summary = PR title, description = PR URL +
 review ID, member = reviewer, due = now + configured hours). The returned
-`guid` is stored as `task_id`. Requires `task:task` write scope for the app.
+`guid` is stored as `task_id` (and the clickable `url` as `task_url`), and the
+requester is DM'd the task link so they can open it directly. Requires
+`task:task` write scope for the app.
 
 ## Config
 

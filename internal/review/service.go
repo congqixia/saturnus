@@ -44,9 +44,18 @@ type MessageContext struct {
 	Topic         string
 }
 
+type larkClient interface {
+	Enabled() bool
+	GetUserName(openID string) (string, error)
+	SendText(receiveIDType, receiveID, text string) error
+	SendTextToUser(openID, text string) error
+	CreateTask(input lark.CreateTaskInput) (lark.Task, error)
+	ReplyMessage(messageID, text string) error
+}
+
 type Service struct {
 	store  *store.Store
-	lark   *lark.Client
+	lark   larkClient
 	cfg    Config
 	jobs   chan string
 	wg     sync.WaitGroup
@@ -111,6 +120,11 @@ func (s *Service) Enabled() bool {
 	return s.cfg.Enabled
 }
 
+// Tool returns the configured review tool name (e.g. "opencode").
+func (s *Service) Tool() string {
+	return s.cfg.Tool
+}
+
 func (s *Service) Start() {
 	if !s.cfg.Enabled {
 		return
@@ -154,10 +168,18 @@ func (s *Service) enqueue(id string) {
 }
 
 func (s *Service) Submit(ctx MessageContext) (store.ReviewRequest, error) {
+	return s.submit(ctx, true)
+}
+
+func (s *Service) SubmitPublic(ctx MessageContext) (store.ReviewRequest, error) {
+	return s.submit(ctx, false)
+}
+
+func (s *Service) submit(ctx MessageContext, requireUser bool) (store.ReviewRequest, error) {
 	if !s.cfg.Enabled {
 		return store.ReviewRequest{}, errors.New("PR review is disabled")
 	}
-	if !s.allowed(ctx.SenderOpenID) {
+	if requireUser && !s.allowed(ctx.SenderOpenID) {
 		return store.ReviewRequest{}, errors.New("sender not allowed to request PR review")
 	}
 	pr, err := FindPRRequest(ctx.Text)
@@ -233,17 +255,40 @@ func (s *Service) maybeCreateTask(req *store.ReviewRequest) {
 	if !s.cfg.CreateTask {
 		return
 	}
-	taskID, err := s.createTask(*req)
+	if req.TaskID != "" {
+		return
+	}
+	task, err := s.createTask(*req)
 	if err != nil {
 		logf("create feishu task: %v", err)
 		return
 	}
-	if taskID == "" {
+	if task.GUID == "" {
 		return
 	}
-	req.TaskID = taskID
+	req.TaskID = task.GUID
+	req.TaskURL = task.URL
 	if _, err := s.store.UpdateReview(*req); err != nil {
 		logf("store task id: %v", err)
+	}
+	s.notifyRequesterTaskCreated(*req)
+}
+
+func (s *Service) notifyRequesterTaskCreated(req store.ReviewRequest) {
+	if req.RequesterOpenID == "" || !s.lark.Enabled() {
+		return
+	}
+	var b strings.Builder
+	b.WriteString("已为你的 PR 评审创建任务：\n")
+	fmt.Fprintf(&b, "%s#%d\n%s\n", req.Repo, req.PRNumber, req.PRURL)
+	if req.TaskURL != "" {
+		fmt.Fprintf(&b, "任务链接：%s\n", req.TaskURL)
+	} else if req.TaskID != "" {
+		fmt.Fprintf(&b, "task_id=%s\n", req.TaskID)
+	}
+	b.WriteString("评审完成后评审人会收到通知，并把结果同步给你。")
+	if err := s.lark.SendTextToUser(req.RequesterOpenID, b.String()); err != nil {
+		logf("notify requester of task: %v", err)
 	}
 }
 
@@ -277,6 +322,9 @@ func (s *Service) FormatOne(req store.ReviewRequest) string {
 	}
 	if req.TaskID != "" {
 		fmt.Fprintf(&b, "\ntask_id=%s", req.TaskID)
+		if req.TaskURL != "" {
+			fmt.Fprintf(&b, "\ntask_url=%s", req.TaskURL)
+		}
 	}
 	if req.SessionID != "" {
 		fmt.Fprintf(&b, "\nsession=%s (continue: %s run --session %s)", req.SessionID, s.cfg.Tool, req.SessionID)
@@ -386,13 +434,13 @@ func (s *Service) FormatRepos() string {
 	return strings.TrimSpace(b.String())
 }
 
-func (s *Service) createTask(req store.ReviewRequest) (string, error) {
+func (s *Service) createTask(req store.ReviewRequest) (lark.Task, error) {
 	if !s.lark.Enabled() {
-		return "", nil
+		return lark.Task{}, nil
 	}
 	members := taskMembers(s.cfg.ReviewerOpenID, req.RequesterOpenID)
 	if len(members) == 0 {
-		return "", nil
+		return lark.Task{}, nil
 	}
 	requester := req.RequesterName
 	if requester == "" {
@@ -575,6 +623,9 @@ func (s *Service) FormatResult(req store.ReviewRequest) string {
 	}
 	if req.TaskID != "" {
 		fmt.Fprintf(&b, "\ntask_id=%s", req.TaskID)
+		if req.TaskURL != "" {
+			fmt.Fprintf(&b, "\ntask_url=%s", req.TaskURL)
+		}
 	}
 	if req.SessionID != "" {
 		fmt.Fprintf(&b, "\nsession=%s (continue: %s run --session %s)", req.SessionID, s.cfg.Tool, req.SessionID)
@@ -584,7 +635,11 @@ func (s *Service) FormatResult(req store.ReviewRequest) string {
 	}
 	clean := stripANSI(req.ResultText)
 	if summary := extractSummary(clean); summary != "" {
-		fmt.Fprintf(&b, "\n\nREVIEW SUMMARY:\n%s", truncate(summary, 2000))
+		if secs := parseReviewSections(summary); !secs.empty() {
+			fmt.Fprintf(&b, "\n\n%s", formatReviewSections(secs))
+		} else {
+			fmt.Fprintf(&b, "\n\nREVIEW SUMMARY:\n%s", truncate(summary, 2000))
+		}
 	} else if clean != "" {
 		fmt.Fprintf(&b, "\n\n%s", truncate(clean, 1500))
 	}

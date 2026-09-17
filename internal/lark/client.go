@@ -75,13 +75,18 @@ type CreateTaskInput struct {
 	SourceURL     string
 }
 
-func (c *Client) CreateTask(input CreateTaskInput) (string, error) {
+type Task struct {
+	GUID string
+	URL  string
+}
+
+func (c *Client) CreateTask(input CreateTaskInput) (Task, error) {
 	if !c.Enabled() {
-		return "", nil
+		return Task{}, nil
 	}
 	token, err := c.tenantToken()
 	if err != nil {
-		return "", err
+		return Task{}, err
 	}
 	members := []map[string]any{}
 	for _, id := range input.MemberOpenIDs {
@@ -104,13 +109,13 @@ func (c *Client) CreateTask(input CreateTaskInput) (string, error) {
 	body, _ := json.Marshal(payload)
 	req, err := http.NewRequest(http.MethodPost, "https://open.feishu.cn/open-apis/task/v2/tasks", bytes.NewReader(body))
 	if err != nil {
-		return "", err
+		return Task{}, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", err
+		return Task{}, err
 	}
 	defer resp.Body.Close()
 	var out struct {
@@ -119,16 +124,17 @@ func (c *Client) CreateTask(input CreateTaskInput) (string, error) {
 		Data struct {
 			Task struct {
 				GUID string `json:"guid"`
+				URL  string `json:"url"`
 			} `json:"task"`
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", err
+		return Task{}, err
 	}
 	if resp.StatusCode >= 300 || out.Code != 0 {
-		return "", fmt.Errorf("lark create task failed: code=%d msg=%q status=%s", out.Code, out.Msg, resp.Status)
+		return Task{}, fmt.Errorf("lark create task failed: code=%d msg=%q status=%s", out.Code, out.Msg, resp.Status)
 	}
-	return out.Data.Task.GUID, nil
+	return Task{GUID: out.Data.Task.GUID, URL: out.Data.Task.URL}, nil
 }
 
 func (c *Client) postJSON(url string, payload any) error {

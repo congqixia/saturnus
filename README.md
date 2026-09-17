@@ -95,6 +95,7 @@ https://<public-domain>/lark/events
 
 Supported text commands:
 
+- `/sat help` — show all available commands
 - `/sat sessions`
 - `/sat pending`
 - `/sat session <session_id>`
@@ -105,6 +106,7 @@ Supported text commands:
 - `/sat reviews`
 - `/sat review <pr-url>` (also works as natural language: any message containing a GitHub PR URL)
 - `/sat review <review_id>`
+- `/sat describe review <review_id>` — show full details of one review (as a card)
 - `/sat repos` — show the configured repo whitelist
 - `/sat whoami` — show the sender's own open_id
 - `/sat whois <name|email|mobile>` — resolve a user to open_id via the contact API
@@ -142,7 +144,8 @@ Environment variables:
 | variable | default | note |
 |---|---|---|
 | `SATURNUS_REVIEW_ENABLED` | 0 | master switch; set to `1` to enable |
-| `SATURNUS_REVIEW_ALLOWED_USERS` | - | comma-separated open_ids; `*` = allow everyone |
+| `SATURNUS_COMMAND_ALLOWED_USERS` | - | who may run `/sat` commands; `*` = everyone, empty = deny all |
+| `SATURNUS_REVIEW_ALLOWED_USERS` | - | comma-separated open_ids; `*` = allow everyone; empty = reject all |
 | `SATURNUS_REVIEW_REPOS` | - | whitelist `owner/repo=/local/path,...` |
 | `SATURNUS_REVIEW_REVIEWER_OPEN_ID` | - | DM recipient for results |
 | `SATURNUS_REVIEW_REVIEWER_CHAT_ID` | - | chat recipient fallback |
@@ -163,8 +166,10 @@ transcript is written to `<SATURNUS_REVIEW_LOG_DIR>/<review_id>.log`. The
 review detail (and the bot result message) includes the `log=` path.
 
 Result messages sent to the reviewer contain a concise conclusion, not the raw
-log: the tool is asked to end with a `REVIEW SUMMARY:` line and the message
-shows that summary (falling back to a short excerpt). ANSI color codes are
+log: the tool is asked to end with a structured `REVIEW SUMMARY:` block split
+into `PR summary`, `Issues`, and `Review suggestions` (verdict: LGTM / concrete
+changes / design or refactor), and the message renders those three sections
+(falling back to a short excerpt when the tool omits them). ANSI color codes are
 stripped from `result_text` and messages; the transcript log keeps the raw
 output.
 
@@ -175,10 +180,21 @@ contact API (new submissions, result messages, and backfilled on startup), and
 the result message includes the opencode `session=` id so the reviewer can
 continue the session with `opencode run --session <id>`.
 
+When task creation is enabled, the requester is DM'd the generated Feishu task
+with its clickable task link (`task_url`, an applink from the task API) so they
+can open the task directly and know when to expect the result. Only one task is
+created per PR: re-running an already-reviewed PR reuses the existing
+`task_id`/`task_url` instead of creating a duplicate.
+
 The default command template is:
 
 ```text
-run "Review GitHub PR {{.Repo}}#{{.PRNumber}} ({{.PRURL}}). The repository is already checked out at {{.Worktree}}. Fetch and check out the PR head yourself, then review the changes. Focus on correctness, security and style; be concise with file:line references."
+run "Review GitHub PR {{.Repo}}#{{.PRNumber}} ({{.PRURL}}). The repository is already checked out at {{.Worktree}}. Fetch and check out the PR head yourself, then review the changes. Focus on correctness, security and style; be concise with file:line references. Finish with a structured review. The very last block must be exactly:
+
+REVIEW SUMMARY:
+PR summary: <what the PR does in 2-3 sentences>
+Issues: <each concrete problem with file:line references, one per line, or None>
+Review suggestions: <verdict and next steps: LGTM, or the specific changes required, or a design/refactor suggestion>"
 ```
 
 Placeholders available in the template: `Repo`, `PRNumber`, `PRURL`, `Title`,
@@ -217,6 +233,14 @@ Bot helpers: `/sat reviews` lists recent review requests, `/sat review <id>`
 shows one, `/sat repos` shows the configured repo whitelist, `/sat whoami`
 prints the sender's own open_id, and `/sat whois <name|email|mobile>` resolves a
 user to their open_id.
+
+### Command access control
+
+`/sat` commands require the sender to be listed in
+`SATURNUS_COMMAND_ALLOWED_USERS` (or `*` for everyone; empty denies all).
+Users outside that list can still trigger reviews by sending a GitHub PR URL in
+plain chat, which is handled without the command layer. Any other message from
+them gets a plain-text usage hint (no `/sat` syntax).
 
 Note: `whois` calls the Lark contact API (`users/search` for names,
 `users/batch_get_id` for email/mobile), so the app needs the corresponding

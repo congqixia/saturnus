@@ -50,6 +50,7 @@ export type Review = {
   message_id: string
   tool: string
   task_id: string
+  task_url: string
   session_id: string
   result_text: string
   error: string

@@ -1,6 +1,9 @@
 package review
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestStripANSI(t *testing.T) {
 	cases := []struct {
@@ -30,5 +33,50 @@ func TestExtractSummary(t *testing.T) {
 	in2 := "first\nREVIEW SUMMARY: old\nmore\nREVIEW SUMMARY: final verdict"
 	if got := extractSummary(in2); got != "final verdict" {
 		t.Fatalf("expected last summary, got %q", got)
+	}
+}
+
+func TestParseReviewSectionsMultiline(t *testing.T) {
+	in := `PR summary: Aborts load-backup on a MultiSave failure instead of racing on a shared error.
+Issues:
+- etcd_restore.go:40 shared err variable written by multiple goroutines
+- etcd_restore.go:55 MultiSave failure silently swallowed
+Review suggestions: Approve after adding a -race regression test.`
+	secs := parseReviewSections(in)
+	if secs.PRSummary != "Aborts load-backup on a MultiSave failure instead of racing on a shared error." {
+		t.Fatalf("PRSummary = %q", secs.PRSummary)
+	}
+	if !strings.Contains(secs.Issues, "etcd_restore.go:40") || !strings.Contains(secs.Issues, "etcd_restore.go:55") {
+		t.Fatalf("Issues = %q", secs.Issues)
+	}
+	if secs.Suggestions != "Approve after adding a -race regression test." {
+		t.Fatalf("Suggestions = %q", secs.Suggestions)
+	}
+}
+
+func TestParseReviewSectionsInline(t *testing.T) {
+	in := "PR summary: fix the race. Issues: None. Review suggestions: LGTM"
+	secs := parseReviewSections(in)
+	if secs.PRSummary != "fix the race." || secs.Issues != "None." || secs.Suggestions != "LGTM" {
+		t.Fatalf("unexpected sections: %#v", secs)
+	}
+}
+
+func TestParseReviewSectionsFallback(t *testing.T) {
+	if secs := parseReviewSections("no headers here"); !secs.empty() {
+		t.Fatalf("expected empty sections, got %#v", secs)
+	}
+	if secs := parseReviewSections("PR summary: only this"); secs.empty() || secs.PRSummary != "only this" {
+		t.Fatalf("unexpected sections: %#v", secs)
+	}
+}
+
+func TestFormatReviewSections(t *testing.T) {
+	secs := reviewSections{PRSummary: "fix the race", Issues: "shared err", Suggestions: "LGTM after fix"}
+	got := formatReviewSections(secs)
+	for _, want := range []string{"REVIEW SUMMARY:", "PR summary:", "Issues:", "Review suggestions:", "fix the race", "shared err", "LGTM after fix"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("formatReviewSections missing %q:\n%s", want, got)
+		}
 	}
 }

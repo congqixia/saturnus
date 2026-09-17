@@ -357,6 +357,31 @@ EOF
 	}
 }
 
+func TestSubmitPublicBypassesUserAllowlist(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	svc := New(st, lark.New(lark.Config{}), Config{
+		Enabled:      true,
+		AllowedUsers: []string{"ou_allowed"},
+		Repos:        map[string]string{"a/b": t.TempDir()},
+	})
+	ctx := MessageContext{
+		Text:         "review https://github.com/a/b/pull/4",
+		ChatID:       "oc_c",
+		SenderOpenID: "ou_stranger",
+	}
+	if _, err := svc.Submit(ctx); err == nil {
+		t.Fatal("expected Submit to reject user outside review allowlist")
+	}
+	if _, err := svc.SubmitPublic(ctx); err != nil {
+		t.Fatalf("expected SubmitPublic to accept any sender, got %v", err)
+	}
+}
+
 func TestTaskMembers(t *testing.T) {
 	got := taskMembers("ou_r", "ou_q")
 	if len(got) != 2 || got[0] != "ou_r" || got[1] != "ou_q" {
@@ -369,6 +394,149 @@ func TestTaskMembers(t *testing.T) {
 	got = taskMembers("", "")
 	if len(got) != 0 {
 		t.Fatalf("expected empty members, got %#v", got)
+	}
+}
+
+func TestFormatResultStructuredSummary(t *testing.T) {
+	svc := New(nil, lark.New(lark.Config{}), Config{})
+	req := store.ReviewRequest{
+		ID:       "rvw_x",
+		Status:   "succeeded",
+		PRURL:    "https://github.com/a/b/pull/1",
+		Repo:     "a/b",
+		PRNumber: 1,
+		ResultText: "investigating...\n" +
+			"REVIEW SUMMARY:\n" +
+			"PR summary: fix the MultiSave race\n" +
+			"Issues:\n" +
+			"- etcd_restore.go:40 shared err is racy\n" +
+			"Review suggestions: LGTM after fix\n",
+	}
+	got := svc.FormatResult(req)
+	for _, want := range []string{"PR summary:", "Issues:", "Review suggestions:", "fix the MultiSave race", "shared err is racy"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("FormatResult missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestFormatResultFallsBackToRawSummary(t *testing.T) {
+	svc := New(nil, lark.New(lark.Config{}), Config{})
+	req := store.ReviewRequest{
+		ID:         "rvw_y",
+		Status:     "succeeded",
+		PRURL:      "https://github.com/a/b/pull/2",
+		Repo:       "a/b",
+		PRNumber:   2,
+		ResultText: "REVIEW SUMMARY: unformatted verdict",
+	}
+	got := svc.FormatResult(req)
+	if !strings.Contains(got, "unformatted verdict") {
+		t.Fatalf("FormatResult missing raw summary:\n%s", got)
+	}
+}
+
+type fakeLark struct {
+	enabled bool
+	task    lark.Task
+	sent    []string
+}
+
+func (f *fakeLark) Enabled() bool { return f.enabled }
+func (f *fakeLark) GetUserName(string) (string, error) {
+	return "", nil
+}
+func (f *fakeLark) SendText(_, _, _ string) error { return nil }
+func (f *fakeLark) SendTextToUser(openID, text string) error {
+	f.sent = append(f.sent, openID+": "+text)
+	return nil
+}
+func (f *fakeLark) CreateTask(lark.CreateTaskInput) (lark.Task, error) {
+	return f.task, nil
+}
+func (f *fakeLark) ReplyMessage(_, _ string) error { return nil }
+
+func TestMaybeCreateTaskNotifiesRequester(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	fake := &fakeLark{enabled: true, task: lark.Task{
+		GUID: "t_123",
+		URL:  "https://applink.feishu.cn/client/todo/detail?guid=t_123",
+	}}
+	svc := &Service{
+		store: st,
+		lark:  fake,
+		cfg:   Config{CreateTask: true, ReviewerOpenID: "ou_r"},
+	}
+	req := store.ReviewRequest{
+		ID:              "rvw_x",
+		Status:          "pending",
+		RequesterOpenID: "ou_q",
+		Repo:            "a/b",
+		PRNumber:        4,
+		PRURL:           "https://github.com/a/b/pull/4",
+	}
+	svc.maybeCreateTask(&req)
+	if req.TaskID != "t_123" || req.TaskURL != fake.task.URL {
+		t.Fatalf("task not stored: %#v", req)
+	}
+	if len(fake.sent) != 1 {
+		t.Fatalf("requester not notified: %#v", fake.sent)
+	}
+	for _, want := range []string{"ou_q", "t_123", fake.task.URL} {
+		if !strings.Contains(fake.sent[0], want) {
+			t.Fatalf("requester message missing %q: %s", want, fake.sent[0])
+		}
+	}
+}
+
+func TestMaybeCreateTaskSkipsRequesterNotificationWhenDisabled(t *testing.T) {
+	fake := &fakeLark{enabled: true, task: lark.Task{GUID: "t_1", URL: "https://applink.feishu.cn/client/todo/detail?guid=t_1"}}
+	svc := &Service{lark: fake, cfg: Config{CreateTask: false}}
+	svc.maybeCreateTask(&store.ReviewRequest{ID: "rvw_x", RequesterOpenID: "ou_q"})
+	if len(fake.sent) != 0 {
+		t.Fatalf("expected no notification when task creation disabled, got %#v", fake.sent)
+	}
+}
+
+func TestMaybeCreateTaskDeduplicatesAcrossReruns(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	fake := &fakeLark{enabled: true, task: lark.Task{GUID: "t_123", URL: "https://applink.feishu.cn/client/todo/detail?guid=t_123"}}
+	svc := &Service{
+		store: st,
+		lark:  fake,
+		cfg:   Config{CreateTask: true},
+	}
+	req := store.ReviewRequest{
+		ID:              "rvw_x",
+		Status:          "pending",
+		RequesterOpenID: "ou_q",
+		Repo:            "a/b",
+		PRNumber:        4,
+		PRURL:           "https://github.com/a/b/pull/4",
+	}
+
+	svc.maybeCreateTask(&req)
+	if req.TaskID != "t_123" || len(fake.sent) != 1 {
+		t.Fatalf("expected first task creation, got task=%#v sent=%#v", req, fake.sent)
+	}
+
+	req.Status = "pending"
+	svc.maybeCreateTask(&req)
+	if req.TaskID != "t_123" {
+		t.Fatalf("task id changed across rerun: %q", req.TaskID)
+	}
+	if len(fake.sent) != 1 {
+		t.Fatalf("expected no duplicate task/notification on rerun, got %#v", fake.sent)
 	}
 }
 

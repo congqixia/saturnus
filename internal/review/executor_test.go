@@ -53,6 +53,11 @@ func TestRenderCommand(t *testing.T) {
 	if got[3] == "" {
 		t.Fatal("expected non-empty prompt")
 	}
+	for _, want := range []string{"REVIEW SUMMARY:", "PR summary:", "Issues:", "Review suggestions:"} {
+		if !strings.Contains(got[3], want) {
+			t.Fatalf("prompt missing %q: %q", want, got[3])
+		}
+	}
 }
 
 func TestRenderCommandWithGuide(t *testing.T) {

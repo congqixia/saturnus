@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -24,9 +25,10 @@ import (
 )
 
 type server struct {
-	store   *store.Store
-	lark    *lark.Client
-	reviews *review.Service
+	store    *store.Store
+	lark     *lark.Client
+	reviews  *review.Service
+	botUsers []string
 }
 
 const shutdownTimeout = 15 * time.Second
@@ -60,9 +62,10 @@ func run(ctx context.Context, addr, data, staticDir string) (err error) {
 		AppSecret: os.Getenv("LARK_APP_SECRET"),
 	})
 	s := &server{
-		store:   st,
-		lark:    larkClient,
-		reviews: review.New(st, larkClient, reviewConfig()),
+		store:    st,
+		lark:     larkClient,
+		reviews:  review.New(st, larkClient, reviewConfig()),
+		botUsers: splitCSV(os.Getenv("SATURNUS_COMMAND_ALLOWED_USERS")),
 	}
 	s.reviews.Start()
 	defer s.reviews.Stop()
@@ -361,15 +364,49 @@ func (s *server) larkEvents(w http.ResponseWriter, r *http.Request) {
 	if command == "" {
 		if reply := s.maybeReview(msg); reply != "" {
 			_ = s.lark.SendText("chat_id", msg.ChatID, reply)
+		} else if !s.botAllowed(msg.SenderOpenID) {
+			_ = s.lark.SendText("chat_id", msg.ChatID, s.reviewUsageExample())
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 		return
 	}
-	reply := s.handleBotCommand(command, msg)
-	if msg.ChatID != "" {
-		_ = s.lark.SendText("chat_id", msg.ChatID, reply)
+	if !s.botAllowed(msg.SenderOpenID) {
+		_ = s.lark.SendText("chat_id", msg.ChatID, s.reviewUsageExample())
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "reply": reply})
+	reply := s.handleBotCommand(command, msg)
+	s.sendReply(msg, reply)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "reply": reply.text})
+}
+
+func (s *server) botAllowed(openID string) bool {
+	if openID == "" {
+		return false
+	}
+	for _, user := range s.botUsers {
+		if user == "*" {
+			return true
+		}
+		if user == openID {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *server) reviewUsageExample() string {
+	var b strings.Builder
+	b.WriteString("你好，我可以发起代码评审。直接发送 GitHub PR 链接即可，例如：")
+	b.WriteString("\nreview https://github.com/congqixia/saturnus/pull/1")
+	b.WriteString("\n或直接把 PR 链接粘贴过来，我会安排评审并把结果通知评审人。")
+	if s.reviews != nil && s.reviews.Enabled() {
+		repos := s.reviews.FormatRepos()
+		if repos != "" && !strings.HasPrefix(repos, "No repos") {
+			fmt.Fprintf(&b, "\n\n当前可评审的仓库：\n%s", repos)
+		}
+	}
+	return b.String()
 }
 
 func (s *server) maybeReview(msg review.MessageContext) string {
@@ -379,7 +416,7 @@ func (s *server) maybeReview(msg review.MessageContext) string {
 	if _, err := review.FindPRRequest(msg.Text); err != nil {
 		return ""
 	}
-	req, err := s.reviews.Submit(msg)
+	req, err := s.reviews.SubmitPublic(msg)
 	if err != nil {
 		if errors.Is(err, review.ErrAlreadyPending) {
 			return "Review already in progress: " + req.ID + " (" + req.PRURL + ")"
@@ -389,50 +426,392 @@ func (s *server) maybeReview(msg review.MessageContext) string {
 	return "Review started " + req.ID + " (" + req.PRURL + ")"
 }
 
-func (s *server) handleBotCommand(text string, msg review.MessageContext) string {
+type botReply struct {
+	text  string
+	table *lark.TableCard
+	md    *lark.MarkdownCard
+}
+
+func (s *server) sendReply(msg review.MessageContext, reply botReply) {
+	if msg.ChatID == "" {
+		return
+	}
+	switch {
+	case reply.table != nil:
+		if err := s.lark.SendTable("chat_id", msg.ChatID, *reply.table); err == nil {
+			return
+		} else {
+			log.Printf("send card to %s: %v", msg.ChatID, err)
+		}
+	case reply.md != nil:
+		if err := s.lark.SendMarkdownCard("chat_id", msg.ChatID, *reply.md); err == nil {
+			return
+		} else {
+			log.Printf("send card to %s: %v", msg.ChatID, err)
+		}
+	}
+	if reply.text != "" {
+		if err := s.lark.SendText("chat_id", msg.ChatID, reply.text); err != nil {
+			log.Printf("send text to %s: %v", msg.ChatID, err)
+		}
+	}
+}
+
+func optionTag(text, color string) map[string]any {
+	if color == "" {
+		return map[string]any{"text": text}
+	}
+	return map[string]any{"text": text, "color": color}
+}
+
+func statusOption(status string) any {
+	color := ""
+	switch status {
+	case "succeeded":
+		color = "green"
+	case "failed":
+		color = "red"
+	case "pending":
+		color = "blue"
+	case "reviewing":
+		color = "orange"
+	}
+	return optionTag(status, color)
+}
+
+func riskOption(risk string) any {
+	color := ""
+	switch strings.ToLower(risk) {
+	case "high":
+		color = "red"
+	case "medium":
+		color = "orange"
+	case "low":
+		color = "green"
+	}
+	return optionTag(risk, color)
+}
+
+func boolOption(v bool) any {
+	if v {
+		return optionTag("true", "green")
+	}
+	return optionTag("false", "grey")
+}
+
+// The /sat query commands below (sessions/pending/whois/reviews) render results
+// as native Feishu card-2.0 tables. The card/table schema, doc links and the
+// sizing rules are documented in internal/lark/table.go. Conventions used here:
+//   - each table uses percentage column widths summing to 100% so it fills the
+//     card (width_mode "fill") without horizontal overflow;
+//   - status/risk/autopass cells use colored "options" tags (optionTag);
+//   - timestamps use the native "date" column type (Unix ms) so Feishu renders
+//     them in the reader's local timezone;
+//   - at most 10 rows are shown (matches the table page_size of 10); the plain
+//     text field is kept as a fallback when card sending fails.
+
+func (s *server) sessionsReply() botReply {
+	sessions := s.store.ListSessions()
+	if len(sessions) == 0 {
+		return botReply{text: "No sessions."}
+	}
+	if len(sessions) > 10 {
+		sessions = sessions[:10]
+	}
+	var b strings.Builder
+	rows := make([]map[string]any, 0, len(sessions))
+	for _, session := range sessions {
+		fmt.Fprintf(&b, "%s %s auto=%v updated=%s\n", session.ID, session.Status, session.AutoPass, session.UpdatedAt.Format(time.RFC3339))
+		rows = append(rows, map[string]any{
+			"id":        session.ID,
+			"status":    statusOption(session.Status),
+			"autopass":  boolOption(session.AutoPass),
+			"updatedAt": lark.UnixMillis(session.UpdatedAt),
+		})
+	}
+	return botReply{
+		text: strings.TrimSpace(b.String()),
+		table: &lark.TableCard{
+			Title: "Sessions",
+			Columns: []lark.TableColumn{
+				{Name: "id", Display: "ID", DataType: lark.ColumnText, Width: "35%"},
+				{Name: "status", Display: "Status", DataType: lark.ColumnOption, Width: "18%"},
+				{Name: "autopass", Display: "AutoPass", DataType: lark.ColumnOption, Width: "18%"},
+				{Name: "updatedAt", Display: "UpdatedAt", DataType: lark.ColumnDate, DateFormat: "YYYY-MM-DD HH:mm", Width: "29%"},
+			},
+			Rows: rows,
+		},
+	}
+}
+
+func (s *server) pendingReply() botReply {
+	approvals := s.store.ListApprovals("pending")
+	if len(approvals) == 0 {
+		return botReply{text: "No pending approvals."}
+	}
+	if len(approvals) > 10 {
+		approvals = approvals[:10]
+	}
+	var b strings.Builder
+	rows := make([]map[string]any, 0, len(approvals))
+	for _, req := range approvals {
+		fmt.Fprintf(&b, "%s session=%s tool=%s risk=%s\n", req.ID, req.SessionID, req.ToolName, req.RiskLevel)
+		rows = append(rows, map[string]any{
+			"id":      req.ID,
+			"session": req.SessionID,
+			"tool":    req.ToolName,
+			"risk":    riskOption(req.RiskLevel),
+		})
+	}
+	return botReply{
+		text: strings.TrimSpace(b.String()),
+		table: &lark.TableCard{
+			Title: "Pending Approvals",
+			Columns: []lark.TableColumn{
+				{Name: "id", Display: "ID", DataType: lark.ColumnText, Width: "30%"},
+				{Name: "session", Display: "Session", DataType: lark.ColumnText, Width: "40%"},
+				{Name: "tool", Display: "Tool", DataType: lark.ColumnText, Width: "12%"},
+				{Name: "risk", Display: "Risk", DataType: lark.ColumnOption, Width: "18%"},
+			},
+			Rows: rows,
+		},
+	}
+}
+
+func (s *server) whoisReply(query string) botReply {
+	users, err := s.lark.ResolveUser(query)
+	if err != nil {
+		return botReply{text: "Whois failed: " + err.Error()}
+	}
+	if len(users) == 0 {
+		return botReply{text: "No users found for " + query}
+	}
+	var b strings.Builder
+	rows := make([]map[string]any, 0, len(users))
+	for _, user := range users {
+		fmt.Fprintf(&b, "%s open_id=%s", user.Name, user.OpenID)
+		if user.Email != "" {
+			fmt.Fprintf(&b, " email=%s", user.Email)
+		}
+		if user.Mobile != "" {
+			fmt.Fprintf(&b, " mobile=%s", user.Mobile)
+		}
+		b.WriteString("\n")
+		rows = append(rows, map[string]any{
+			"name":   user.Name,
+			"openID": user.OpenID,
+			"email":  user.Email,
+			"mobile": user.Mobile,
+		})
+	}
+	return botReply{
+		text: strings.TrimSpace(b.String()),
+		table: &lark.TableCard{
+			Title: "Users",
+			Columns: []lark.TableColumn{
+				{Name: "name", Display: "Name", DataType: lark.ColumnText, Width: "15%"},
+				{Name: "openID", Display: "OpenID", DataType: lark.ColumnText, Width: "35%"},
+				{Name: "email", Display: "Email", DataType: lark.ColumnText, Width: "30%"},
+				{Name: "mobile", Display: "Mobile", DataType: lark.ColumnText, Width: "20%"},
+			},
+			Rows: rows,
+		},
+	}
+}
+
+func (s *server) reviewsReply() botReply {
+	reqs := s.reviews.List("")
+	if len(reqs) == 0 {
+		return botReply{text: "No reviews."}
+	}
+	if len(reqs) > 10 {
+		reqs = reqs[:10]
+	}
+	rows := make([]map[string]any, 0, len(reqs))
+	for _, req := range reqs {
+		requester := req.RequesterName
+		if requester == "" {
+			requester = req.RequesterOpenID
+		}
+		rows = append(rows, map[string]any{
+			"id":        req.ID,
+			"status":    statusOption(req.Status),
+			"repo":      fmt.Sprintf("%s#%d", req.Repo, req.PRNumber),
+			"requester": requester,
+			"createdAt": lark.UnixMillis(req.CreatedAt),
+		})
+	}
+	return botReply{
+		text: s.reviews.FormatList(s.reviews.List("")),
+		table: &lark.TableCard{
+			Title: "PR Reviews",
+			Columns: []lark.TableColumn{
+				{Name: "id", Display: "ID", DataType: lark.ColumnText, Width: "20%"},
+				{Name: "status", Display: "Status", DataType: lark.ColumnOption, Width: "12%"},
+				{Name: "repo", Display: "Repo#PR", DataType: lark.ColumnText, Width: "25%"},
+				{Name: "requester", Display: "Requester", DataType: lark.ColumnText, Width: "26%"},
+				{Name: "createdAt", Display: "Created", DataType: lark.ColumnDate, DateFormat: "YYYY-MM-DD HH:mm", Width: "17%"},
+			},
+			Rows: rows,
+		},
+	}
+}
+
+func (s *server) describeReviewReply(id string) botReply {
+	req, err := s.reviews.Get(id)
+	if err != nil {
+		return botReply{text: "Review not found."}
+	}
+	s.reviews.ResolveRequesterName(&req)
+	return botReply{
+		text: s.reviews.FormatOne(req),
+		md: &lark.MarkdownCard{
+			Title:   "Review " + req.ID,
+			Content: formatReviewMarkdown(req, s.reviews.Tool()),
+		},
+	}
+}
+
+// formatReviewMarkdown renders a single review as markdown for a card. Metadata
+// values (title, requester, error) are escaped so they cannot break the
+// markdown; the review ResultText is intentionally left raw since it is itself
+// the tool's markdown-ish output.
+func formatReviewMarkdown(req store.ReviewRequest, tool string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "**Status**: `%s`\n", req.Status)
+	if req.PRURL != "" {
+		label := fmt.Sprintf("%s#%d", req.Repo, req.PRNumber)
+		fmt.Fprintf(&b, "**PR**: [%s](%s)\n", label, req.PRURL)
+	}
+	if req.Title != "" {
+		fmt.Fprintf(&b, "**Title**: %s\n", escapeMarkdown(req.Title))
+	}
+	if req.RequesterName != "" || req.RequesterOpenID != "" {
+		name := req.RequesterName
+		if name == "" {
+			name = req.RequesterOpenID
+		}
+		fmt.Fprintf(&b, "**Requester**: %s\n", escapeMarkdown(name))
+	}
+	if !req.CreatedAt.IsZero() {
+		fmt.Fprintf(&b, "**Created**: %s\n", req.CreatedAt.Local().Format("2006-01-02 15:04:05"))
+	}
+	if !req.CompletedAt.IsZero() {
+		fmt.Fprintf(&b, "**Completed**: %s\n", req.CompletedAt.Local().Format("2006-01-02 15:04:05"))
+	}
+	if req.TaskID != "" {
+		if req.TaskURL != "" {
+			fmt.Fprintf(&b, "**Task**: [%s](%s)\n", req.TaskID, req.TaskURL)
+		} else {
+			fmt.Fprintf(&b, "**Task**: `%s`\n", req.TaskID)
+		}
+	}
+	if req.SessionID != "" {
+		fmt.Fprintf(&b, "**Session**: `%s` (continue: `%s run --session %s`)\n", req.SessionID, tool, req.SessionID)
+	}
+	if req.Error != "" {
+		fmt.Fprintf(&b, "**Error**: %s\n", escapeMarkdown(req.Error))
+	}
+	if req.ResultText != "" {
+		b.WriteString("\n---\n\n")
+		b.WriteString(truncateText(req.ResultText, 3000))
+	}
+	return b.String()
+}
+
+func escapeMarkdown(s string) string {
+	return strings.NewReplacer(
+		"\\", "\\\\",
+		"`", "\\`",
+		"*", "\\*",
+		"_", "\\_",
+		"[", "\\[",
+		"]", "\\]",
+	).Replace(s)
+}
+
+func truncateText(value string, max int) string {
+	if len(value) <= max {
+		return value
+	}
+	return value[:max] + "\n...[truncated]"
+}
+
+// satCommandList is the single source of truth for /sat commands, used by both
+// /sat help and the plain "/sat" reply. Keep it in sync with the "case" arms of
+// handleBotCommand below and with the README.
+var satCommandList = []struct {
+	command     string
+	description string
+}{
+	{"/sat help", "show this help"},
+	{"/sat sessions", "list recent sessions"},
+	{"/sat pending", "list pending approvals"},
+	{"/sat session <session_id>", "show one session"},
+	{"/sat approve <request_id>", "approve a pending request"},
+	{"/sat deny <request_id> <reason>", "deny a pending request"},
+	{"/sat autopass on|off <session_id>", "toggle auto-approve for a session"},
+	{"/sat reviews", "list recent PR reviews"},
+	{"/sat review <pr-url|review_id>", "start a review, or show one review by id"},
+	{"/sat describe review <review_id>", "show full details of one review"},
+	{"/sat repos", "show the configured review repos"},
+	{"/sat whoami", "show your open_id"},
+	{"/sat whois <name|email|mobile>", "resolve a user to open_id"},
+	{"/sat reply <review_id> <message>", "reviewer replies to the requester"},
+}
+
+func helpText() string {
+	var b strings.Builder
+	for i, c := range satCommandList {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		fmt.Fprintf(&b, "%s - %s", c.command, c.description)
+	}
+	return b.String()
+}
+
+func helpMarkdown() string {
+	var b strings.Builder
+	for i, c := range satCommandList {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		fmt.Fprintf(&b, "**%s** — %s", c.command, c.description)
+	}
+	return b.String()
+}
+
+func (s *server) handleBotCommand(text string, msg review.MessageContext) botReply {
 	fields := strings.Fields(text)
 	if len(fields) < 2 {
-		return "Commands: /sat sessions, /sat pending, /sat session <id>, /sat approve <id>, /sat deny <id> <reason>, /sat autopass on|off <session_id>, /sat review <url|id>, /sat reviews, /sat repos, /sat whoami, /sat whois <name|email|mobile>, /sat reply <review_id> <message>"
+		return botReply{
+			text: helpText(),
+			md:   &lark.MarkdownCard{Title: "Saturnus Commands", Content: helpMarkdown()},
+		}
 	}
 	switch fields[1] {
+	case "help":
+		return botReply{
+			text: helpText(),
+			md:   &lark.MarkdownCard{Title: "Saturnus Commands", Content: helpMarkdown()},
+		}
 	case "sessions":
-		sessions := s.store.ListSessions()
-		if len(sessions) == 0 {
-			return "No sessions."
-		}
-		var b strings.Builder
-		for i, session := range sessions {
-			if i >= 10 {
-				break
-			}
-			fmt.Fprintf(&b, "%s %s auto=%v updated=%s\n", session.ID, session.Status, session.AutoPass, session.UpdatedAt.Format(time.RFC3339))
-		}
-		return strings.TrimSpace(b.String())
+		return s.sessionsReply()
 	case "pending":
-		approvals := s.store.ListApprovals("pending")
-		if len(approvals) == 0 {
-			return "No pending approvals."
-		}
-		var b strings.Builder
-		for i, req := range approvals {
-			if i >= 10 {
-				break
-			}
-			fmt.Fprintf(&b, "%s session=%s tool=%s risk=%s\n", req.ID, req.SessionID, req.ToolName, req.RiskLevel)
-		}
-		return strings.TrimSpace(b.String())
+		return s.pendingReply()
 	case "session":
 		if len(fields) < 3 {
-			return "Usage: /sat session <session_id>"
+			return botReply{text: "Usage: /sat session <session_id>"}
 		}
 		session, events, err := s.store.GetSession(fields[2])
 		if err != nil {
-			return "Session not found."
+			return botReply{text: "Session not found."}
 		}
-		return fmt.Sprintf("%s status=%s auto=%v events=%d cwd=%s", session.ID, session.Status, session.AutoPass, len(events), session.CWD)
+		return botReply{text: fmt.Sprintf("%s status=%s auto=%v events=%d cwd=%s", session.ID, session.Status, session.AutoPass, len(events), session.CWD)}
 	case "approve":
 		if len(fields) < 3 {
-			return "Usage: /sat approve <request_id>"
+			return botReply{text: "Usage: /sat approve <request_id>"}
 		}
 		_, _, err := s.store.DecideApproval(fields[2], store.ApprovalDecision{
 			Decision:  "approved",
@@ -440,12 +819,12 @@ func (s *server) handleBotCommand(text string, msg review.MessageContext) string
 			Source:    "lark",
 		})
 		if err != nil {
-			return "Approve failed: " + err.Error()
+			return botReply{text: "Approve failed: " + err.Error()}
 		}
-		return "Approved " + fields[2]
+		return botReply{text: "Approved " + fields[2]}
 	case "deny":
 		if len(fields) < 3 {
-			return "Usage: /sat deny <request_id> <reason>"
+			return botReply{text: "Usage: /sat deny <request_id> <reason>"}
 		}
 		reason := strings.TrimSpace(strings.TrimPrefix(text, strings.Join(fields[:3], " ")))
 		_, _, err := s.store.DecideApproval(fields[2], store.ApprovalDecision{
@@ -455,25 +834,25 @@ func (s *server) handleBotCommand(text string, msg review.MessageContext) string
 			Reason:    reason,
 		})
 		if err != nil {
-			return "Deny failed: " + err.Error()
+			return botReply{text: "Deny failed: " + err.Error()}
 		}
-		return "Denied " + fields[2]
+		return botReply{text: "Denied " + fields[2]}
 	case "autopass":
 		if len(fields) < 4 {
-			return "Usage: /sat autopass on|off <session_id>"
+			return botReply{text: "Usage: /sat autopass on|off <session_id>"}
 		}
 		enabled := fields[2] == "on"
 		if fields[2] != "on" && fields[2] != "off" {
-			return "Usage: /sat autopass on|off <session_id>"
+			return botReply{text: "Usage: /sat autopass on|off <session_id>"}
 		}
 		session, err := s.store.UpdateAutoPass(fields[3], enabled, 30*time.Minute, "lark", "lark")
 		if err != nil {
-			return "Auto-pass update failed: " + err.Error()
+			return botReply{text: "Auto-pass update failed: " + err.Error()}
 		}
-		return fmt.Sprintf("Auto-pass for %s is now %v until %s", session.ID, session.AutoPass, session.AutoPassUntil.Format(time.RFC3339))
+		return botReply{text: fmt.Sprintf("Auto-pass for %s is now %v until %s", session.ID, session.AutoPass, session.AutoPassUntil.Format(time.RFC3339))}
 	case "whoami":
 		if msg.SenderOpenID == "" {
-			return "Unknown sender: no open_id in message context."
+			return botReply{text: "Unknown sender: no open_id in message context."}
 		}
 		name := msg.SenderName
 		if name == "" && s.lark.Enabled() {
@@ -484,70 +863,57 @@ func (s *server) handleBotCommand(text string, msg review.MessageContext) string
 		if name == "" {
 			name = "unknown"
 		}
-		return fmt.Sprintf("%s open_id=%s", name, msg.SenderOpenID)
+		return botReply{text: fmt.Sprintf("%s open_id=%s", name, msg.SenderOpenID)}
 	case "whois":
 		if len(fields) < 3 {
-			return "Usage: /sat whois <name|email|mobile>"
+			return botReply{text: "Usage: /sat whois <name|email|mobile>"}
 		}
 		query := strings.TrimSpace(strings.TrimPrefix(text, strings.Join(fields[:2], " ")))
-		users, err := s.lark.ResolveUser(query)
-		if err != nil {
-			return "Whois failed: " + err.Error()
-		}
-		if len(users) == 0 {
-			return "No users found for " + query
-		}
-		var b strings.Builder
-		for _, user := range users {
-			fmt.Fprintf(&b, "%s open_id=%s", user.Name, user.OpenID)
-			if user.Email != "" {
-				fmt.Fprintf(&b, " email=%s", user.Email)
-			}
-			if user.Mobile != "" {
-				fmt.Fprintf(&b, " mobile=%s", user.Mobile)
-			}
-			b.WriteString("\n")
-		}
-		return strings.TrimSpace(b.String())
+		return s.whoisReply(query)
 	case "reviews":
-		return s.reviews.FormatList(s.reviews.List(""))
+		return s.reviewsReply()
 	case "repos":
-		return s.reviews.FormatRepos()
+		return botReply{text: s.reviews.FormatRepos()}
 	case "review":
 		if len(fields) < 3 {
-			return "Usage: /sat review <pr-url> or /sat review <review_id>"
+			return botReply{text: "Usage: /sat review <pr-url> or /sat review <review_id>"}
 		}
 		if strings.HasPrefix(fields[2], "rvw_") {
 			req, err := s.reviews.Get(fields[2])
 			if err != nil {
-				return "Review not found."
+				return botReply{text: "Review not found."}
 			}
 			s.reviews.ResolveRequesterName(&req)
-			return s.reviews.FormatOne(req)
+			return botReply{text: s.reviews.FormatOne(req)}
 		}
 		msg.Text = text
 		req, err := s.reviews.Submit(msg)
 		if err != nil {
 			if errors.Is(err, review.ErrAlreadyPending) {
-				return "Review already in progress: " + req.ID + " (" + req.PRURL + ")"
+				return botReply{text: "Review already in progress: " + req.ID + " (" + req.PRURL + ")"}
 			}
-			return "Review failed: " + err.Error()
+			return botReply{text: "Review failed: " + err.Error()}
 		}
-		return "Review started " + req.ID + " (" + req.PRURL + ")"
+		return botReply{text: "Review started " + req.ID + " (" + req.PRURL + ")"}
+	case "describe":
+		if len(fields) < 4 || fields[2] != "review" {
+			return botReply{text: "Usage: /sat describe review <review_id>"}
+		}
+		return s.describeReviewReply(fields[3])
 	case "reply":
 		if len(fields) < 4 {
-			return "Usage: /sat reply <review_id> <message>"
+			return botReply{text: "Usage: /sat reply <review_id> <message>"}
 		}
 		message := strings.TrimSpace(strings.TrimPrefix(text, strings.Join(fields[:3], " ")))
 		if message == "" {
-			return "Usage: /sat reply <review_id> <message>"
+			return botReply{text: "Usage: /sat reply <review_id> <message>"}
 		}
 		if err := s.reviews.ReplyToRequester(fields[2], msg.SenderOpenID, message); err != nil {
-			return "Reply failed: " + err.Error()
+			return botReply{text: "Reply failed: " + err.Error()}
 		}
-		return "Replied to requester for " + fields[2]
+		return botReply{text: "Replied to requester for " + fields[2]}
 	default:
-		return "Unknown command."
+		return botReply{text: "Unknown command. Type /sat help to see all commands."}
 	}
 }
 
@@ -648,15 +1014,15 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 	return parsed
 }
 
+var satCommandPattern = regexp.MustCompile(`(^|\s)/sat(\s|$)`)
+
 func satCommand(text string) string {
 	text = strings.TrimSpace(text)
-	if strings.HasPrefix(text, "/sat") {
-		return text
+	loc := satCommandPattern.FindStringIndex(text)
+	if loc == nil {
+		return ""
 	}
-	if idx := strings.Index(text, "/sat"); idx >= 0 {
-		return strings.TrimSpace(text[idx:])
-	}
-	return ""
+	return strings.TrimSpace(text[loc[0]:])
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, out any) bool {

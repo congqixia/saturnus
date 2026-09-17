@@ -243,8 +243,14 @@ plain chat, which is handled without the command layer. Any other message from
 them gets a plain-text usage hint (no `/sat` syntax).
 
 Note: `whois` calls the Lark contact API (`users/search` for names,
-`users/batch_get_id` for email/mobile), so the app needs the corresponding
-contact read scope (e.g. `contact:user.base:readonly`).
+`users/batch_get_id` for email/mobile), and requester display names are
+resolved via `users/:user_id`, so the app needs the corresponding
+contact read scope. If the API answers with `code: 0` but only identity
+fields (`open_id`/`union_id`) and no `name`, the app is missing the
+`contact:user.base:readonly` scope (获取用户基本信息) — grant it and
+re-publish the app. Name-lookup failures are logged server-side and never
+block review processing (they fall back to showing the open_id, and are
+backed off for 15 minutes to avoid hammering the API).
 
 See `docs/plan/pr-review.md` for the full design.
 

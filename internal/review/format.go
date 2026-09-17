@@ -28,7 +28,9 @@ func stripANSI(s string) string {
 	return b.String()
 }
 
-func extractSummary(text string) string {
+// ExtractSummary returns the text after the last "REVIEW SUMMARY:" marker,
+// or "" when the marker is absent.
+func ExtractSummary(text string) string {
 	idx := strings.LastIndex(text, summaryMarker)
 	if idx < 0 {
 		return ""

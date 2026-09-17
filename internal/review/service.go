@@ -61,9 +61,15 @@ type Service struct {
 	wg     sync.WaitGroup
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	// nameFailures tracks recent requester-name resolution failures by open_id
+	// so repeated lookups (e.g. web UI polling) do not hammer the contact API
+	// or spam the logs. Keyed by open_id, value is the failure time.
+	nameFailures   map[string]time.Time
+	nameFailuresMu sync.Mutex
 }
 
-func New(st *store.Store, lk *lark.Client, cfg Config) *Service {
+func New(st *store.Store, lk larkClient, cfg Config) *Service {
 	if cfg.Tool == "" {
 		cfg.Tool = "opencode"
 	}
@@ -87,12 +93,13 @@ func New(st *store.Store, lk *lark.Client, cfg Config) *Service {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Service{
-		store:  st,
-		lark:   lk,
-		cfg:    cfg,
-		jobs:   make(chan string, 64),
-		ctx:    ctx,
-		cancel: cancel,
+		store:        st,
+		lark:         lk,
+		cfg:          cfg,
+		jobs:         make(chan string, 64),
+		ctx:          ctx,
+		cancel:       cancel,
+		nameFailures: map[string]time.Time{},
 	}
 }
 
@@ -394,15 +401,23 @@ func (s *Service) ReplyToRequester(reviewID, senderOpenID, text string) error {
 }
 
 func (s *Service) BackfillRequesterNames() {
+	if !s.lark.Enabled() {
+		return
+	}
 	for _, r := range s.store.ListReviews("") {
 		if r.RequesterName == "" && r.RequesterOpenID != "" {
-			s.resolveRequesterName(&r)
+			if err := s.resolveRequesterName(&r); err != nil {
+				logf("backfill requester names: %v", err)
+			}
 		}
 	}
 }
 
-func (s *Service) ResolveRequesterName(req *store.ReviewRequest) {
-	s.resolveRequesterName(req)
+// ResolveRequesterName resolves and persists the requester's display name for a
+// review. The error is returned so callers can log it for later analysis;
+// failures are best-effort and never block review processing.
+func (s *Service) ResolveRequesterName(req *store.ReviewRequest) error {
+	return s.resolveRequesterName(req)
 }
 
 func (s *Service) loadGuide(repo, repoRoot string) (string, error) {
@@ -634,7 +649,7 @@ func (s *Service) FormatResult(req store.ReviewRequest) string {
 		fmt.Fprintf(&b, "\nerror=%s", req.Error)
 	}
 	clean := stripANSI(req.ResultText)
-	if summary := extractSummary(clean); summary != "" {
+	if summary := ExtractSummary(clean); summary != "" {
 		if secs := parseReviewSections(summary); !secs.empty() {
 			fmt.Fprintf(&b, "\n\n%s", formatReviewSections(secs))
 		} else {
@@ -649,26 +664,71 @@ func (s *Service) FormatResult(req store.ReviewRequest) string {
 	return b.String()
 }
 
-func (s *Service) resolveRequesterName(req *store.ReviewRequest) {
-	if req.RequesterName != "" || req.RequesterOpenID == "" || !s.lark.Enabled() {
-		return
+// requesterNameBackoff stops repeated contact-API lookups for an open_id whose
+// name resolution recently failed. Without it, the web UI's periodic review
+// polling would hammer the contact API and spam the logs every few seconds.
+const requesterNameBackoff = 15 * time.Minute
+
+// resolveRequesterName resolves and persists the requester's display name for a
+// review. It returns nil when the name is already set, when there is no open_id
+// to look up, or on success; otherwise it returns a descriptive error for
+// callers to log. Failures never block review processing. After a failure the
+// open_id is backed off so retries are skipped silently for a while.
+func (s *Service) resolveRequesterName(req *store.ReviewRequest) error {
+	if req.RequesterName != "" || req.RequesterOpenID == "" {
+		return nil
+	}
+	if !s.lark.Enabled() {
+		return errors.New("lark client disabled")
+	}
+	if s.inNameBackoff(req.RequesterOpenID) {
+		// Recent attempt already failed; skip silently so the caller keeps the
+		// open_id fallback without another API call or log line.
+		return nil
 	}
 	name, err := s.lark.GetUserName(req.RequesterOpenID)
 	if err != nil {
-		logf("resolve requester name for %s: %v", req.ID, err)
-		return
+		s.recordNameFailure(req.RequesterOpenID)
+		return fmt.Errorf("resolve requester name for %s (open_id=%s): %w", req.ID, req.RequesterOpenID, err)
 	}
 	if name == "" {
-		return
+		s.recordNameFailure(req.RequesterOpenID)
+		return fmt.Errorf("resolve requester name for %s (open_id=%s): contact API returned no name fields (grant the app the contact:user.base:readonly scope)", req.ID, req.RequesterOpenID)
 	}
+	s.clearNameFailure(req.RequesterOpenID)
 	req.RequesterName = name
 	if _, err := s.store.UpdateReview(*req); err != nil {
-		logf("store requester name for %s: %v", req.ID, err)
+		return fmt.Errorf("store requester name for %s: %w", req.ID, err)
 	}
+	return nil
+}
+
+func (s *Service) inNameBackoff(openID string) bool {
+	s.nameFailuresMu.Lock()
+	defer s.nameFailuresMu.Unlock()
+	last, ok := s.nameFailures[openID]
+	return ok && time.Since(last) < requesterNameBackoff
+}
+
+func (s *Service) recordNameFailure(openID string) {
+	s.nameFailuresMu.Lock()
+	defer s.nameFailuresMu.Unlock()
+	if s.nameFailures == nil {
+		s.nameFailures = map[string]time.Time{}
+	}
+	s.nameFailures[openID] = time.Now()
+}
+
+func (s *Service) clearNameFailure(openID string) {
+	s.nameFailuresMu.Lock()
+	defer s.nameFailuresMu.Unlock()
+	delete(s.nameFailures, openID)
 }
 
 func (s *Service) notifyReviewer(req store.ReviewRequest) {
-	s.resolveRequesterName(&req)
+	if err := s.resolveRequesterName(&req); err != nil {
+		logf("notifyReviewer: %v", err)
+	}
 	text := s.FormatResult(req)
 	var err error
 	switch {

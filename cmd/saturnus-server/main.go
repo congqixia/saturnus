@@ -313,7 +313,9 @@ func (s *server) getReview(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	s.reviews.ResolveRequesterName(&req)
+	if err := s.reviews.ResolveRequesterName(&req); err != nil {
+		logRequesterResolveFailure(req, err)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"review": req})
 }
 
@@ -619,6 +621,44 @@ func (s *server) whoisReply(query string) botReply {
 	}
 }
 
+// requesterNameResolveBudget bounds how long a /sat query spends resolving
+// requester names so a slow or down contact API cannot stall the reply.
+const requesterNameResolveBudget = 3 * time.Second
+
+// logRequesterResolveFailure logs a failed requester-name lookup with enough
+// context (review id, open_id, status) to analyze later without blocking.
+func logRequesterResolveFailure(req store.ReviewRequest, err error) {
+	if err == nil {
+		return
+	}
+	log.Printf("saturnus: resolve requester name failed for review %s (open_id=%s status=%s): %v", req.ID, req.RequesterOpenID, req.Status, err)
+}
+
+// resolveRequesterNames fills missing requester names for a review list,
+// persisting successful lookups. It is best-effort and non-blocking: when the
+// contact API fails or the time budget is exhausted, the caller keeps showing
+// the open_id and the failure is logged server-side for later analysis.
+func (s *server) resolveRequesterNames(reqs []store.ReviewRequest) {
+	deadline := time.Now().Add(requesterNameResolveBudget)
+	skipped := 0
+	for i := range reqs {
+		req := &reqs[i]
+		if req.RequesterName != "" || req.RequesterOpenID == "" {
+			continue
+		}
+		if time.Now().After(deadline) {
+			skipped++
+			continue
+		}
+		if err := s.reviews.ResolveRequesterName(req); err != nil {
+			logRequesterResolveFailure(*req, err)
+		}
+	}
+	if skipped > 0 {
+		log.Printf("saturnus: requester name resolution budget exceeded; skipped %d review(s), open_id shown", skipped)
+	}
+}
+
 func (s *server) reviewsReply() botReply {
 	reqs := s.reviews.List("")
 	if len(reqs) == 0 {
@@ -627,17 +667,17 @@ func (s *server) reviewsReply() botReply {
 	if len(reqs) > 10 {
 		reqs = reqs[:10]
 	}
+	// Best-effort: fill missing requester names (persisted on success) and log
+	// failures. Never blocks the reply; unresolved names fall back to open_id.
+	s.resolveRequesterNames(reqs)
+
 	rows := make([]map[string]any, 0, len(reqs))
 	for _, req := range reqs {
-		requester := req.RequesterName
-		if requester == "" {
-			requester = req.RequesterOpenID
-		}
 		rows = append(rows, map[string]any{
 			"id":        req.ID,
 			"status":    statusOption(req.Status),
 			"repo":      fmt.Sprintf("%s#%d", req.Repo, req.PRNumber),
-			"requester": requester,
+			"requester": requesterDisplayName(req),
 			"createdAt": lark.UnixMillis(req.CreatedAt),
 		})
 	}
@@ -657,12 +697,23 @@ func (s *server) reviewsReply() botReply {
 	}
 }
 
+// requesterDisplayName returns the requester's display name, falling back to
+// the open_id when no name could be resolved or stored.
+func requesterDisplayName(req store.ReviewRequest) string {
+	if req.RequesterName != "" {
+		return req.RequesterName
+	}
+	return req.RequesterOpenID
+}
+
 func (s *server) describeReviewReply(id string) botReply {
 	req, err := s.reviews.Get(id)
 	if err != nil {
 		return botReply{text: "Review not found."}
 	}
-	s.reviews.ResolveRequesterName(&req)
+	if err := s.reviews.ResolveRequesterName(&req); err != nil {
+		logRequesterResolveFailure(req, err)
+	}
 	return botReply{
 		text: s.reviews.FormatOne(req),
 		md: &lark.MarkdownCard{
@@ -674,8 +725,12 @@ func (s *server) describeReviewReply(id string) botReply {
 
 // formatReviewMarkdown renders a single review as markdown for a card. Metadata
 // values (title, requester, error) are escaped so they cannot break the
-// markdown; the review ResultText is intentionally left raw since it is itself
-// the tool's markdown-ish output.
+// markdown. The tool output is intentionally left raw since it is itself
+// markdown-ish:
+//   - for a running review the tail of the output is shown so the latest
+//     progress is visible without scrolling through the whole transcript;
+//   - for a completed review the full REVIEW SUMMARY block is shown instead
+//     (falling back to the output tail when the tool omitted the marker).
 func formatReviewMarkdown(req store.ReviewRequest, tool string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "**Status**: `%s`\n", req.Status)
@@ -714,9 +769,38 @@ func formatReviewMarkdown(req store.ReviewRequest, tool string) string {
 	}
 	if req.ResultText != "" {
 		b.WriteString("\n---\n\n")
-		b.WriteString(truncateText(req.ResultText, 3000))
+		if reviewCompleted(req) {
+			if summary := review.ExtractSummary(req.ResultText); summary != "" {
+				b.WriteString(truncateText(summary, maxSummaryChars))
+			} else {
+				b.WriteString(tailText(req.ResultText, maxTailChars))
+			}
+		} else {
+			b.WriteString(tailText(req.ResultText, maxTailChars))
+		}
 	}
 	return b.String()
+}
+
+// reviewCompleted reports whether a review reached a terminal state.
+func reviewCompleted(req store.ReviewRequest) bool {
+	return req.Status == "succeeded" || req.Status == "failed" || !req.CompletedAt.IsZero()
+}
+
+// maxSummaryChars / maxTailChars bound how much of the tool output a describe
+// card shows so it stays within the card content limits.
+const (
+	maxSummaryChars = 8000
+	maxTailChars    = 2000
+)
+
+// tailText returns the last max bytes of value, prefixed with a marker when
+// earlier output was omitted.
+func tailText(value string, max int) string {
+	if len(value) <= max {
+		return value
+	}
+	return "...[earlier output omitted]\n" + value[len(value)-max:]
 }
 
 func escapeMarkdown(s string) string {

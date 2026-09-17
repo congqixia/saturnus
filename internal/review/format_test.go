@@ -23,15 +23,15 @@ func TestStripANSI(t *testing.T) {
 }
 
 func TestExtractSummary(t *testing.T) {
-	if got := extractSummary("no marker here"); got != "" {
+	if got := ExtractSummary("no marker here"); got != "" {
 		t.Fatalf("expected empty, got %q", got)
 	}
 	in := "some output\nREVIEW SUMMARY: LGTM overall, one nit about error handling.\n"
-	if got := extractSummary(in); got != "LGTM overall, one nit about error handling." {
+	if got := ExtractSummary(in); got != "LGTM overall, one nit about error handling." {
 		t.Fatalf("extractSummary = %q", got)
 	}
 	in2 := "first\nREVIEW SUMMARY: old\nmore\nREVIEW SUMMARY: final verdict"
-	if got := extractSummary(in2); got != "final verdict" {
+	if got := ExtractSummary(in2); got != "final verdict" {
 		t.Fatalf("expected last summary, got %q", got)
 	}
 }

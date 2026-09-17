@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 )
@@ -191,7 +192,18 @@ func (c *Client) GetUserName(openID string) (string, error) {
 	if resp.StatusCode >= 300 {
 		return "", fmt.Errorf("lark contact get failed: %s", resp.Status)
 	}
-	return parseContactUserName(raw)
+	name, err := parseContactUserName(raw)
+	if err != nil {
+		return "", err
+	}
+	if name == "" {
+		// Debug aid: the API answered with code 0 but no name was extracted.
+		// A user object containing only identity fields (open_id/union_id/user_id)
+		// means the app lacks the field-level permission to read names, i.e. the
+		// contact:user.base:readonly scope (获取用户基本信息) is not granted.
+		fmt.Fprintf(os.Stderr, "lark: contact user %s returned no name fields (likely missing contact:user.base:readonly scope); response: %.800s\n", openID, string(raw))
+	}
+	return name, nil
 }
 
 func parseContactUserName(raw []byte) (string, error) {

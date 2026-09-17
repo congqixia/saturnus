@@ -437,14 +437,17 @@ func TestFormatResultFallsBackToRawSummary(t *testing.T) {
 }
 
 type fakeLark struct {
-	enabled bool
-	task    lark.Task
-	sent    []string
+	enabled   bool
+	task      lark.Task
+	sent      []string
+	userName  string
+	userCalls int
 }
 
 func (f *fakeLark) Enabled() bool { return f.enabled }
 func (f *fakeLark) GetUserName(string) (string, error) {
-	return "", nil
+	f.userCalls++
+	return f.userName, nil
 }
 func (f *fakeLark) SendText(_, _, _ string) error { return nil }
 func (f *fakeLark) SendTextToUser(openID, text string) error {
@@ -537,6 +540,137 @@ func TestMaybeCreateTaskDeduplicatesAcrossReruns(t *testing.T) {
 	}
 	if len(fake.sent) != 1 {
 		t.Fatalf("expected no duplicate task/notification on rerun, got %#v", fake.sent)
+	}
+}
+
+func TestResolveRequesterNameSuccess(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	thread, err := st.GetOrCreateReviewThread("oc_c", "om_1", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := st.CreateReview(store.ReviewRequest{
+		ID:              "rvw_n",
+		ThreadID:        thread.ID,
+		Status:          "pending",
+		PRURL:           "https://github.com/a/b/pull/1",
+		Repo:            "a/b",
+		PRNumber:        1,
+		RequesterOpenID: "ou_x",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	svc := &Service{store: st, lark: &fakeLark{enabled: true, userName: "张三"}}
+	if err := svc.ResolveRequesterName(&req); err != nil {
+		t.Fatalf("resolve requester name: %v", err)
+	}
+	if req.RequesterName != "张三" {
+		t.Fatalf("expected resolved name, got %q", req.RequesterName)
+	}
+
+	got, err := st.GetReview("rvw_n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RequesterName != "张三" {
+		t.Fatalf("resolved name not persisted, got %q", got.RequesterName)
+	}
+}
+
+func TestResolveRequesterNameErrorsDoNotPanic(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	thread, err := st.GetOrCreateReviewThread("oc_c", "om_1", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := st.CreateReview(store.ReviewRequest{
+		ID:              "rvw_e",
+		ThreadID:        thread.ID,
+		Status:          "pending",
+		PRURL:           "https://github.com/a/b/pull/1",
+		Repo:            "a/b",
+		PRNumber:        1,
+		RequesterOpenID: "ou_x",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Contact API returns an empty name: resolution fails, name stays empty.
+	svc := &Service{store: st, lark: &fakeLark{enabled: true}}
+	if err := svc.ResolveRequesterName(&req); err == nil {
+		t.Fatal("expected error when contact API returns empty name")
+	}
+	if req.RequesterName != "" {
+		t.Fatalf("expected empty name, got %q", req.RequesterName)
+	}
+
+	// Disabled lark client: resolution is skipped with an error, no panic.
+	disabled := &Service{store: st, lark: &fakeLark{enabled: false}}
+	if err := disabled.ResolveRequesterName(&req); err == nil {
+		t.Fatal("expected error when lark client disabled")
+	}
+
+	// Already-resolved names are left untouched.
+	req.RequesterName = "张三"
+	if err := svc.ResolveRequesterName(&req); err != nil {
+		t.Fatalf("expected nil for already-resolved name, got %v", err)
+	}
+}
+
+func TestResolveRequesterNameBacksOffAfterFailure(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	thread, err := st.GetOrCreateReviewThread("oc_c", "om_1", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := st.CreateReview(store.ReviewRequest{
+		ID:              "rvw_b",
+		ThreadID:        thread.ID,
+		Status:          "pending",
+		PRURL:           "https://github.com/a/b/pull/1",
+		Repo:            "a/b",
+		PRNumber:        1,
+		RequesterOpenID: "ou_x",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fake := &fakeLark{enabled: true}
+	svc := &Service{store: st, lark: fake}
+
+	if err := svc.ResolveRequesterName(&req); err == nil {
+		t.Fatal("expected first attempt to fail with empty contact name")
+	}
+	if fake.userCalls != 1 {
+		t.Fatalf("expected 1 contact API call, got %d", fake.userCalls)
+	}
+
+	// A retry for the same open_id within the backoff window is skipped
+	// silently: no error, no extra API call, name stays empty.
+	if err := svc.ResolveRequesterName(&req); err != nil {
+		t.Fatalf("expected backed-off retry to return nil, got %v", err)
+	}
+	if fake.userCalls != 1 {
+		t.Fatalf("expected no second contact API call, got %d", fake.userCalls)
+	}
+	if req.RequesterName != "" {
+		t.Fatalf("expected name to stay empty, got %q", req.RequesterName)
 	}
 }
 

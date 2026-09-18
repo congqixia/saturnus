@@ -7,3 +7,6 @@ bin/
 .DS_Store
 web/node_modules/
 web/dist/
+# cloud-ops client config (real values, never committed)
+cloudops.json
+internal/cloudops/cloudops.json

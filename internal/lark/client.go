@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -76,11 +77,6 @@ type CreateTaskInput struct {
 	SourceURL     string
 }
 
-type Task struct {
-	GUID string
-	URL  string
-}
-
 func (c *Client) CreateTask(input CreateTaskInput) (Task, error) {
 	if !c.Enabled() {
 		return Task{}, nil
@@ -119,6 +115,7 @@ func (c *Client) CreateTask(input CreateTaskInput) (Task, error) {
 		return Task{}, err
 	}
 	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
 	var out struct {
 		Code int    `json:"code"`
 		Msg  string `json:"msg"`
@@ -129,8 +126,8 @@ func (c *Client) CreateTask(input CreateTaskInput) (Task, error) {
 			} `json:"task"`
 		} `json:"data"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return Task{}, err
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return Task{}, fmt.Errorf("lark create task failed: %s", larkErrorDetail(raw))
 	}
 	if resp.StatusCode >= 300 || out.Code != 0 {
 		return Task{}, fmt.Errorf("lark create task failed: code=%d msg=%q status=%s", out.Code, out.Msg, resp.Status)
@@ -139,12 +136,18 @@ func (c *Client) CreateTask(input CreateTaskInput) (Task, error) {
 }
 
 func (c *Client) postJSON(url string, payload any) error {
+	return c.sendJSON(http.MethodPost, url, payload)
+}
+
+// sendJSON issues a JSON request with the tenant token. Empty payloads are
+// allowed (e.g. a PATCH with an empty object).
+func (c *Client) sendJSON(method, url string, payload any) error {
 	token, err := c.tenantToken()
 	if err != nil {
 		return err
 	}
 	body, _ := json.Marshal(payload)
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	req, err := http.NewRequest(method, url, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -156,9 +159,172 @@ func (c *Client) postJSON(url string, payload any) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("lark api failed: %s", resp.Status)
+		raw, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("lark api failed: %s (%s)", resp.Status, larkErrorDetail(raw))
 	}
 	return nil
+}
+
+// larkErrorDetail extracts Feishu's error code and message from a response
+// body, falling back to a truncated raw body snippet when it is not the usual
+// {"code": ..., "msg": ...} JSON.
+func larkErrorDetail(raw []byte) string {
+	var out struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	if err := json.Unmarshal(raw, &out); err == nil && (out.Code != 0 || out.Msg != "") {
+		return fmt.Sprintf("code=%d msg=%q", out.Code, out.Msg)
+	}
+	body := strings.TrimSpace(string(raw))
+	if body == "" {
+		return ""
+	}
+	if len(body) > 200 {
+		body = body[:200]
+	}
+	return "body=" + strconv.Quote(body)
+}
+
+// Task is the subset of a Feishu task v2 object the server cares about.
+type Task struct {
+	GUID        string
+	URL         string
+	Summary     string
+	Description string
+	Completed   bool
+}
+
+// GetTask fetches a Feishu task by guid.
+func (c *Client) GetTask(taskGUID string) (Task, error) {
+	if !c.Enabled() {
+		return Task{}, errors.New("lark client disabled")
+	}
+	if taskGUID == "" {
+		return Task{}, errors.New("empty task guid")
+	}
+	token, err := c.tenantToken()
+	if err != nil {
+		return Task{}, err
+	}
+	req, err := http.NewRequest(http.MethodGet, "https://open.feishu.cn/open-apis/task/v2/tasks/"+url.PathEscape(taskGUID), nil)
+	if err != nil {
+		return Task{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return Task{}, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return Task{}, fmt.Errorf("lark get task failed: %s (%s)", resp.Status, larkErrorDetail(raw))
+	}
+	var out struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			Task struct {
+				GUID        string `json:"guid"`
+				URL         string `json:"url"`
+				Summary     string `json:"summary"`
+				Description string `json:"description"`
+				Completed   bool   `json:"completed"`
+			} `json:"task"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return Task{}, err
+	}
+	if out.Code != 0 {
+		return Task{}, fmt.Errorf("lark get task failed: %s", out.Msg)
+	}
+	return Task{
+		GUID:        out.Data.Task.GUID,
+		URL:         out.Data.Task.URL,
+		Summary:     out.Data.Task.Summary,
+		Description: out.Data.Task.Description,
+		Completed:   out.Data.Task.Completed,
+	}, nil
+}
+
+// UpdateTaskInput carries the optional fields of a task v2 PATCH update.
+// nil fields are left untouched on the remote task.
+type UpdateTaskInput struct {
+	Summary     *string
+	Description *string
+	Completed   *bool
+}
+
+// taskDescriptionMaxRunes is the Feishu task v2 description limit (3000 UTF-8
+// characters). Longer text is truncated before sending.
+const taskDescriptionMaxRunes = 3000
+
+// UpdateTask patches an existing Feishu task (summary / description /
+// completion). The task v2 update contract requires a `task` object plus an
+// `update_fields` list naming exactly the fields being changed; completion is
+// expressed via `completed_at` (ms timestamp, or "0" to reopen). Requires the
+// task:task write scope.
+func (c *Client) UpdateTask(taskGUID string, input UpdateTaskInput) error {
+	if !c.Enabled() {
+		return nil
+	}
+	if taskGUID == "" {
+		return errors.New("empty task guid")
+	}
+	payload, ok := buildTaskUpdate(input)
+	if !ok {
+		return nil
+	}
+	return c.sendJSON(http.MethodPatch, "https://open.feishu.cn/open-apis/task/v2/tasks/"+url.PathEscape(taskGUID), payload)
+}
+
+// buildTaskUpdate renders the task v2 PATCH request body: the fields to change
+// go in the nested `task` object and their names in `update_fields`. The bool
+// result reports whether anything is to be updated.
+func buildTaskUpdate(input UpdateTaskInput) (map[string]any, bool) {
+	task := map[string]any{}
+	updateFields := []string{}
+	if input.Summary != nil {
+		task["summary"] = *input.Summary
+		updateFields = append(updateFields, "summary")
+	}
+	if input.Description != nil {
+		task["description"] = truncateRunes(*input.Description, taskDescriptionMaxRunes)
+		updateFields = append(updateFields, "description")
+	}
+	if input.Completed != nil {
+		if *input.Completed {
+			task["completed_at"] = strconv.FormatInt(time.Now().UnixMilli(), 10)
+		} else {
+			task["completed_at"] = "0"
+		}
+		updateFields = append(updateFields, "completed_at")
+	}
+	if len(updateFields) == 0 {
+		return nil, false
+	}
+	return map[string]any{
+		"task":          task,
+		"update_fields": updateFields,
+	}, true
+}
+
+// CompleteTask marks a Feishu task as completed.
+func (c *Client) CompleteTask(taskGUID string) error {
+	completed := true
+	return c.UpdateTask(taskGUID, UpdateTaskInput{Completed: &completed})
+}
+
+// truncateRunes bounds a string to max UTF-8 characters without splitting a
+// rune.
+func truncateRunes(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max])
 }
 
 type ContactUser struct {

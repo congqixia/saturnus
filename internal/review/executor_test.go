@@ -85,6 +85,37 @@ func TestRenderCommandWithGuide(t *testing.T) {
 	}
 }
 
+func TestRenderCommandContinueSession(t *testing.T) {
+	args := ToolArgs{
+		Repo:      "a/b",
+		PRNumber:  1,
+		PRURL:     "https://github.com/a/b/pull/1",
+		ReviewID:  "rvw_c",
+		SessionID: "ses_9",
+		RetryNote: "Continue reviewing. Reason: retry after failure.",
+	}
+	got, err := RenderCommand(DefaultCommandTemplate, args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 6 || got[0] != "run" || got[1] != "--session" || got[2] != "ses_9" || got[3] != "--title" {
+		t.Fatalf("expected session continuation args, got %#v", got)
+	}
+	if got[4] != "saturnus-review-rvw_c" {
+		t.Fatalf("expected title arg, got %q", got[4])
+	}
+	prompt := got[5]
+	if !strings.Contains(prompt, "Continue reviewing. Reason: retry after failure.") {
+		t.Fatalf("retry note missing from prompt: %q", prompt)
+	}
+	if strings.Contains(prompt, "Review GitHub PR a/b#1") {
+		t.Fatalf("retry prompt must not contain the fresh-review prompt: %q", prompt)
+	}
+	if !strings.Contains(prompt, "REVIEW SUMMARY:") {
+		t.Fatalf("retry prompt must still require the structured summary: %q", prompt)
+	}
+}
+
 func TestShellquote(t *testing.T) {
 	if got := shellquote(`a"b\c`); got != `a\"b\\c` {
 		t.Fatalf("shellquote = %q", got)

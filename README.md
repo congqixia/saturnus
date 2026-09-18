@@ -104,9 +104,14 @@ Supported text commands:
 - `/sat autopass on <session_id>`
 - `/sat autopass off <session_id>`
 - `/sat reviews`
+- `/sat reviews all` / `/sat reviews archived` — include archived reviews, or list only archived
 - `/sat review <pr-url>` (also works as natural language: any message containing a GitHub PR URL)
 - `/sat review <review_id>`
-- `/sat describe review <review_id>` — show full details of one review (as a card)
+- `/sat retry <review_id>` — retry a failed review, or re-run a successful one after its PR head commit moved
+- `/sat refresh <review_id|all>` — re-sync PR/task state: archive merged/closed PRs (and complete their task), restore reopened PRs, append new reviewer comments to the task
+- `/sat act <review_id> <instruction>` — resume the review's tool session to act on the PR (e.g. post inline comments for selected issues, work out concrete code for an issue); the agent output is sent back to the chat
+- `/sat threads <review_id>` — list every chat thread a review was requested in
+- `/sat describe review <review_id>` — show full details of one review (as a card), including the run history
 - `/sat repos` — show the configured repo whitelist
 - `/sat whoami` — show the sender's own open_id
 - `/sat whois <name|email|mobile>` — resolve a user to open_id via the contact API
@@ -174,11 +179,84 @@ stripped from `result_text` and messages; the transcript log keeps the raw
 output.
 
 Repeated submissions of the same PR reuse one review record (and thread):
-an active one is reported as already in progress, a finished one is reset and
-re-run with the same id. Reviewer identities are resolved to names via the
-contact API (new submissions, result messages, and backfilled on startup), and
-the result message includes the opencode `session=` id so the reviewer can
-continue the session with `opencode run --session <id>`.
+an active one is reported as already in progress. Each run records the PR head
+commit (`head_commit`) it reviewed; a finished review is only reset and re-run
+when its head commit moved, otherwise the request is reported as already up to
+date (`ErrReviewUnchanged`). `/sat retry <review_id>` forces another run: failed
+reviews always retry, successful ones only when the head changed. Retries keep
+the previous tool session (`session_id`), so the run resumes the same review
+conversation via `opencode run --session <id> --title ...`. Reviewer identities
+are resolved to names via the contact API (new submissions, result messages,
+and backfilled on startup), and the result message includes the opencode
+`session=` id so the reviewer can continue the session with
+`opencode run --session <id>`.
+
+The requester identity is stable across re-runs: re-submitting the same PR or
+`/sat retry` (e.g. the reviewer continuing the review) never reassigns who the
+requester is, so requester replies and task notifications keep reaching the
+original requester. Only when no real requester is recorded (empty, or the
+HTTP-API `"api"` sentinel) is the new sender adopted. The chat/message/thread
+context still updates per request, so the review thread records everyone who
+keeps participating.
+
+Every thread a review is requested in is recorded in a `review_thread_links`
+table (deduped per review+thread), so a review re-requested or retried from
+different chats keeps its full thread history. `/sat threads <review_id>` lists
+all of them (chat, topic, participant count, last activity) as a card, and the
+history is also included in `GET /api/reviews/{id}` (`threads` field) and the
+`/sat describe review` card. Reviews recorded before thread linking fall back
+to their current thread.
+
+### Refresh and archive
+
+`/sat refresh <review_id>` (or `/sat refresh all` to sweep every non-archived
+review) re-syncs a review with its PR and Feishu task:
+
+- If the PR was merged or closed, the review is set to status `archived` (hidden
+  from default listings) and its Feishu task is marked completed.
+- If a previously archived PR was reopened, the review is restored to
+  `succeeded`.
+- If the reviewer submitted new reviews/comments on the PR, they are appended to
+  the task description (tracked by `task_synced_at`, so each comment is synced
+  once). This requires `gh` and the `task:task` write scope.
+
+Default listings (`/sat reviews`, `GET /api/reviews`) exclude archived reviews;
+use `/sat reviews all` / `/sat reviews archived` (or `?archived=1` on the API)
+to include or isolate them. Archived reviews reject re-runs
+(`ErrArchived`), and carry an `archived_at` timestamp shown in the describe
+card.
+
+### Reactions (`/sat act`)
+
+After a review finishes, the reviewer can act on it right from the chat without
+manually shelling into the tool session:
+
+```text
+/sat act <review_id> 用 inline comment 在 PR 中回复 issue 1,3
+/sat act <review_id> 针对 issue 2, 给出具体代码
+```
+
+`/sat act` resumes the review's tool session (`opencode run --session <id>`,
+same session captured for the review), passes the instruction as-is, and runs
+it in the background inside the mapped checkout. The agent's output is streamed
+into a persisted reaction record and delivered back to the chat where the
+command was issued (falling back to the configured reviewer recipient). Only
+the reviewer (or an allowlisted review user) may trigger a reaction, and only
+on a finished review — a missing tool session is reported immediately.
+
+Every reaction is stored in a `review_reactions` table (review_id, instruction,
+status, session, output, error, timestamps), shown in `GET /api/reviews/{id}`
+(`reactions` field) and in the `/sat describe review` card, mirroring how
+`review_runs` keeps run history. Reactions are re-enqueued after a server
+restart; interrupted `running` ones are marked `failed`. The tool invocation
+reuses the same `Run` helper as reviews, so ANSI stripping, log transcripts
+(`<SATURNUS_REVIEW_LOG_DIR>/<reaction_id>.log`) and the per-job timeout apply
+identically.
+
+Every execution is also appended to a `review_runs` table (one row per run,
+with `seq`, status, `head_commit`, retry reason, session and result). This
+history survives later retries that overwrite the `review_requests` row, and is
+exposed in `GET /api/reviews/{id}` and in the `/sat describe review` card.
 
 When task creation is enabled, the requester is DM'd the generated Feishu task
 with its clickable task link (`task_url`, an applink from the task API) so they

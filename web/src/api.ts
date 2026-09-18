@@ -52,11 +52,29 @@ export type Review = {
   task_id: string
   task_url: string
   session_id: string
+  head_commit: string
+  retry_reason: string
   result_text: string
   error: string
   created_at: string
   updated_at: string
   completed_at?: string
+}
+
+export type ReviewRun = {
+  id: string
+  review_id: string
+  seq: number
+  status: string
+  head_commit: string
+  retry_reason: string
+  session_id: string
+  result_text: string
+  error: string
+  tool: string
+  started_at: string
+  completed_at?: string
+  updated_at: string
 }
 
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {

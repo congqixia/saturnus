@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -91,6 +92,26 @@ type ReviewThread struct {
 	CreatedAt     time.Time `json:"created_at"`
 }
 
+// ReviewRun is one append-only execution of a review (initial run or a
+// retry/continue). It keeps the outcome of every run, including the PR head
+// commit it reviewed, so history can be traced after later runs overwrite the
+// review_requests row.
+type ReviewRun struct {
+	ID          string    `json:"id"`
+	ReviewID    string    `json:"review_id"`
+	Seq         int       `json:"seq"`
+	Status      string    `json:"status"`
+	HeadCommit  string    `json:"head_commit"`
+	RetryReason string    `json:"retry_reason"`
+	SessionID   string    `json:"session_id"`
+	ResultText  string    `json:"result_text"`
+	Error       string    `json:"error"`
+	Tool        string    `json:"tool"`
+	StartedAt   time.Time `json:"started_at"`
+	CompletedAt time.Time `json:"completed_at,omitempty"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
 type ReviewRequest struct {
 	ID              string    `json:"id"`
 	ThreadID        string    `json:"thread_id"`
@@ -108,11 +129,43 @@ type ReviewRequest struct {
 	TaskID          string    `json:"task_id"`
 	TaskURL         string    `json:"task_url"`
 	SessionID       string    `json:"session_id"`
+	HeadCommit      string    `json:"head_commit"`
+	RetryReason     string    `json:"retry_reason"`
 	ResultText      string    `json:"result_text"`
 	Error           string    `json:"error"`
 	CreatedAt       time.Time `json:"created_at"`
 	UpdatedAt       time.Time `json:"updated_at"`
 	CompletedAt     time.Time `json:"completed_at,omitempty"`
+	// ArchivedAt is set when the review is archived because its PR was merged
+	// or closed. Archived reviews are hidden from default listings.
+	ArchivedAt time.Time `json:"archived_at,omitempty"`
+	// RefreshedAt records the last /sat refresh of this review.
+	RefreshedAt time.Time `json:"refreshed_at,omitempty"`
+	// TaskSyncedAt is the submitted_at of the newest PR review already synced
+	// to the Feishu task, so later refreshes only append new reviewer comments.
+	TaskSyncedAt time.Time `json:"task_synced_at,omitempty"`
+}
+
+// ReviewReaction is one reviewer-triggered action taken on a finished review by
+// resuming its tool session (e.g. post inline comments on the PR for selected
+// issues, or work out concrete code for an issue). It is append-only history,
+// analogous to review_runs but tied to reviewer instructions rather than review
+// executions.
+type ReviewReaction struct {
+	ID           string    `json:"id"`
+	ReviewID     string    `json:"review_id"`
+	Instruction  string    `json:"instruction"`
+	Status       string    `json:"status"`
+	ChatID       string    `json:"chat_id"`
+	MessageID    string    `json:"message_id"`
+	SenderOpenID string    `json:"sender_open_id"`
+	SenderName   string    `json:"sender_name"`
+	SessionID    string    `json:"session_id"`
+	ResultText   string    `json:"result_text"`
+	Error        string    `json:"error"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	CompletedAt  time.Time `json:"completed_at,omitempty"`
 }
 
 type Store struct {
@@ -246,6 +299,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			task_id TEXT NOT NULL DEFAULT '',
 			task_url TEXT NOT NULL DEFAULT '',
 			session_id TEXT NOT NULL DEFAULT '',
+			head_commit TEXT NOT NULL DEFAULT '',
+			retry_reason TEXT NOT NULL DEFAULT '',
 			result_text TEXT NOT NULL DEFAULT '',
 			error TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL,
@@ -255,6 +310,45 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_review_requests_created ON review_requests(created_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_review_requests_status ON review_requests(status, created_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_review_requests_thread ON review_requests(thread_id)`,
+		`CREATE TABLE IF NOT EXISTS review_runs (
+			id TEXT PRIMARY KEY,
+			review_id TEXT NOT NULL REFERENCES review_requests(id) ON DELETE CASCADE,
+			seq INTEGER NOT NULL,
+			status TEXT NOT NULL,
+			head_commit TEXT NOT NULL DEFAULT '',
+			retry_reason TEXT NOT NULL DEFAULT '',
+			session_id TEXT NOT NULL DEFAULT '',
+			result_text TEXT NOT NULL DEFAULT '',
+			error TEXT NOT NULL DEFAULT '',
+			tool TEXT NOT NULL DEFAULT '',
+			started_at TEXT NOT NULL,
+			completed_at TEXT,
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_review_runs_review ON review_runs(review_id, seq)`,
+		`CREATE TABLE IF NOT EXISTS review_reactions (
+			id TEXT PRIMARY KEY,
+			review_id TEXT NOT NULL REFERENCES review_requests(id) ON DELETE CASCADE,
+			instruction TEXT NOT NULL,
+			status TEXT NOT NULL,
+			chat_id TEXT NOT NULL DEFAULT '',
+			message_id TEXT NOT NULL DEFAULT '',
+			sender_open_id TEXT NOT NULL DEFAULT '',
+			sender_name TEXT NOT NULL DEFAULT '',
+			session_id TEXT NOT NULL DEFAULT '',
+			result_text TEXT NOT NULL DEFAULT '',
+			error TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			completed_at TEXT
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_review_reactions_review ON review_reactions(review_id, created_at ASC)`,
+		`CREATE TABLE IF NOT EXISTS review_thread_links (
+			review_id TEXT NOT NULL REFERENCES review_requests(id) ON DELETE CASCADE,
+			thread_id TEXT NOT NULL REFERENCES review_threads(id) ON DELETE CASCADE,
+			linked_at TEXT NOT NULL,
+			PRIMARY KEY (review_id, thread_id)
+		)`,
 	}
 	for _, stmt := range statements {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
@@ -265,6 +359,21 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "review_requests", "task_url", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "review_requests", "head_commit", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "review_requests", "retry_reason", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "review_requests", "archived_at", "TEXT"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "review_requests", "refreshed_at", "TEXT"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "review_requests", "task_synced_at", "TEXT"); err != nil {
 		return err
 	}
 	return nil
@@ -715,6 +824,64 @@ func (s *Store) GetOrCreateReviewThread(chatID, rootMessageID, topic string, par
 	return thread, tx.Commit()
 }
 
+// GetThread loads one review thread by id.
+func (s *Store) GetThread(id string) (ReviewThread, error) {
+	row := s.db.QueryRow(`
+		SELECT id, chat_id, root_message_id, topic, participants, last_message_at, created_at
+		FROM review_threads
+		WHERE id = ?
+	`, id)
+	thread, err := scanReviewThread(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ReviewThread{}, ErrNotFound
+	}
+	if err != nil {
+		return ReviewThread{}, err
+	}
+	return thread, nil
+}
+
+// LinkReviewThread records that a review request happened in a thread. The same
+// (review_id, thread_id) pair is deduped, bumping linked_at to the most recent
+// time the thread was used, so the review's full thread history is preserved
+// even after review_requests.ThreadID moves to a newer thread.
+func (s *Store) LinkReviewThread(reviewID, threadID string) error {
+	if reviewID == "" || threadID == "" {
+		return nil
+	}
+	_, err := s.db.Exec(`
+		INSERT INTO review_thread_links (review_id, thread_id, linked_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(review_id, thread_id) DO UPDATE SET linked_at = excluded.linked_at
+	`, reviewID, threadID, timeText(time.Now().UTC()))
+	return err
+}
+
+// ListReviewThreads returns every thread a review has been requested in, most
+// recently active first.
+func (s *Store) ListReviewThreads(reviewID string) []ReviewThread {
+	rows, err := s.db.Query(`
+		SELECT t.id, t.chat_id, t.root_message_id, t.topic, t.participants, t.last_message_at, t.created_at
+		FROM review_thread_links l
+		JOIN review_threads t ON t.id = l.thread_id
+		WHERE l.review_id = ?
+		ORDER BY t.last_message_at DESC
+	`, reviewID)
+	if err != nil {
+		return []ReviewThread{}
+	}
+	defer rows.Close()
+
+	out := []ReviewThread{}
+	for rows.Next() {
+		thread, err := scanReviewThread(rows)
+		if err == nil {
+			out = append(out, thread)
+		}
+	}
+	return out
+}
+
 func (s *Store) CreateReview(req ReviewRequest) (ReviewRequest, error) {
 	ctx := context.Background()
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -742,12 +909,14 @@ func (s *Store) CreateReview(req ReviewRequest) (ReviewRequest, error) {
 		INSERT INTO review_requests (
 			id, thread_id, status, pr_url, repo, pr_number, title, base_branch,
 			requester_open_id, requester_name, chat_id, message_id, tool, task_id, task_url,
-			session_id, result_text, error, created_at, updated_at, completed_at
+			session_id, head_commit, retry_reason, result_text, error, created_at, updated_at, completed_at,
+			archived_at, refreshed_at, task_synced_at
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, req.ID, req.ThreadID, req.Status, req.PRURL, req.Repo, req.PRNumber, req.Title, req.BaseBranch,
 		req.RequesterOpenID, req.RequesterName, req.ChatID, req.MessageID, req.Tool, req.TaskID, req.TaskURL,
-		req.SessionID, req.ResultText, req.Error, timeText(req.CreatedAt), timeText(req.UpdatedAt), nullableTimeText(req.CompletedAt)); err != nil {
+		req.SessionID, req.HeadCommit, req.RetryReason, req.ResultText, req.Error, timeText(req.CreatedAt), timeText(req.UpdatedAt), nullableTimeText(req.CompletedAt),
+		nullableTimeText(req.ArchivedAt), nullableTimeText(req.RefreshedAt), nullableTimeText(req.TaskSyncedAt)); err != nil {
 		return ReviewRequest{}, err
 	}
 	if err := audit(ctx, tx, "requester:"+req.RequesterOpenID, "review.create", req.ID, mustJSON(req)); err != nil {
@@ -760,7 +929,8 @@ func (s *Store) GetReview(id string) (ReviewRequest, error) {
 	row := s.db.QueryRow(`
 		SELECT id, thread_id, status, pr_url, repo, pr_number, title, base_branch,
 			requester_open_id, requester_name, chat_id, message_id, tool, task_id, task_url,
-			session_id, result_text, error, created_at, updated_at, completed_at
+			session_id, head_commit, retry_reason, result_text, error, created_at, updated_at, completed_at,
+			archived_at, refreshed_at, task_synced_at
 		FROM review_requests
 		WHERE id = ?
 	`, id)
@@ -778,7 +948,8 @@ func (s *Store) GetReviewByPR(repo string, prNumber int) (ReviewRequest, error) 
 	row := s.db.QueryRow(`
 		SELECT id, thread_id, status, pr_url, repo, pr_number, title, base_branch,
 			requester_open_id, requester_name, chat_id, message_id, tool, task_id, task_url,
-			session_id, result_text, error, created_at, updated_at, completed_at
+			session_id, head_commit, retry_reason, result_text, error, created_at, updated_at, completed_at,
+			archived_at, refreshed_at, task_synced_at
 		FROM review_requests
 		WHERE repo = ? AND pr_number = ?
 		ORDER BY created_at DESC
@@ -794,17 +965,29 @@ func (s *Store) GetReviewByPR(repo string, prNumber int) (ReviewRequest, error) 
 	return req, nil
 }
 
-func (s *Store) ListReviews(status string) []ReviewRequest {
+// ListReviews returns review requests, newest first. When status is empty every
+// status is returned. Archived reviews are excluded by default (unless
+// includeArchived is true or status is "archived"), so the default listings
+// stay focused on active reviews.
+func (s *Store) ListReviews(status string, includeArchived bool) []ReviewRequest {
 	query := `
 		SELECT id, thread_id, status, pr_url, repo, pr_number, title, base_branch,
 			requester_open_id, requester_name, chat_id, message_id, tool, task_id, task_url,
-			session_id, result_text, error, created_at, updated_at, completed_at
+			session_id, head_commit, retry_reason, result_text, error, created_at, updated_at, completed_at,
+			archived_at, refreshed_at, task_synced_at
 		FROM review_requests
 	`
-	args := []any{}
+	var conds []string
+	var args []any
 	if status != "" {
-		query += ` WHERE status = ?`
+		conds = append(conds, `status = ?`)
 		args = append(args, status)
+	}
+	if !includeArchived && status != "archived" {
+		conds = append(conds, `status != 'archived'`)
+	}
+	if len(conds) > 0 {
+		query += ` WHERE ` + strings.Join(conds, " AND ")
 	}
 	query += ` ORDER BY created_at DESC`
 	rows, err := s.db.Query(query, args...)
@@ -836,11 +1019,13 @@ func (s *Store) UpdateReview(req ReviewRequest) (ReviewRequest, error) {
 		UPDATE review_requests
 		SET status = ?, pr_url = ?, repo = ?, pr_number = ?, title = ?, base_branch = ?,
 			requester_open_id = ?, requester_name = ?, chat_id = ?, message_id = ?, tool = ?,
-			task_id = ?, task_url = ?, session_id = ?, result_text = ?, error = ?, updated_at = ?, completed_at = ?
+			task_id = ?, task_url = ?, session_id = ?, head_commit = ?, retry_reason = ?, result_text = ?, error = ?, updated_at = ?, completed_at = ?,
+			archived_at = ?, refreshed_at = ?, task_synced_at = ?
 		WHERE id = ?
 	`, req.Status, req.PRURL, req.Repo, req.PRNumber, req.Title, req.BaseBranch,
 		req.RequesterOpenID, req.RequesterName, req.ChatID, req.MessageID, req.Tool,
-		req.TaskID, req.TaskURL, req.SessionID, req.ResultText, req.Error, timeText(req.UpdatedAt), nullableTimeText(req.CompletedAt),
+		req.TaskID, req.TaskURL, req.SessionID, req.HeadCommit, req.RetryReason, req.ResultText, req.Error, timeText(req.UpdatedAt), nullableTimeText(req.CompletedAt),
+		nullableTimeText(req.ArchivedAt), nullableTimeText(req.RefreshedAt), nullableTimeText(req.TaskSyncedAt),
 		req.ID); err != nil {
 		return ReviewRequest{}, err
 	}
@@ -871,6 +1056,251 @@ func (s *Store) FailInterruptedReviews() ([]string, error) {
 		`, "interrupted by server restart", timeText(now), timeText(now), id); err != nil {
 			return nil, err
 		}
+		if _, err := s.db.ExecContext(ctx, `
+			UPDATE review_runs SET status = 'failed', error = ?, completed_at = ?, updated_at = ? WHERE review_id = ? AND status = 'running'
+		`, "interrupted by server restart", timeText(now), timeText(now), id); err != nil {
+			return nil, err
+		}
+	}
+	return ids, nil
+}
+
+// CreateReviewRun appends a run for a review, assigning the next sequence
+// number (1 for the first run, 2, 3, ... for retries).
+func (s *Store) CreateReviewRun(run ReviewRun) (ReviewRun, error) {
+	ctx := context.Background()
+	if run.ID == "" {
+		run.ID = "run_" + newID()
+	}
+	if run.StartedAt.IsZero() {
+		run.StartedAt = time.Now().UTC()
+	}
+	if run.UpdatedAt.IsZero() {
+		run.UpdatedAt = run.StartedAt
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return ReviewRun{}, err
+	}
+	defer rollback(tx)
+
+	var maxSeq sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `SELECT MAX(seq) FROM review_runs WHERE review_id = ?`, run.ReviewID).Scan(&maxSeq); err != nil {
+		return ReviewRun{}, err
+	}
+	run.Seq = int(maxSeq.Int64) + 1
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO review_runs (id, review_id, seq, status, head_commit, retry_reason, session_id, result_text, error, tool, started_at, completed_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, run.ID, run.ReviewID, run.Seq, run.Status, run.HeadCommit, run.RetryReason, run.SessionID, run.ResultText, run.Error, run.Tool,
+		timeText(run.StartedAt), nullableTimeText(run.CompletedAt), timeText(run.UpdatedAt)); err != nil {
+		return ReviewRun{}, err
+	}
+	return run, tx.Commit()
+}
+
+// UpdateReviewRun persists a run's terminal outcome (status, head commit,
+// session, result/error).
+func (s *Store) UpdateReviewRun(run ReviewRun) error {
+	ctx := context.Background()
+	run.UpdatedAt = time.Now().UTC()
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE review_runs
+		SET status = ?, head_commit = ?, retry_reason = ?, session_id = ?, result_text = ?, error = ?, completed_at = ?, updated_at = ?
+		WHERE id = ?
+	`, run.Status, run.HeadCommit, run.RetryReason, run.SessionID, run.ResultText, run.Error,
+		nullableTimeText(run.CompletedAt), timeText(run.UpdatedAt), run.ID)
+	return err
+}
+
+// CurrentRun returns the in-flight run for a review (status 'running'), if any.
+func (s *Store) CurrentRun(reviewID string) (ReviewRun, error) {
+	row := s.db.QueryRow(`
+		SELECT id, review_id, seq, status, head_commit, retry_reason, session_id, result_text, error, tool, started_at, completed_at, updated_at
+		FROM review_runs
+		WHERE review_id = ? AND status = 'running'
+		ORDER BY seq DESC
+		LIMIT 1
+	`, reviewID)
+	run, err := scanReviewRun(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ReviewRun{}, ErrNotFound
+	}
+	if err != nil {
+		return ReviewRun{}, err
+	}
+	return run, nil
+}
+
+// ListRuns returns every run of a review in execution order (oldest first).
+func (s *Store) ListRuns(reviewID string) []ReviewRun {
+	rows, err := s.db.Query(`
+		SELECT id, review_id, seq, status, head_commit, retry_reason, session_id, result_text, error, tool, started_at, completed_at, updated_at
+		FROM review_runs
+		WHERE review_id = ?
+		ORDER BY seq ASC
+	`, reviewID)
+	if err != nil {
+		return []ReviewRun{}
+	}
+	defer rows.Close()
+
+	out := []ReviewRun{}
+	for rows.Next() {
+		run, err := scanReviewRun(rows)
+		if err == nil {
+			out = append(out, run)
+		}
+	}
+	return out
+}
+
+// CreateReaction persists a new review reaction in status pending.
+func (s *Store) CreateReaction(reac ReviewReaction) (ReviewReaction, error) {
+	ctx := context.Background()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return ReviewReaction{}, err
+	}
+	defer rollback(tx)
+
+	if _, err := getReviewTx(ctx, tx, reac.ReviewID); errors.Is(err, sql.ErrNoRows) {
+		return ReviewReaction{}, ErrNotFound
+	} else if err != nil {
+		return ReviewReaction{}, err
+	}
+	if reac.ID == "" {
+		reac.ID = "rxn_" + newID()
+	}
+	if reac.Status == "" {
+		reac.Status = "pending"
+	}
+	if reac.CreatedAt.IsZero() {
+		reac.CreatedAt = time.Now().UTC()
+	}
+	reac.UpdatedAt = reac.CreatedAt
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO review_reactions (
+			id, review_id, instruction, status, chat_id, message_id, sender_open_id, sender_name,
+			session_id, result_text, error, created_at, updated_at, completed_at
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, reac.ID, reac.ReviewID, reac.Instruction, reac.Status, reac.ChatID, reac.MessageID,
+		reac.SenderOpenID, reac.SenderName, reac.SessionID, reac.ResultText, reac.Error,
+		timeText(reac.CreatedAt), timeText(reac.UpdatedAt), nullableTimeText(reac.CompletedAt)); err != nil {
+		return ReviewReaction{}, err
+	}
+	return reac, tx.Commit()
+}
+
+// GetReaction loads one review reaction by id.
+func (s *Store) GetReaction(id string) (ReviewReaction, error) {
+	row := s.db.QueryRow(`
+		SELECT id, review_id, instruction, status, chat_id, message_id, sender_open_id, sender_name,
+			session_id, result_text, error, created_at, updated_at, completed_at
+		FROM review_reactions
+		WHERE id = ?
+	`, id)
+	reac, err := scanReviewReaction(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ReviewReaction{}, ErrNotFound
+	}
+	if err != nil {
+		return ReviewReaction{}, err
+	}
+	return reac, nil
+}
+
+// ListReactions returns every reaction of a review in creation order (oldest
+// first).
+func (s *Store) ListReactions(reviewID string) []ReviewReaction {
+	rows, err := s.db.Query(`
+		SELECT id, review_id, instruction, status, chat_id, message_id, sender_open_id, sender_name,
+			session_id, result_text, error, created_at, updated_at, completed_at
+		FROM review_reactions
+		WHERE review_id = ?
+		ORDER BY created_at ASC
+	`, reviewID)
+	if err != nil {
+		return []ReviewReaction{}
+	}
+	defer rows.Close()
+
+	out := []ReviewReaction{}
+	for rows.Next() {
+		reac, err := scanReviewReaction(rows)
+		if err == nil {
+			out = append(out, reac)
+		}
+	}
+	return out
+}
+
+// ListPendingReactions returns reactions still in status pending (used to
+// re-enqueue them after a restart).
+func (s *Store) ListPendingReactions() []ReviewReaction {
+	rows, err := s.db.Query(`
+		SELECT id, review_id, instruction, status, chat_id, message_id, sender_open_id, sender_name,
+			session_id, result_text, error, created_at, updated_at, completed_at
+		FROM review_reactions
+		WHERE status = 'pending'
+		ORDER BY created_at ASC
+	`)
+	if err != nil {
+		return []ReviewReaction{}
+	}
+	defer rows.Close()
+
+	out := []ReviewReaction{}
+	for rows.Next() {
+		reac, err := scanReviewReaction(rows)
+		if err == nil {
+			out = append(out, reac)
+		}
+	}
+	return out
+}
+
+// UpdateReaction persists a reaction's mutable fields (status, session, result,
+// error, timing).
+func (s *Store) UpdateReaction(reac ReviewReaction) (ReviewReaction, error) {
+	ctx := context.Background()
+	reac.UpdatedAt = time.Now().UTC()
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE review_reactions
+		SET instruction = ?, status = ?, chat_id = ?, message_id = ?, sender_open_id = ?, sender_name = ?,
+			session_id = ?, result_text = ?, error = ?, updated_at = ?, completed_at = ?
+		WHERE id = ?
+	`, reac.Instruction, reac.Status, reac.ChatID, reac.MessageID, reac.SenderOpenID, reac.SenderName,
+		reac.SessionID, reac.ResultText, reac.Error, timeText(reac.UpdatedAt), nullableTimeText(reac.CompletedAt),
+		reac.ID)
+	return reac, err
+}
+
+// FailInterruptedReactions marks reactions that were still running (status
+// 'running') as failed after a server restart.
+func (s *Store) FailInterruptedReactions() ([]string, error) {
+	ctx := context.Background()
+	rows, err := s.db.Query(`SELECT id FROM review_reactions WHERE status = 'running'`)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	rows.Close()
+	now := time.Now().UTC()
+	for _, id := range ids {
+		if _, err := s.db.ExecContext(ctx, `
+			UPDATE review_reactions SET status = 'failed', error = ?, updated_at = ?, completed_at = ? WHERE id = ?
+		`, "interrupted by server restart", timeText(now), timeText(now), id); err != nil {
+			return nil, err
+		}
 	}
 	return ids, nil
 }
@@ -892,6 +1322,14 @@ type reviewThreadScanner interface {
 }
 
 type reviewRequestScanner interface {
+	Scan(dest ...any) error
+}
+
+type reviewRunScanner interface {
+	Scan(dest ...any) error
+}
+
+type reviewReactionScanner interface {
 	Scan(dest ...any) error
 }
 
@@ -995,6 +1433,18 @@ func getReviewThreadTx(ctx context.Context, tx *sql.Tx, id string) (ReviewThread
 	return scanReviewThread(row)
 }
 
+func getReviewTx(ctx context.Context, tx *sql.Tx, id string) (ReviewRequest, error) {
+	row := tx.QueryRowContext(ctx, `
+		SELECT id, thread_id, status, pr_url, repo, pr_number, title, base_branch,
+			requester_open_id, requester_name, chat_id, message_id, tool, task_id, task_url,
+			session_id, head_commit, retry_reason, result_text, error, created_at, updated_at, completed_at,
+			archived_at, refreshed_at, task_synced_at
+		FROM review_requests
+		WHERE id = ?
+	`, id)
+	return scanReviewRequest(row)
+}
+
 func scanReviewThread(row reviewThreadScanner) (ReviewThread, error) {
 	var thread ReviewThread
 	var participants string
@@ -1014,17 +1464,59 @@ func scanReviewRequest(row reviewRequestScanner) (ReviewRequest, error) {
 	var createdAt string
 	var updatedAt string
 	var completedAt sql.NullString
+	var archivedAt sql.NullString
+	var refreshedAt sql.NullString
+	var taskSyncedAt sql.NullString
 	if err := row.Scan(
 		&req.ID, &req.ThreadID, &req.Status, &req.PRURL, &req.Repo, &req.PRNumber, &req.Title, &req.BaseBranch,
 		&req.RequesterOpenID, &req.RequesterName, &req.ChatID, &req.MessageID, &req.Tool, &req.TaskID, &req.TaskURL,
-		&req.SessionID, &req.ResultText, &req.Error, &createdAt, &updatedAt, &completedAt,
+		&req.SessionID, &req.HeadCommit, &req.RetryReason, &req.ResultText, &req.Error, &createdAt, &updatedAt, &completedAt,
+		&archivedAt, &refreshedAt, &taskSyncedAt,
 	); err != nil {
 		return ReviewRequest{}, err
 	}
 	req.CreatedAt, _ = parseTime(createdAt)
 	req.UpdatedAt, _ = parseTime(updatedAt)
 	req.CompletedAt, _ = parseNullTime(completedAt)
+	req.ArchivedAt, _ = parseNullTime(archivedAt)
+	req.RefreshedAt, _ = parseNullTime(refreshedAt)
+	req.TaskSyncedAt, _ = parseNullTime(taskSyncedAt)
 	return req, nil
+}
+
+func scanReviewRun(row reviewRunScanner) (ReviewRun, error) {
+	var run ReviewRun
+	var startedAt string
+	var updatedAt string
+	var completedAt sql.NullString
+	if err := row.Scan(
+		&run.ID, &run.ReviewID, &run.Seq, &run.Status, &run.HeadCommit, &run.RetryReason, &run.SessionID,
+		&run.ResultText, &run.Error, &run.Tool, &startedAt, &completedAt, &updatedAt,
+	); err != nil {
+		return ReviewRun{}, err
+	}
+	run.StartedAt, _ = parseTime(startedAt)
+	run.UpdatedAt, _ = parseTime(updatedAt)
+	run.CompletedAt, _ = parseNullTime(completedAt)
+	return run, nil
+}
+
+func scanReviewReaction(row reviewReactionScanner) (ReviewReaction, error) {
+	var reac ReviewReaction
+	var createdAt string
+	var updatedAt string
+	var completedAt sql.NullString
+	if err := row.Scan(
+		&reac.ID, &reac.ReviewID, &reac.Instruction, &reac.Status, &reac.ChatID, &reac.MessageID,
+		&reac.SenderOpenID, &reac.SenderName, &reac.SessionID, &reac.ResultText, &reac.Error,
+		&createdAt, &updatedAt, &completedAt,
+	); err != nil {
+		return ReviewReaction{}, err
+	}
+	reac.CreatedAt, _ = parseTime(createdAt)
+	reac.UpdatedAt, _ = parseTime(updatedAt)
+	reac.CompletedAt, _ = parseNullTime(completedAt)
+	return reac, nil
 }
 
 func mergeParticipants(existing, extra []string) []string {

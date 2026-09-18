@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { api, type Approval, type Event, type Review, type Session } from '../api'
+import { api, type Approval, type Event, type Review, type ReviewRun, type Session } from '../api'
 
 type Health = {
   ok: boolean
@@ -17,6 +17,7 @@ export const useControlPlaneStore = defineStore('controlPlane', {
     selected: null as Session | null,
     selectedReviewId: '',
     selectedReview: null as Review | null,
+    selectedReviewRuns: [] as ReviewRun[],
     events: [] as Event[],
     loading: false,
     error: ''
@@ -67,8 +68,9 @@ export const useControlPlaneStore = defineStore('controlPlane', {
     },
     async selectReview(id: string, updateSelectedId = true) {
       if (updateSelectedId) this.selectedReviewId = id
-      const detail = await api<{ review: Review }>(`/api/reviews/${encodeURIComponent(id)}`)
+      const detail = await api<{ review: Review; runs: ReviewRun[] }>(`/api/reviews/${encodeURIComponent(id)}`)
       this.selectedReview = detail.review
+      this.selectedReviewRuns = detail.runs ?? []
     },
     async setAutoPass(enabled: boolean) {
       if (!this.selected) return

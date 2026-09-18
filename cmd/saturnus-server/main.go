@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"saturnus/internal/cloudops"
 	"saturnus/internal/lark"
 	"saturnus/internal/policy"
 	"saturnus/internal/review"
@@ -28,6 +29,7 @@ type server struct {
 	store    *store.Store
 	lark     *lark.Client
 	reviews  *review.Service
+	cloudops *cloudops.Client
 	botUsers []string
 }
 
@@ -61,10 +63,15 @@ func run(ctx context.Context, addr, data, staticDir string) (err error) {
 		AppID:     os.Getenv("LARK_APP_ID"),
 		AppSecret: os.Getenv("LARK_APP_SECRET"),
 	})
+	cloudopsClient, err := cloudopsFromEnv()
+	if err != nil {
+		return err
+	}
 	s := &server{
 		store:    st,
 		lark:     larkClient,
 		reviews:  review.New(st, larkClient, reviewConfig()),
+		cloudops: cloudopsClient,
 		botUsers: splitCSV(os.Getenv("SATURNUS_COMMAND_ALLOWED_USERS")),
 	}
 	s.reviews.Start()
@@ -304,7 +311,8 @@ func (s *server) decideApproval(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) listReviews(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"reviews": s.reviews.List(r.URL.Query().Get("status"))})
+	includeArchived := r.URL.Query().Get("archived") == "1" || r.URL.Query().Get("archived") == "true"
+	writeJSON(w, http.StatusOK, map[string]any{"reviews": s.reviews.List(r.URL.Query().Get("status"), includeArchived)})
 }
 
 func (s *server) getReview(w http.ResponseWriter, r *http.Request) {
@@ -316,7 +324,7 @@ func (s *server) getReview(w http.ResponseWriter, r *http.Request) {
 	if err := s.reviews.ResolveRequesterName(&req); err != nil {
 		logRequesterResolveFailure(req, err)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"review": req})
+	writeJSON(w, http.StatusOK, map[string]any{"review": req, "runs": s.reviews.ListRuns(req.ID), "reactions": s.reviews.ListReactions(req.ID), "threads": s.reviews.ListThreads(req.ID)})
 }
 
 func (s *server) createReview(w http.ResponseWriter, r *http.Request) {
@@ -344,6 +352,10 @@ func (s *server) createReview(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, review.ErrAlreadyPending) {
 			writeJSON(w, http.StatusOK, map[string]any{"review": created, "reused": true})
+			return
+		}
+		if errors.Is(err, review.ErrReviewUnchanged) {
+			writeJSON(w, http.StatusOK, map[string]any{"review": created, "reused": true, "unchanged": true})
 			return
 		}
 		writeError(w, http.StatusBadRequest, err)
@@ -423,6 +435,9 @@ func (s *server) maybeReview(msg review.MessageContext) string {
 		if errors.Is(err, review.ErrAlreadyPending) {
 			return "Review already in progress: " + req.ID + " (" + req.PRURL + ")"
 		}
+		if errors.Is(err, review.ErrReviewUnchanged) {
+			return "Review " + req.ID + " is already up to date: PR head commit unchanged since the last review."
+		}
 		return "Review failed: " + err.Error()
 	}
 	return "Review started " + req.ID + " (" + req.PRURL + ")"
@@ -477,6 +492,8 @@ func statusOption(status string) any {
 		color = "blue"
 	case "reviewing":
 		color = "orange"
+	case "archived":
+		color = "grey"
 	}
 	return optionTag(status, color)
 }
@@ -659,10 +676,23 @@ func (s *server) resolveRequesterNames(reqs []store.ReviewRequest) {
 	}
 }
 
-func (s *server) reviewsReply() botReply {
-	reqs := s.reviews.List("")
+// reviewsReply renders the review list. mode is "" (default, excludes archived),
+// "all" (includes archived), or "archived" (only archived).
+func (s *server) reviewsReply(mode string) botReply {
+	includeArchived := mode == "all" || mode == "archived"
+	reqs := s.reviews.List("", includeArchived)
+	if mode == "archived" {
+		reqs = filterStatus(reqs, "archived")
+	}
 	if len(reqs) == 0 {
-		return botReply{text: "No reviews."}
+		switch mode {
+		case "archived":
+			return botReply{text: "No archived reviews."}
+		case "all":
+			return botReply{text: "No reviews."}
+		default:
+			return botReply{text: "No active reviews."}
+		}
 	}
 	if len(reqs) > 10 {
 		reqs = reqs[:10]
@@ -681,10 +711,14 @@ func (s *server) reviewsReply() botReply {
 			"createdAt": lark.UnixMillis(req.CreatedAt),
 		})
 	}
+	title := "PR Reviews"
+	if mode == "archived" {
+		title = "Archived PR Reviews"
+	}
 	return botReply{
-		text: s.reviews.FormatList(s.reviews.List("")),
+		text: s.reviews.FormatList(reqs),
 		table: &lark.TableCard{
-			Title: "PR Reviews",
+			Title: title,
 			Columns: []lark.TableColumn{
 				{Name: "id", Display: "ID", DataType: lark.ColumnText, Width: "20%"},
 				{Name: "status", Display: "Status", DataType: lark.ColumnOption, Width: "12%"},
@@ -697,6 +731,17 @@ func (s *server) reviewsReply() botReply {
 	}
 }
 
+// filterStatus keeps only reviews whose status equals want.
+func filterStatus(reqs []store.ReviewRequest, want string) []store.ReviewRequest {
+	out := make([]store.ReviewRequest, 0, len(reqs))
+	for _, req := range reqs {
+		if req.Status == want {
+			out = append(out, req)
+		}
+	}
+	return out
+}
+
 // requesterDisplayName returns the requester's display name, falling back to
 // the open_id when no name could be resolved or stored.
 func requesterDisplayName(req store.ReviewRequest) string {
@@ -704,6 +749,70 @@ func requesterDisplayName(req store.ReviewRequest) string {
 		return req.RequesterName
 	}
 	return req.RequesterOpenID
+}
+
+// refreshReply refreshes one review (or all non-archived reviews) against its
+// PR and task, and reports what changed.
+func (s *server) refreshReply(target string, msg review.MessageContext) botReply {
+	if target == "all" {
+		reqs, results, err := s.reviews.RefreshAll(msg)
+		if err != nil {
+			return botReply{text: "Refresh failed: " + err.Error()}
+		}
+		return botReply{text: s.reviews.FormatRefreshAll(reqs, results)}
+	}
+	req, res, err := s.reviews.Refresh(target, msg)
+	if err != nil {
+		return botReply{text: "Refresh failed: " + err.Error()}
+	}
+	return botReply{text: s.reviews.FormatRefreshResult(req, res)}
+}
+
+// threadsReply renders every chat thread a review was requested in. Each row is
+// one thread (chat, topic, participant count, last activity); participants are
+// shown as open_ids since resolving every one via the contact API would be too
+// slow for the reply budget.
+func (s *server) threadsReply(reviewID string) botReply {
+	req, err := s.reviews.Get(reviewID)
+	if err != nil {
+		return botReply{text: "Review not found."}
+	}
+	threads := s.reviews.ListThreads(reviewID)
+	if len(threads) == 0 {
+		return botReply{text: "No threads recorded for " + reviewID + "."}
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "Threads for %s (%s#%d):\n", reviewID, req.Repo, req.PRNumber)
+	rows := make([]map[string]any, 0, len(threads))
+	for _, t := range threads {
+		topic := t.Topic
+		if topic == "" {
+			topic = "-"
+		}
+		fmt.Fprintf(&b, "%s chat=%s topic=%s participants=%d last=%s\n",
+			t.ID, t.ChatID, topic, len(t.Participants), t.LastMessageAt.Format(time.RFC3339))
+		rows = append(rows, map[string]any{
+			"id":           t.ID,
+			"chat":         t.ChatID,
+			"topic":        topic,
+			"participants": len(t.Participants),
+			"lastActive":   lark.UnixMillis(t.LastMessageAt),
+		})
+	}
+	return botReply{
+		text: strings.TrimSpace(b.String()),
+		table: &lark.TableCard{
+			Title: "Threads for " + reviewID,
+			Columns: []lark.TableColumn{
+				{Name: "id", Display: "Thread", DataType: lark.ColumnText, Width: "22%"},
+				{Name: "chat", Display: "Chat", DataType: lark.ColumnText, Width: "22%"},
+				{Name: "topic", Display: "Topic", DataType: lark.ColumnText, Width: "28%"},
+				{Name: "participants", Display: "Participants", DataType: lark.ColumnNumber, Width: "13%"},
+				{Name: "lastActive", Display: "LastActive", DataType: lark.ColumnDate, DateFormat: "YYYY-MM-DD HH:mm", Width: "15%"},
+			},
+			Rows: rows,
+		},
+	}
 }
 
 func (s *server) describeReviewReply(id string) botReply {
@@ -714,13 +823,85 @@ func (s *server) describeReviewReply(id string) botReply {
 	if err := s.reviews.ResolveRequesterName(&req); err != nil {
 		logRequesterResolveFailure(req, err)
 	}
+	content := formatReviewMarkdown(req, s.reviews.Tool())
+	if runs := s.reviews.ListRuns(req.ID); len(runs) > 0 {
+		content += "\n\n" + formatReviewRuns(runs)
+	}
+	if reacs := s.reviews.ListReactions(req.ID); len(reacs) > 0 {
+		content += "\n\n" + formatReviewReactions(reacs)
+	}
+	if threads := s.reviews.ListThreads(req.ID); len(threads) > 0 {
+		content += "\n\n" + formatReviewThreads(threads)
+	}
 	return botReply{
 		text: s.reviews.FormatOne(req),
 		md: &lark.MarkdownCard{
 			Title:   "Review " + req.ID,
-			Content: formatReviewMarkdown(req, s.reviews.Tool()),
+			Content: content,
 		},
 	}
+}
+
+// formatReviewRuns renders a review's run history as a markdown table, so
+// every execution (initial + retries, each with its head commit) is visible.
+func formatReviewRuns(runs []store.ReviewRun) string {
+	var b strings.Builder
+	b.WriteString("**Runs**:\n")
+	b.WriteString("| # | Status | Head | Retry reason | Started |\n")
+	b.WriteString("| - | ------ | ---- | ------------ | ------- |\n")
+	for _, run := range runs {
+		head := run.HeadCommit
+		if len(head) > 7 {
+			head = head[:7]
+		}
+		started := ""
+		if !run.StartedAt.IsZero() {
+			started = run.StartedAt.Local().Format("2006-01-02 15:04:05")
+		}
+		fmt.Fprintf(&b, "| %d | %s | `%s` | %s | %s |\n", run.Seq, run.Status, head, markdownTableCell(run.RetryReason), started)
+	}
+	return b.String()
+}
+
+// formatReviewReactions renders a review's reaction history as a markdown
+// table, so every reviewer-triggered action on the review is visible.
+func formatReviewReactions(reacs []store.ReviewReaction) string {
+	var b strings.Builder
+	b.WriteString("**Reactions**:\n")
+	b.WriteString("| # | Status | Instruction | Updated |\n")
+	b.WriteString("| - | ------ | ----------- | ------- |\n")
+	for i, reac := range reacs {
+		updated := ""
+		if !reac.UpdatedAt.IsZero() {
+			updated = reac.UpdatedAt.Local().Format("2006-01-02 15:04:05")
+		}
+		fmt.Fprintf(&b, "| %d | %s | %s | %s |\n", i+1, reac.Status, markdownTableCell(truncateText(reac.Instruction, 60)), updated)
+	}
+	return b.String()
+}
+
+// formatReviewThreads renders a review's chat-thread history as a markdown
+// table, showing every thread the review was requested in.
+func formatReviewThreads(threads []store.ReviewThread) string {
+	var b strings.Builder
+	b.WriteString("**Threads**:\n")
+	b.WriteString("| # | Thread | Chat | Topic | Participants | Last active |\n")
+	b.WriteString("| - | ------ | ---- | ----- | ------------ | ----------- |\n")
+	for i, t := range threads {
+		last := ""
+		if !t.LastMessageAt.IsZero() {
+			last = t.LastMessageAt.Local().Format("2006-01-02 15:04:05")
+		}
+		fmt.Fprintf(&b, "| %d | `%s` | %s | %s | %d | %s |\n",
+			i+1, t.ID, markdownTableCell(t.ChatID), markdownTableCell(t.Topic), len(t.Participants), last)
+	}
+	return b.String()
+}
+
+// markdownTableCell sanitizes a value so it does not break a markdown table.
+func markdownTableCell(s string) string {
+	s = strings.ReplaceAll(s, "|", "\\|")
+	return strings.ReplaceAll(s, "\n", " ")
 }
 
 // formatReviewMarkdown renders a single review as markdown for a card. Metadata
@@ -741,6 +922,12 @@ func formatReviewMarkdown(req store.ReviewRequest, tool string) string {
 	if req.Title != "" {
 		fmt.Fprintf(&b, "**Title**: %s\n", escapeMarkdown(req.Title))
 	}
+	if req.HeadCommit != "" {
+		fmt.Fprintf(&b, "**Head**: `%s`\n", req.HeadCommit)
+	}
+	if req.RetryReason != "" {
+		fmt.Fprintf(&b, "**Retry reason**: %s\n", escapeMarkdown(req.RetryReason))
+	}
 	if req.RequesterName != "" || req.RequesterOpenID != "" {
 		name := req.RequesterName
 		if name == "" {
@@ -753,6 +940,12 @@ func formatReviewMarkdown(req store.ReviewRequest, tool string) string {
 	}
 	if !req.CompletedAt.IsZero() {
 		fmt.Fprintf(&b, "**Completed**: %s\n", req.CompletedAt.Local().Format("2006-01-02 15:04:05"))
+	}
+	if !req.ArchivedAt.IsZero() {
+		fmt.Fprintf(&b, "**Archived**: %s\n", req.ArchivedAt.Local().Format("2006-01-02 15:04:05"))
+	}
+	if !req.RefreshedAt.IsZero() {
+		fmt.Fprintf(&b, "**Refreshed**: %s\n", req.RefreshedAt.Local().Format("2006-01-02 15:04:05"))
 	}
 	if req.TaskID != "" {
 		if req.TaskURL != "" {
@@ -835,8 +1028,13 @@ var satCommandList = []struct {
 	{"/sat approve <request_id>", "approve a pending request"},
 	{"/sat deny <request_id> <reason>", "deny a pending request"},
 	{"/sat autopass on|off <session_id>", "toggle auto-approve for a session"},
-	{"/sat reviews", "list recent PR reviews"},
+	{"/sat reviews", "list recent PR reviews (archived reviews are hidden)"},
+	{"/sat reviews all|archived", "list PR reviews including archived, or only archived"},
 	{"/sat review <pr-url|review_id>", "start a review, or show one review by id"},
+	{"/sat retry <review_id>", "retry a failed review, or re-run after the PR head changed"},
+	{"/sat refresh <review_id|all>", "sync PR/task state: archive merged/closed PRs, complete their task, append reviewer comments to the task"},
+	{"/sat act <review_id> <instruction>", "resume the review session to act on the PR (e.g. inline comments for selected issues, concrete code for an issue)"},
+	{"/sat threads <review_id>", "list all chat threads a review was requested in"},
 	{"/sat describe review <review_id>", "show full details of one review"},
 	{"/sat repos", "show the configured review repos"},
 	{"/sat whoami", "show your open_id"},
@@ -955,7 +1153,14 @@ func (s *server) handleBotCommand(text string, msg review.MessageContext) botRep
 		query := strings.TrimSpace(strings.TrimPrefix(text, strings.Join(fields[:2], " ")))
 		return s.whoisReply(query)
 	case "reviews":
-		return s.reviewsReply()
+		mode := ""
+		if len(fields) >= 3 {
+			mode = fields[2]
+		}
+		if mode != "" && mode != "all" && mode != "archived" {
+			return botReply{text: "Usage: /sat reviews [all|archived]"}
+		}
+		return s.reviewsReply(mode)
 	case "repos":
 		return botReply{text: s.reviews.FormatRepos()}
 	case "review":
@@ -976,9 +1181,50 @@ func (s *server) handleBotCommand(text string, msg review.MessageContext) botRep
 			if errors.Is(err, review.ErrAlreadyPending) {
 				return botReply{text: "Review already in progress: " + req.ID + " (" + req.PRURL + ")"}
 			}
+			if errors.Is(err, review.ErrReviewUnchanged) {
+				return botReply{text: "Review " + req.ID + " is already up to date: PR head commit unchanged since the last review. Use /sat retry to force another run."}
+			}
 			return botReply{text: "Review failed: " + err.Error()}
 		}
 		return botReply{text: "Review started " + req.ID + " (" + req.PRURL + ")"}
+	case "retry":
+		if len(fields) < 3 {
+			return botReply{text: "Usage: /sat retry <review_id>"}
+		}
+		req, err := s.reviews.Retry(fields[2], msg)
+		if err != nil {
+			if errors.Is(err, review.ErrAlreadyPending) {
+				return botReply{text: "Review already in progress: " + req.ID + " (" + req.PRURL + ")"}
+			}
+			if errors.Is(err, review.ErrReviewUnchanged) {
+				return botReply{text: "Review " + fields[2] + " is already up to date: PR head commit unchanged since the last review."}
+			}
+			return botReply{text: "Retry failed: " + err.Error()}
+		}
+		return botReply{text: "Retry started " + req.ID + " (" + req.PRURL + ")"}
+	case "act":
+		if len(fields) < 4 {
+			return botReply{text: "Usage: /sat act <review_id> <instruction>"}
+		}
+		instruction := strings.TrimSpace(strings.TrimPrefix(text, strings.Join(fields[:3], " ")))
+		if instruction == "" {
+			return botReply{text: "Usage: /sat act <review_id> <instruction>"}
+		}
+		reac, err := s.reviews.Act(msg, fields[2], instruction)
+		if err != nil {
+			return botReply{text: "Act failed: " + err.Error()}
+		}
+		return botReply{text: fmt.Sprintf("Act started %s on review %s: %s", reac.ID, reac.ReviewID, reac.Instruction)}
+	case "refresh":
+		if len(fields) < 3 {
+			return botReply{text: "Usage: /sat refresh <review_id|all>"}
+		}
+		return s.refreshReply(fields[2], msg)
+	case "threads":
+		if len(fields) < 3 {
+			return botReply{text: "Usage: /sat threads <review_id>"}
+		}
+		return s.threadsReply(fields[2])
 	case "describe":
 		if len(fields) < 4 || fields[2] != "review" {
 			return botReply{text: "Usage: /sat describe review <review_id>"}
@@ -996,6 +1242,17 @@ func (s *server) handleBotCommand(text string, msg review.MessageContext) botRep
 			return botReply{text: "Reply failed: " + err.Error()}
 		}
 		return botReply{text: "Replied to requester for " + fields[2]}
+	case "cluster-actions":
+		if len(fields) < 3 {
+			return botReply{text: "Usage: /sat cluster-actions <instance_id> [hours]"}
+		}
+		hours := 24
+		if len(fields) >= 4 {
+			if parsed, err := strconv.Atoi(fields[3]); err == nil && parsed > 0 {
+				hours = parsed
+			}
+		}
+		return s.clusterActionsReply(fields[2], hours)
 	default:
 		return botReply{text: "Unknown command. Type /sat help to see all commands."}
 	}
@@ -1058,6 +1315,38 @@ func reviewConfig() review.Config {
 		TaskDueHours:    envInt("SATURNUS_REVIEW_TASK_DUE_HOURS", 24),
 		LogDir:          os.Getenv("SATURNUS_REVIEW_LOG_DIR"),
 	}
+}
+
+// cloudopsFromEnv loads the cloud-ops client config from
+// SATURNUS_CLOUDOPS_CONFIG. When the variable is unset the feature is disabled
+// and the bot returns "not configured".
+func cloudopsFromEnv() (*cloudops.Client, error) {
+	path := os.Getenv("SATURNUS_CLOUDOPS_CONFIG")
+	if path == "" {
+		return nil, nil
+	}
+	cfg, err := cloudops.Load(path)
+	if err != nil {
+		return nil, fmt.Errorf("load cloudops config: %w", err)
+	}
+	return cloudops.New(cfg), nil
+}
+
+// clusterActionsReply queries the cloud-ops action history for an instance and
+// renders the result. Intentionally not listed in /sat help.
+func (s *server) clusterActionsReply(instanceID string, hours int) botReply {
+	if s.cloudops == nil {
+		return botReply{text: "Cluster actions not configured (set SATURNUS_CLOUDOPS_CONFIG)."}
+	}
+	if instanceID == "" {
+		return botReply{text: "Usage: /sat cluster-actions <instance_id> [hours]"}
+	}
+	actions, err := s.cloudops.ListActions(context.Background(), instanceID, hours)
+	if err != nil {
+		return botReply{text: "Cluster actions failed: " + err.Error()}
+	}
+	card, text := s.cloudops.Reply(instanceID, hours, actions)
+	return botReply{text: text, table: card}
 }
 
 func splitCSV(value string) []string {

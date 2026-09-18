@@ -1,6 +1,10 @@
 package lark
 
-import "testing"
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+)
 
 func TestParseContactUserName(t *testing.T) {
 	cases := []struct {
@@ -76,5 +80,64 @@ func TestIsAllDigits(t *testing.T) {
 	}
 	if isAllDigits("") {
 		t.Fatal("expected false for empty")
+	}
+}
+
+func TestLarkErrorDetail(t *testing.T) {
+	got := larkErrorDetail([]byte(`{"code":1470400,"msg":"invalid params"}`))
+	if !strings.Contains(got, "1470400") || !strings.Contains(got, "invalid params") {
+		t.Fatalf("expected code+msg in error detail, got %q", got)
+	}
+	// Non-JSON bodies fall back to a quoted snippet.
+	got = larkErrorDetail([]byte("<html>gateway error</html>"))
+	if !strings.Contains(got, "gateway error") {
+		t.Fatalf("expected body fallback, got %q", got)
+	}
+	if got := larkErrorDetail(nil); got != "" {
+		t.Fatalf("expected empty detail for empty body, got %q", got)
+	}
+}
+
+func TestTruncateRunes(t *testing.T) {
+	if got := truncateRunes("hello", 10); got != "hello" {
+		t.Fatalf("expected no truncation, got %q", got)
+	}
+	got := truncateRunes("你好世界", 3)
+	if got != "你好世" || len([]rune(got)) != 3 {
+		t.Fatalf("expected rune-safe truncation, got %q", got)
+	}
+}
+
+// TestUpdateTaskBody verifies the task v2 PATCH contract: a `task` object plus
+// `update_fields`, and completion expressed via `completed_at` (ms timestamp).
+func TestUpdateTaskBody(t *testing.T) {
+	desc := strings.Repeat("长", taskDescriptionMaxRunes+100)
+	completed := true
+	payload, ok := buildTaskUpdate(UpdateTaskInput{Description: &desc, Completed: &completed})
+	if !ok {
+		t.Fatal("expected a payload to build")
+	}
+	raw, _ := json.Marshal(payload)
+	if !strings.Contains(string(raw), `"update_fields"`) || !strings.Contains(string(raw), `"completed_at"`) {
+		t.Fatalf("update body missing update_fields/completed_at: %s", raw)
+	}
+	if strings.Contains(string(raw), `"completed"`) {
+		t.Fatalf("update body must not use a top-level completed field: %s", raw)
+	}
+	task := payload["task"].(map[string]any)
+	if len([]rune(task["description"].(string))) > taskDescriptionMaxRunes {
+		t.Fatalf("description not truncated to %d runes", taskDescriptionMaxRunes)
+	}
+
+	// Reopen: completed=false maps to completed_at "0".
+	reopen := false
+	payload2, _ := buildTaskUpdate(UpdateTaskInput{Completed: &reopen})
+	if payload2["task"].(map[string]any)["completed_at"] != "0" {
+		t.Fatalf("expected completed_at 0 for reopen, got %#v", payload2)
+	}
+
+	// No fields to update -> not ok.
+	if _, ok := buildTaskUpdate(UpdateTaskInput{}); ok {
+		t.Fatal("expected no payload for empty input")
 	}
 }

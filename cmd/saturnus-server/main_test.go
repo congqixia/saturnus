@@ -264,7 +264,9 @@ func (f *fakeLarkName) SendTextToUser(_, _ string) error   { return nil }
 func (f *fakeLarkName) CreateTask(lark.CreateTaskInput) (lark.Task, error) {
 	return lark.Task{}, nil
 }
-func (f *fakeLarkName) ReplyMessage(_, _ string) error { return nil }
+func (f *fakeLarkName) GetTask(string) (lark.Task, error)             { return lark.Task{}, nil }
+func (f *fakeLarkName) UpdateTask(string, lark.UpdateTaskInput) error { return nil }
+func (f *fakeLarkName) ReplyMessage(_, _ string) error                { return nil }
 
 func newTestReviewWithName(t *testing.T, name string) (botReply, *server) {
 	t.Helper()
@@ -289,7 +291,7 @@ func newTestReviewWithName(t *testing.T, name string) (botReply, *server) {
 		t.Fatal(err)
 	}
 	svc := review.New(st, &fakeLarkName{name: name}, review.Config{Enabled: true})
-	return (&server{store: st, reviews: svc}).reviewsReply(), nil
+	return (&server{store: st, reviews: svc}).reviewsReply(""), nil
 }
 
 func TestReviewsReplyResolvesRequesterName(t *testing.T) {
@@ -306,6 +308,109 @@ func TestReviewsReplyFallsBackToOpenIDWhenNameUnresolvable(t *testing.T) {
 	reply, _ := newTestReviewWithName(t, "")
 	if got := reply.table.Rows[0]["requester"]; got != "ou_requester" {
 		t.Fatalf("expected open_id fallback when name unresolvable, got %v", got)
+	}
+}
+
+func TestThreadsReplyListsAllLinkedThreads(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	t1, err := st.GetOrCreateReviewThread("oc_alice", "om_a", "topic-a", []string{"ou_alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t2, err := st.GetOrCreateReviewThread("oc_bob", "om_b", "topic-b", []string{"ou_bob", "ou_alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := st.CreateReview(store.ReviewRequest{
+		ID: "rvw_th", ThreadID: t1.ID, Status: "succeeded",
+		PRURL: "https://github.com/a/b/pull/1", Repo: "a/b", PRNumber: 1,
+		RequesterOpenID: "ou_alice",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.LinkReviewThread(req.ID, t1.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.LinkReviewThread(req.ID, t2.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := &server{store: st, reviews: review.New(st, &fakeLarkName{}, review.Config{Enabled: true})}
+	reply := srv.threadsReply("rvw_th")
+	if reply.table == nil || len(reply.table.Rows) != 2 {
+		t.Fatalf("expected a 2-row table card, got %#v", reply.table)
+	}
+	seenChats := map[string]bool{}
+	for _, row := range reply.table.Rows {
+		seenChats[row["chat"].(string)] = true
+	}
+	if !seenChats["oc_alice"] || !seenChats["oc_bob"] {
+		t.Fatalf("thread card missing chats: %#v", seenChats)
+	}
+	if !strings.Contains(reply.text, "oc_alice") || !strings.Contains(reply.text, "topic-b") {
+		t.Fatalf("plain-text fallback missing thread info: %s", reply.text)
+	}
+}
+
+func TestThreadsReplyReviewNotFound(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	srv := &server{store: st, reviews: review.New(st, &fakeLarkName{}, review.Config{Enabled: true})}
+	reply := srv.threadsReply("rvw_missing")
+	if reply.table != nil || !strings.Contains(reply.text, "not found") {
+		t.Fatalf("expected not-found reply, got %#v", reply)
+	}
+}
+
+func TestReviewsReplyArchivedMode(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	thread, err := st.GetOrCreateReviewThread("oc_chat", "om_root", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateReview(store.ReviewRequest{
+		ID: "rvw_active", ThreadID: thread.ID, Status: "succeeded",
+		PRURL: "https://github.com/a/b/pull/1", Repo: "a/b", PRNumber: 1,
+		RequesterOpenID: "ou_requester",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateReview(store.ReviewRequest{
+		ID: "rvw_arch", ThreadID: thread.ID, Status: "archived",
+		PRURL: "https://github.com/a/b/pull/2", Repo: "a/b", PRNumber: 2,
+		RequesterOpenID: "ou_requester",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	srv := &server{store: st, reviews: review.New(st, &fakeLarkName{}, review.Config{Enabled: true})}
+
+	// Default list hides archived reviews.
+	def := srv.reviewsReply("")
+	if len(def.table.Rows) != 1 || def.table.Rows[0]["id"] != "rvw_active" {
+		t.Fatalf("default list should hide archived, got %#v", def.table.Rows)
+	}
+	// Explicit archived mode shows only archived.
+	arch := srv.reviewsReply("archived")
+	if len(arch.table.Rows) != 1 || arch.table.Rows[0]["id"] != "rvw_arch" {
+		t.Fatalf("archived list wrong, got %#v", arch.table.Rows)
+	}
+	// All mode shows everything.
+	all := srv.reviewsReply("all")
+	if len(all.table.Rows) != 2 {
+		t.Fatalf("all list wrong, got %#v", all.table.Rows)
 	}
 }
 

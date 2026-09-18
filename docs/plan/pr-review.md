@@ -16,6 +16,10 @@ fixed reviewer.
 3. (Optional) Create a Feishu task for each review request.
 4. (Optional, template-driven) Run a local review tool (default `opencode`) in
    a fresh PR worktree and send the result to the configured reviewer.
+5. Reviewer reactions: after a review finishes, the reviewer can resume the
+   review's tool session from the chat (`/sat act <review_id> <instruction>`)
+   so the agent takes an action (inline comments on selected issues, concrete
+   code for an issue, ...) and the output is returned.
 
 Items 3 and 4 are behind config flags so the pipeline can be rolled out in
 stages.
@@ -83,9 +87,69 @@ thread row.
 | tool | TEXT | tool used (default `opencode`) |
 | task_id | TEXT | Feishu task GUID when created |
 | task_url | TEXT | clickable Feishu task applink |
+| session_id | TEXT | tool session captured after a run; reused to continue a retry |
+| head_commit | TEXT | PR head commit (`headRefOid`) this run reviewed |
+| retry_reason | TEXT | why the run was re-queued (shown in prompts/describe, cleared after the run) |
 | result_text | TEXT | tool output |
 | error | TEXT | failure detail |
+| archived_at | TEXT | when the review was archived (PR merged/closed); hidden from default listings |
+| refreshed_at | TEXT | last `/sat refresh` time |
+| task_synced_at | TEXT | newest PR review `submitted_at` already synced to the task |
 | created_at / updated_at / completed_at | TEXT | |
+
+Every execution is also appended to `review_runs` (one row per run, ordered by
+`seq`), so the full history — including each run's status, head commit, retry
+reason, session and result — is preserved even after later retries overwrite
+the `review_requests` row:
+
+| column | meaning |
+| --- | --- |
+| id / review_id / seq | run id, owning review, 1-based sequence |
+| status | running / succeeded / failed / cancelled |
+| head_commit | PR head commit this run reviewed |
+| retry_reason | why this run happened (empty for the first run) |
+| session_id | tool session captured for this run |
+| result_text / error | this run's outcome |
+| started_at / completed_at / updated_at | timing |
+
+`review_runs` is exposed in `GET /api/reviews/{id}` (`runs`) and in the
+`/sat describe review` card.
+
+### review_reactions
+
+Records reviewer-triggered actions on a finished review, so every `/sat act`
+instruction (and its outcome) is traceable:
+
+| column | meaning |
+| --- | --- |
+| id / review_id | `rxn_...`, owning review |
+| instruction | the reviewer's natural-language instruction |
+| status | pending / running / succeeded / failed |
+| chat_id / message_id | where the command was issued (result is delivered there) |
+| sender_open_id / sender_name | who triggered the action |
+| session_id | tool session resumed for this action |
+| result_text / error | the agent's output / failure detail |
+| created_at / updated_at / completed_at | timing |
+
+Exposed in `GET /api/reviews/{id}` (`reactions`) and the `/sat describe
+review` card.
+
+### review_thread_links
+
+Records every thread a review was requested in, so the review keeps its full
+chat-thread history even after `review_requests.thread_id` moves to the latest
+request's thread:
+
+| column | meaning |
+| --- | --- |
+| review_id | owning review |
+| thread_id | the thread used for that request |
+| linked_at | when the thread was (last) used for the review |
+
+Deduped by `(review_id, thread_id)`; on every submit/retry the resolved thread
+is linked. `GET /api/reviews/{id}` returns `threads`, the `/sat threads
+<review_id>` command lists them as a card, and the describe card shows them.
+Reviews recorded before linking fall back to their current thread.
 
 ## Flow
 
@@ -100,12 +164,79 @@ thread row.
    stored.
 6. The review ID is enqueued. A worker picks it up:
    - Resolve the local checkout from the repo whitelist; reject if not listed.
-   - `gh pr view` (when `gh` exists) for title/base branch.
+   - `gh pr view` (when `gh` exists) for title/base branch/head commit; the head
+     commit is recorded as `head_commit` and used as the baseline for retries.
+   - If the review was re-queued (retry/re-submit), the command template resumes
+     the previous tool session (`--session <session_id>`) and the prompt notes
+     the `retry_reason` so the tool continues the existing review conversation.
    - Run the tool via the command template directly inside the checkout. The
      tool is responsible for fetching/checking out the PR head itself.
    - Store result / error, mark `succeeded` or `failed`.
 7. Result is delivered to the fixed reviewer (DM by open_id, or configured
    chat; optionally also replied into the original thread).
+
+Re-submission and retry semantics:
+
+- Submitting the same PR again while a review is active → already in progress.
+- Submitting again after a review finished: a failed review always re-runs; a
+  successful review only re-runs when `head_commit` moved (compared via
+  `gh pr view --json headRefOid`), otherwise the request is refused as already
+  up to date. The retry keeps `session_id` and sets `retry_reason`.
+- `/sat retry <review_id>`: same policy, plus it works on a specific review id.
+  The previous `session_id` is kept so the run appends to the same tool
+  conversation.
+- The requester identity is preserved across re-runs: re-submitting or retrying
+  a review (e.g. the reviewer continuing the review) does not reassign
+  `requester_open_id`/`requester_name`, so requester replies and task
+  notifications still reach the original requester. Only when the recorded
+  requester is a placeholder (empty, or the HTTP-API `"api"` sentinel) is the
+  new sender adopted. The chat/message/thread context is still updated each
+  request so the review thread records who keeps participating.
+
+### Refresh and archive
+
+`/sat refresh <review_id>` (or `/sat refresh all` to sweep every non-archived
+review) re-syncs a review with its PR and Feishu task:
+
+- `gh pr view` resolves the PR state. When it is `MERGED` or `CLOSED` the
+  review is set to status `archived` (`archived_at` recorded) and, when a task
+  exists, the task is marked completed. Archived reviews are hidden from
+  default listings and reject re-runs (`ErrArchived`).
+- A previously archived PR that was reopened restores the review to `succeeded`
+  and clears `archived_at`.
+- For an open PR, `gh api repos/<owner>/<repo>/pulls/<n>/reviews` returns the
+  submitted reviews; those newer than `task_synced_at` are appended to the task
+  description (`[review] <user> (<state>) <submitted_at>\n<body>`, bounded to
+  3000 UTF-8 chars), then `task_synced_at` advances so each comment is synced
+  once. Requires `gh` and the `task:task` write scope.
+
+Task writes follow the task v2 update contract: a nested `task` object plus an
+`update_fields` list naming the changed fields, and completion is set via
+`completed_at` (ms timestamp; `"0"` reopens) — not a boolean `completed` field.
+API errors surface Feishu's `code`/`msg` in the log so a 400 (e.g. code
+`1470400`) is diagnosable.
+
+Listings: `ListReviews(status, includeArchived)` excludes archived by default;
+`/sat reviews all` / `/sat reviews archived` and `GET /api/reviews?archived=1`
+opt in.
+
+### Reactions
+
+`/sat act <review_id> <instruction>` records a reaction (status `pending`) and
+enqueues it on the same worker pool. A worker resolves the review's checkout,
+resumes the review's tool session (`opencode run --session <session_id>`; the
+stored `session_id`, falling back to `captureSessionID`), and runs the tool
+with the instruction passed as a single argv element (no shell quoting issues).
+Output is streamed into `review_reactions.result_text` (~5s flush), the
+transcript is written to `<LOG_DIR>/<reaction_id>.log`, and the outcome is
+delivered to the chat where the command was issued (falling back to the
+configured reviewer recipient). The instruction argv element keeps arbitrary
+reviewer text (quotes, backslashes, whitespace) verbatim.
+
+Validation at submission time: service enabled, sender is the reviewer
+(`isReviewer`), instruction non-empty, review exists and is not still running,
+and a tool session is resolvable. Pending reactions are re-enqueued on
+restart; interrupted `running` reactions are marked `failed`.
 
 ## Repo Whitelist
 
@@ -197,8 +328,14 @@ requester is DM'd the task link so they can open it directly. Requires
 ## Bot Commands
 
 - `/sat review <pr-url>`
-- `/sat reviews` — recent review requests
+- `/sat reviews` — recent review requests (excludes archived)
+- `/sat reviews all|archived` — include archived, or only archived
 - `/sat review <id>` — detail of one review
+- `/sat retry <review_id>` — retry a failed review, or re-run after the PR head changed
+- `/sat refresh <review_id|all>` — archive merged/closed PRs, complete their task, append reviewer comments to the task
+- `/sat act <review_id> <instruction>` — resume the review session to act on the PR
+- `/sat threads <review_id>` — list all chat threads the review was requested in
+- `/sat describe review <id>` — full details including runs, reactions and threads
 - `/sat repos` — show the configured repo whitelist
 
 ## Web UI

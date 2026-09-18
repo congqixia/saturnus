@@ -1,12 +1,10 @@
 package review
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os/exec"
 	"strings"
 	"sync"
@@ -22,11 +20,19 @@ type ToolArgs struct {
 	Worktree   string
 	Guide      string
 	ReviewID   string
+	HeadCommit string
+	// SessionID, when set, makes the rendered command resume that tool session
+	// (opencode run --session <id>) so a retry/continue appends to the previous
+	// review conversation instead of starting fresh.
+	SessionID string
+	// RetryNote, when set, replaces the initial review prompt with a
+	// continuation instruction; it is shellquoted into the outer prompt.
+	RetryNote string
 }
 
 const maxResultBytes = 512 * 1024
 
-var DefaultCommandTemplate = `run --title "saturnus-review-{{.ReviewID}}" "Review GitHub PR {{.Repo}}#{{.PRNumber}} ({{.PRURL}}). The repository is already checked out at {{.Worktree}}. Fetch and check out the PR head yourself, then review the changes. Focus on correctness, security and style; be concise with file:line references.{{if .Guide}} Review guidelines: {{.Guide | shellquote}}{{end}} Finish with a structured review. The very last block must be exactly:
+var DefaultCommandTemplate = `run {{if .SessionID}}--session {{.SessionID}} {{end}}--title "saturnus-review-{{.ReviewID}}" "{{if .RetryNote}}{{.RetryNote | shellquote}}{{else}}Review GitHub PR {{.Repo}}#{{.PRNumber}} ({{.PRURL}}). The repository is already checked out at {{.Worktree}}. Fetch and check out the PR head yourself, then review the changes. Focus on correctness, security and style; be concise with file:line references.{{if .Guide}} Review guidelines: {{.Guide | shellquote}}{{end}}{{end}} Finish with a structured review. The very last block must be exactly:
 
 REVIEW SUMMARY:
 PR summary: <what the PR does in 2-3 sentences>
@@ -98,47 +104,26 @@ func splitCommand(line string) ([]string, error) {
 	return out, nil
 }
 
+// Run executes the review tool in dir, streaming stdout/stderr to sink and
+// returning the combined output. The tool's stdout and stderr are wired to
+// writers, so os/exec drains them before Wait returns; using StdoutPipe here
+// instead would race with Wait and occasionally lose buffered output.
 func Run(ctx context.Context, tool string, args []string, dir string, sink func(string)) (string, error) {
 	cmd := exec.CommandContext(ctx, tool, args...)
 	cmd.Dir = dir
 	setupProcessGroup(cmd)
 
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return "", err
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return "", err
-	}
+	var mu sync.Mutex
+	var buf strings.Builder
+	w := &sinkWriter{buf: &buf, mu: &mu, sink: sink}
+	cmd.Stdout = w
+	cmd.Stderr = w
+
 	if err := cmd.Start(); err != nil {
 		return "", err
 	}
 
-	var mu sync.Mutex
-	var buf strings.Builder
-	emit := func(line string) {
-		mu.Lock()
-		if buf.Len() < maxResultBytes {
-			buf.WriteString(line)
-		}
-		mu.Unlock()
-		if sink != nil {
-			sink(line)
-		}
-	}
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		scanLines(stdout, emit)
-	}()
-	go func() {
-		defer wg.Done()
-		scanLines(stderr, emit)
-	}()
 	runErr := cmd.Wait()
-	wg.Wait()
 
 	mu.Lock()
 	out := buf.String()
@@ -149,10 +134,22 @@ func Run(ctx context.Context, tool string, args []string, dir string, sink func(
 	return out, runErr
 }
 
-func scanLines(r io.Reader, emit func(string)) {
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for sc.Scan() {
-		emit(sc.Text() + "\n")
+// sinkWriter accumulates output (bounded to maxResultBytes) and forwards every
+// chunk to the streaming sink.
+type sinkWriter struct {
+	mu   *sync.Mutex
+	buf  *strings.Builder
+	sink func(string)
+}
+
+func (w *sinkWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	if w.buf.Len() < maxResultBytes {
+		_, _ = w.buf.Write(p)
 	}
+	w.mu.Unlock()
+	if w.sink != nil {
+		w.sink(string(p))
+	}
+	return len(p), nil
 }

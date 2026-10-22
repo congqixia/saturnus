@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -79,8 +78,8 @@ func (b *Bridge) Run(ctx context.Context) error {
 	}()
 
 	ready := make(chan struct{})
-	stderrDone := make(chan struct{})
-	go streamStderr(stderr, ready, stderrDone)
+	exited := make(chan struct{})
+	go streamStderr(stderr, ready, exited)
 
 	waitDone := make(chan error, 1)
 	go func() {
@@ -90,15 +89,30 @@ func (b *Bridge) Run(ctx context.Context) error {
 	if err := waitReady(ctx, ready, waitDone, b.cfg.ReadyTimeout); err != nil {
 		return err
 	}
-	if err := b.consume(stdout); err != nil {
-		return err
+
+	consumeDone := make(chan error, 1)
+	go func() {
+		consumeDone <- b.consume(stdout)
+	}()
+
+	// The lark-cli consumer spawns a detached bus daemon that inherits the
+	// stdout pipe, so EOF on stdout (or the child process itself) may never
+	// arrive on its own after the consumer stops. Bail out as soon as any
+	// of the "done" signals fires instead of blocking on the pipe forever.
+	var waitErr error
+	select {
+	case <-consumeDone:
+	case <-exited:
+	case waitErr = <-waitDone:
+	case <-ctx.Done():
 	}
-	err = <-waitDone
-	<-stderrDone
-	if errors.Is(err, context.Canceled) {
+	if ctx.Err() != nil {
 		return nil
 	}
-	return err
+	if waitErr != nil {
+		return fmt.Errorf("lark-cli event consumer exited: %w", waitErr)
+	}
+	return fmt.Errorf("lark-cli event consumer stopped unexpectedly")
 }
 
 func (b *Bridge) consume(r io.Reader) error {
@@ -151,10 +165,26 @@ func WebhookPayload(line []byte) (map[string]any, error) {
 				"chat_id":      chatID,
 				"message_id":   firstNonEmpty(stringField(event, "message_id"), stringField(event, "id")),
 				"message_type": stringField(event, "message_type"),
+				"chat_type":    stringField(event, "chat_type"),
+				"reply_to":     stringField(event, "reply_to"),
+				"root_id":      stringField(event, "root_id"),
+				"thread_id":    stringField(event, "thread_id"),
+				"mentions":     mentionItems(event),
 				"content":      string(contentJSON),
 			},
 		},
 	}, nil
+}
+
+// mentionItems returns the event's mention entries as a JSON-ready slice.
+// Each item is {id, key, name}: id is the mentioned user's open_id (or the
+// special value "all" for @everyone), so the server can tell "@bot" apart
+// from "@all" by comparing ids against the bot's own open_id.
+func mentionItems(m map[string]any) []any {
+	if raw, ok := m["mentions"].([]any); ok {
+		return raw
+	}
+	return []any{}
 }
 
 func (b *Bridge) postEvent(payload map[string]any) error {
@@ -176,16 +206,20 @@ func (b *Bridge) postEvent(payload map[string]any) error {
 	return nil
 }
 
-func streamStderr(r io.Reader, ready chan<- struct{}, done chan<- struct{}) {
-	defer close(done)
+func streamStderr(r io.Reader, ready chan<- struct{}, exited chan<- struct{}) {
 	scanner := bufio.NewScanner(r)
 	readySent := false
+	exitedSent := false
 	for scanner.Scan() {
 		line := scanner.Text()
 		fmt.Fprintln(os.Stderr, line)
 		if !readySent && strings.Contains(line, "[event] ready event_key=") {
 			close(ready)
 			readySent = true
+		}
+		if !exitedSent && strings.Contains(line, "[event] exited ") {
+			close(exited)
+			exitedSent = true
 		}
 	}
 	if !readySent {

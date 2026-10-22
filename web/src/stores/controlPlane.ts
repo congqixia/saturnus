@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { api, type Approval, type Event, type Review, type ReviewRun, type Session } from '../api'
+import { api, type Approval, type Event, type Review, type ReviewRun, type Session, type Task, type TaskDoc, type TaskPR } from '../api'
 
 type Health = {
   ok: boolean
@@ -18,6 +18,11 @@ export const useControlPlaneStore = defineStore('controlPlane', {
     selectedReviewId: '',
     selectedReview: null as Review | null,
     selectedReviewRuns: [] as ReviewRun[],
+    tasks: [] as Task[],
+    selectedTaskId: '',
+    selectedTask: null as Task | null,
+    selectedTaskDocs: [] as TaskDoc[],
+    selectedTaskPrs: [] as TaskPR[],
     events: [] as Event[],
     loading: false,
     error: ''
@@ -25,7 +30,8 @@ export const useControlPlaneStore = defineStore('controlPlane', {
   getters: {
     activeSessions: (state) => state.sessions.filter((session) => session.status === 'active').length,
     pendingCount: (state) => state.pending.length,
-    reviewCount: (state) => state.reviews.length
+    reviewCount: (state) => state.reviews.length,
+    taskCount: (state) => state.tasks.length
   },
   actions: {
     async refresh() {
@@ -33,14 +39,16 @@ export const useControlPlaneStore = defineStore('controlPlane', {
       this.error = ''
       try {
         this.health = await api<Health>('/api/health')
-        const [sessions, approvals, reviews] = await Promise.all([
+        const [sessions, approvals, reviews, tasks] = await Promise.all([
           api<{ sessions: Session[] }>('/api/sessions'),
           api<{ approvals: Approval[] }>('/api/approvals?status=pending'),
-          api<{ reviews: Review[] }>('/api/reviews')
+          api<{ reviews: Review[] }>('/api/reviews'),
+          api<{ tasks: Task[] }>('/api/tasks')
         ])
         this.sessions = sessions.sessions ?? []
         this.pending = approvals.approvals ?? []
         this.reviews = reviews.reviews ?? []
+        this.tasks = tasks.tasks ?? []
         if (!this.selectedId && this.sessions.length > 0) {
           this.selectedId = this.sessions[0].id
         }
@@ -52,6 +60,12 @@ export const useControlPlaneStore = defineStore('controlPlane', {
         }
         if (this.selectedReviewId) {
           await this.selectReview(this.selectedReviewId, false)
+        }
+        if (!this.selectedTaskId && this.tasks.length > 0) {
+          this.selectedTaskId = this.tasks[0].id
+        }
+        if (this.selectedTaskId) {
+          await this.selectTask(this.selectedTaskId, false)
         }
       } catch (error) {
         this.health = { ok: false }
@@ -71,6 +85,13 @@ export const useControlPlaneStore = defineStore('controlPlane', {
       const detail = await api<{ review: Review; runs: ReviewRun[] }>(`/api/reviews/${encodeURIComponent(id)}`)
       this.selectedReview = detail.review
       this.selectedReviewRuns = detail.runs ?? []
+    },
+    async selectTask(id: string, updateSelectedId = true) {
+      if (updateSelectedId) this.selectedTaskId = id
+      const detail = await api<{ task: Task; docs: TaskDoc[]; prs: TaskPR[] }>(`/api/tasks/${encodeURIComponent(id)}`)
+      this.selectedTask = detail.task
+      this.selectedTaskDocs = detail.docs ?? []
+      this.selectedTaskPrs = detail.prs ?? []
     },
     async setAutoPass(enabled: boolean) {
       if (!this.selected) return

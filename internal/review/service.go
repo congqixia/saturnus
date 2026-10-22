@@ -27,9 +27,15 @@ type Config struct {
 	Timeout         time.Duration
 	CreateTask      bool
 	TaskDueHours    int
-	GHCli           string
-	LogDir          string
-	Guides          map[string]string
+	// TaskGroup is the name of the Feishu task group (任务分组) tasks are
+	// filed under. When set, Saturnus looks it up and creates it if missing.
+	TaskGroup string
+	// TaskGroupID pins an existing task group by guid, bypassing the name
+	// lookup/create.
+	TaskGroupID string
+	GHCli       string
+	LogDir      string
+	Guides      map[string]string
 }
 
 var ErrAlreadyPending = errors.New("review already in progress")
@@ -45,11 +51,32 @@ var ErrArchived = errors.New("review is archived")
 type MessageContext struct {
 	Text          string
 	ChatID        string
+	ChatType      string
 	SenderOpenID  string
 	SenderName    string
 	MessageID     string
+	ReplyTo       string
 	RootMessageID string
 	Topic         string
+	// Mentions holds the open_ids of every user @mentioned in the message
+	// (the special value "all" marks @everyone). MentionNames maps those ids
+	// to their display names as rendered by the client.
+	Mentions     []string
+	MentionNames map[string]string
+	// RequesterOpenID explicitly attributes the review requester (who receives
+	// result notifications and task assignment) to a different user than the
+	// command sender, e.g. via "@user" in /sat review. Empty means the sender
+	// is the requester.
+	RequesterOpenID string
+}
+
+// EffectiveRequesterOpenID returns the requester for a review: the explicitly
+// attributed open_id when set, otherwise the message sender.
+func (ctx MessageContext) EffectiveRequesterOpenID() string {
+	if ctx.RequesterOpenID != "" {
+		return ctx.RequesterOpenID
+	}
+	return ctx.SenderOpenID
 }
 
 type larkClient interface {
@@ -61,6 +88,8 @@ type larkClient interface {
 	GetTask(taskGUID string) (lark.Task, error)
 	UpdateTask(taskGUID string, input lark.UpdateTaskInput) error
 	ReplyMessage(messageID, text string) error
+	EnsureTaskList(name string) (lark.TaskList, error)
+	AddTaskToList(taskGUID, taskListGUID string) error
 }
 
 // job is one unit of work for the worker pool: a review execution or a
@@ -84,6 +113,12 @@ type Service struct {
 	// or spam the logs. Keyed by open_id, value is the failure time.
 	nameFailures   map[string]time.Time
 	nameFailuresMu sync.Mutex
+
+	// Task group resolution is cached once: the guid of the configured task
+	// group (SATURNUS_REVIEW_TASK_GROUP / _ID), resolved lazily on first use.
+	taskListOnce sync.Once
+	taskListGUID string
+	taskListErr  error
 }
 
 func New(st *store.Store, lk larkClient, cfg Config) *Service {
@@ -147,6 +182,21 @@ func (s *Service) Enabled() bool {
 // Tool returns the configured review tool name (e.g. "opencode").
 func (s *Service) Tool() string {
 	return s.cfg.Tool
+}
+
+// GHCli returns the configured GitHub CLI executable (default "gh").
+func (s *Service) GHCli() string {
+	return s.cfg.GHCli
+}
+
+// RepoList returns the whitelisted repo names (owner/name), one per configured
+// SATURNUS_REVIEW_REPOS entry.
+func (s *Service) RepoList() []string {
+	repos := make([]string, 0, len(s.cfg.Repos))
+	for repo := range s.cfg.Repos {
+		repos = append(repos, repo)
+	}
+	return repos
 }
 
 func (s *Service) Start() {
@@ -229,7 +279,8 @@ func (s *Service) submit(ctx MessageContext, requireUser bool) (store.ReviewRequ
 	if err != nil {
 		return store.ReviewRequest{}, err
 	}
-	requesterName := s.resolveName(ctx)
+	requesterOpenID := ctx.EffectiveRequesterOpenID()
+	requesterName := s.resolveNameFor(ctx, requesterOpenID)
 
 	existing, err := s.store.GetReviewByPR(pr.Repo, pr.PRNumber)
 	if err == nil {
@@ -257,7 +308,7 @@ func (s *Service) submit(ctx MessageContext, requireUser bool) (store.ReviewRequ
 				reason += ": " + existing.Error
 			}
 		}
-		return s.retryFinished(&existing, ctx, requesterName, reason)
+		return s.retryFinished(&existing, ctx, reason)
 	}
 
 	req := store.ReviewRequest{
@@ -266,7 +317,7 @@ func (s *Service) submit(ctx MessageContext, requireUser bool) (store.ReviewRequ
 		PRURL:           pr.PRURL,
 		Repo:            pr.Repo,
 		PRNumber:        pr.PRNumber,
-		RequesterOpenID: ctx.SenderOpenID,
+		RequesterOpenID: requesterOpenID,
 		RequesterName:   requesterName,
 		ChatID:          ctx.ChatID,
 		MessageID:       ctx.MessageID,
@@ -321,7 +372,94 @@ func (s *Service) Retry(id string, ctx MessageContext) (store.ReviewRequest, err
 			reason += ": " + req.Error
 		}
 	}
-	return s.retryFinished(&req, ctx, s.resolveName(ctx), reason)
+	return s.retryFinished(&req, ctx, reason)
+}
+
+// RetryOnReply handles a reply (with a bot mention) inside a review thread:
+// it looks up the latest active review rooted at that thread and re-checks
+// whether the PR head moved. When it did (or the review has no recorded
+// baseline, e.g. a failed run), the review is re-queued and both the requester
+// (in-thread) and the reviewer are notified. When nothing changed it returns
+// retried=false so the caller can acknowledge the reply without a re-run.
+func (s *Service) RetryOnReply(ctx MessageContext) (store.ReviewRequest, bool, error) {
+	if !s.cfg.Enabled {
+		return store.ReviewRequest{}, false, errors.New("PR review is disabled")
+	}
+	req, err := s.store.GetLatestReviewByThread(ctx.ChatID, ctx.RootMessageID)
+	if err != nil {
+		return store.ReviewRequest{}, false, errors.New("no active review found in this thread")
+	}
+	switch req.Status {
+	case "pending", "reviewing":
+		return req, false, nil
+	case "archived":
+		return req, false, ErrArchived
+	}
+	changed, head := s.headChanged(&req)
+	if !changed {
+		return req, false, nil
+	}
+	reason := "reply in review thread; PR head changed"
+	if head != "" {
+		reason += " to " + head
+	}
+	retried, err := s.retryFinished(&req, ctx, reason)
+	if err != nil {
+		return store.ReviewRequest{}, false, err
+	}
+	s.notifyReplyRetry(retried, ctx, head)
+	return retried, true, nil
+}
+
+// notifyReplyRetry tells the requester (in-thread) that the re-review has
+// started and pings the reviewer about the trigger.
+func (s *Service) notifyReplyRetry(req store.ReviewRequest, ctx MessageContext, head string) {
+	if !s.lark.Enabled() {
+		return
+	}
+	var requesterNote string
+	if head != "" {
+		requesterNote = fmt.Sprintf("重新评审已开始：%s#%d (%s)，PR head 已更新至 %s。完成后会通知你。", req.Repo, req.PRNumber, req.ID, shortHead(head))
+	} else {
+		requesterNote = fmt.Sprintf("重新评审已开始：%s#%d (%s)。完成后会通知你。", req.Repo, req.PRNumber, req.ID)
+	}
+	if ctx.MessageID != "" {
+		if err := s.lark.ReplyMessage(ctx.MessageID, requesterNote); err != nil {
+			logf("reply retry notice: %v", err)
+		}
+	} else if req.RequesterOpenID != "" {
+		if err := s.lark.SendTextToUser(req.RequesterOpenID, requesterNote); err != nil {
+			logf("notify requester of re-review: %v", err)
+		}
+	}
+
+	reviewerNote := fmt.Sprintf("Review %s (%s#%d) 已重新运行：PR head 变更，由 review 线程内的回复触发。requester=%s", req.ID, req.Repo, req.PRNumber, requesterDisplayName(req))
+	switch {
+	case s.cfg.ReviewerOpenID != "":
+		if err := s.lark.SendTextToUser(s.cfg.ReviewerOpenID, reviewerNote); err != nil {
+			logf("notify reviewer of re-review: %v", err)
+		}
+	case s.cfg.ReviewerChatID != "":
+		if err := s.lark.SendText("chat_id", s.cfg.ReviewerChatID, reviewerNote); err != nil {
+			logf("notify reviewer of re-review: %v", err)
+		}
+	}
+}
+
+// shortHead returns a short commit prefix for messages.
+func shortHead(head string) string {
+	if len(head) > 8 {
+		return head[:8]
+	}
+	return head
+}
+
+// requesterDisplayName returns the requester's stored display name or open_id.
+func requesterDisplayName(req store.ReviewRequest) string {
+	if req.RequesterName != "" {
+		return req.RequesterName
+	}
+	return req.RequesterOpenID
 }
 
 // retryFinished resets a finished review to pending and re-queues it. The
@@ -332,16 +470,17 @@ func (s *Service) Retry(id string, ctx MessageContext) (store.ReviewRequest, err
 // by anyone else (typically the reviewer continuing the review) must not
 // reassign who receives requester replies and task notifications. Only when the
 // recorded requester is a placeholder (empty, or the HTTP-API "api" sentinel)
-// is the new sender adopted as the requester. The chat/message/thread context
-// is still updated so the latest request is recorded in the review thread.
-func (s *Service) retryFinished(existing *store.ReviewRequest, ctx MessageContext, requesterName, reason string) (store.ReviewRequest, error) {
+// is the new sender (or an explicitly attributed requester) adopted. The
+// chat/message/thread context is still updated so the latest request is
+// recorded in the review thread.
+func (s *Service) retryFinished(existing *store.ReviewRequest, ctx MessageContext, reason string) (store.ReviewRequest, error) {
 	existing.Status = "pending"
 	existing.ResultText, existing.Error = "", ""
 	existing.CompletedAt = time.Time{}
 	existing.RetryReason = reason
 	if isPlaceholderRequester(existing.RequesterOpenID) {
-		existing.RequesterOpenID = ctx.SenderOpenID
-		existing.RequesterName = requesterName
+		existing.RequesterOpenID = ctx.EffectiveRequesterOpenID()
+		existing.RequesterName = s.resolveNameFor(ctx, existing.RequesterOpenID)
 	}
 	existing.ChatID = ctx.ChatID
 	existing.MessageID = ctx.MessageID
@@ -409,6 +548,11 @@ func (s *Service) Refresh(id string, ctx MessageContext) (store.ReviewRequest, R
 	res.PRState = info.State
 	if res.PRState == "" {
 		res.Error = "cannot resolve PR state (is gh configured?)"
+	}
+	// Record the PR's current head commit so listings can flag reviews whose
+	// last run predates the latest commit (OUTDATED).
+	if info.HeadCommit != "" {
+		req.PrHeadCommit = info.HeadCommit
 	}
 
 	now := time.Now().UTC()
@@ -586,16 +730,24 @@ func (s *Service) currentHead(repo string, num int) string {
 	return ResolvePRInfo(ctx, s.cfg.GHCli, repo, num).HeadCommit
 }
 
-func (s *Service) resolveName(ctx MessageContext) string {
-	name := ctx.SenderName
-	if name == "" && ctx.SenderOpenID != "" && s.lark.Enabled() {
-		if n, err := s.lark.GetUserName(ctx.SenderOpenID); err != nil {
+// resolveNameFor resolves a display name for an open_id, preferring the name
+// carried in the message (mention name, or the sender name when the id is the
+// sender), then falling back to the contact API.
+func (s *Service) resolveNameFor(ctx MessageContext, openID string) string {
+	if name := ctx.MentionNames[openID]; name != "" {
+		return name
+	}
+	if openID == ctx.SenderOpenID && ctx.SenderName != "" {
+		return ctx.SenderName
+	}
+	if openID != "" && s.lark.Enabled() {
+		if n, err := s.lark.GetUserName(openID); err != nil {
 			logf("resolve requester name: %v", err)
 		} else {
-			name = n
+			return n
 		}
 	}
-	return name
+	return ""
 }
 
 func (s *Service) maybeCreateTask(req *store.ReviewRequest) {
@@ -649,9 +801,49 @@ func (s *Service) Get(id string) (store.ReviewRequest, error) {
 	return s.store.GetReview(id)
 }
 
+// SetRequester reassigns the requester of an existing review (who receives
+// result notifications, requester replies and task assignment). The name is
+// resolved from the contact API when not provided. Archived reviews are
+// immutable and rejected.
+func (s *Service) SetRequester(id, openID, name string) (store.ReviewRequest, error) {
+	if !s.cfg.Enabled {
+		return store.ReviewRequest{}, errors.New("PR review is disabled")
+	}
+	if openID == "" {
+		return store.ReviewRequest{}, errors.New("empty requester open_id")
+	}
+	req, err := s.store.GetReview(id)
+	if err != nil {
+		return store.ReviewRequest{}, err
+	}
+	if req.Status == "archived" {
+		return store.ReviewRequest{}, ErrArchived
+	}
+	req.RequesterOpenID = openID
+	if name == "" && s.lark.Enabled() {
+		if n, err := s.lark.GetUserName(openID); err != nil {
+			logf("resolve requester name: %v", err)
+		} else {
+			name = n
+		}
+	}
+	req.RequesterName = name
+	if _, err := s.store.UpdateReview(req); err != nil {
+		return store.ReviewRequest{}, err
+	}
+	return req, nil
+}
+
 // ListRuns returns every recorded run of a review in execution order.
 func (s *Service) ListRuns(reviewID string) []store.ReviewRun {
 	return s.store.ListRuns(reviewID)
+}
+
+// ReviewOutdated reports whether a review's last run reviewed an older PR head
+// than the PR's current head as recorded by the last refresh (pr_head_commit).
+// A review with no recorded head on either side is never flagged.
+func ReviewOutdated(req store.ReviewRequest) bool {
+	return req.PrHeadCommit != "" && req.HeadCommit != "" && req.PrHeadCommit != req.HeadCommit
 }
 
 func (s *Service) FormatList(reqs []store.ReviewRequest) string {
@@ -663,14 +855,22 @@ func (s *Service) FormatList(reqs []store.ReviewRequest) string {
 		if i >= 10 {
 			break
 		}
-		fmt.Fprintf(&b, "%s %s %s#%d %s\n", req.ID, req.Status, req.Repo, req.PRNumber, req.CreatedAt.Format(time.RFC3339))
+		status := req.Status
+		if ReviewOutdated(req) {
+			status += " OUTDATED"
+		}
+		fmt.Fprintf(&b, "%s %s %s#%d %s\n", req.ID, status, req.Repo, req.PRNumber, req.CreatedAt.Format(time.RFC3339))
 	}
 	return strings.TrimSpace(b.String())
 }
 
 func (s *Service) FormatOne(req store.ReviewRequest) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s status=%s\n%s\nrepo=%s#%d", req.ID, req.Status, req.PRURL, req.Repo, req.PRNumber)
+	status := req.Status
+	if ReviewOutdated(req) {
+		status += " OUTDATED"
+	}
+	fmt.Fprintf(&b, "%s status=%s\n%s\nrepo=%s#%d", req.ID, status, req.PRURL, req.Repo, req.PRNumber)
 	if req.Title != "" {
 		fmt.Fprintf(&b, "\ntitle=%s", req.Title)
 	}
@@ -685,6 +885,9 @@ func (s *Service) FormatOne(req store.ReviewRequest) string {
 	}
 	if req.HeadCommit != "" {
 		fmt.Fprintf(&b, "\nhead=%s", req.HeadCommit)
+	}
+	if req.PrHeadCommit != "" && req.PrHeadCommit != req.HeadCommit {
+		fmt.Fprintf(&b, "\npr_head=%s (outdated)", req.PrHeadCommit)
 	}
 	if req.RetryReason != "" {
 		fmt.Fprintf(&b, "\nretry_reason=%s", req.RetryReason)
@@ -921,7 +1124,7 @@ func (s *Service) createTask(req store.ReviewRequest) (lark.Task, error) {
 	if requester == "" {
 		requester = req.RequesterOpenID
 	}
-	return s.lark.CreateTask(lark.CreateTaskInput{
+	task, err := s.lark.CreateTask(lark.CreateTaskInput{
 		Summary:       fmt.Sprintf("Review PR %s#%d", req.Repo, req.PRNumber),
 		Description:   fmt.Sprintf("PR review request %s\n%s\nrequester=%s", req.ID, req.PRURL, requester),
 		Due:           time.Now().Add(time.Duration(s.cfg.TaskDueHours) * time.Hour),
@@ -929,6 +1132,38 @@ func (s *Service) createTask(req store.ReviewRequest) (lark.Task, error) {
 		SourceTitle:   "Saturnus PR Review",
 		SourceURL:     req.PRURL,
 	})
+	if err != nil || task.GUID == "" {
+		return task, err
+	}
+	// File the task under the configured task group, if any.
+	guid, gerr := s.taskListGuid()
+	if gerr != nil {
+		logf("resolve task group: %v", gerr)
+	} else if guid != "" {
+		if aerr := s.lark.AddTaskToList(task.GUID, guid); aerr != nil {
+			logf("add task %s to tasklist %s: %v", task.GUID, guid, aerr)
+		}
+	}
+	return task, nil
+}
+
+// taskListGuid returns the guid of the configured task group, resolving it
+// once (lookup by name and create when missing, or the pinned guid).
+func (s *Service) taskListGuid() (string, error) {
+	s.taskListOnce.Do(func() {
+		switch {
+		case s.cfg.TaskGroupID != "":
+			s.taskListGUID = s.cfg.TaskGroupID
+		case s.cfg.TaskGroup != "" && s.lark.Enabled():
+			list, err := s.lark.EnsureTaskList(s.cfg.TaskGroup)
+			if err != nil {
+				s.taskListErr = err
+				return
+			}
+			s.taskListGUID = list.GUID
+		}
+	})
+	return s.taskListGUID, s.taskListErr
 }
 
 func taskMembers(reviewerOpenID, requesterOpenID string) []string {
@@ -986,9 +1221,12 @@ func (s *Service) process(id string) {
 		req.BaseBranch = info.BaseBranch
 	}
 	// Record the PR head commit this run reviews. It is the baseline used to
-	// decide whether a later retry/re-submission needs a fresh run.
+	// decide whether a later retry/re-submission needs a fresh run. The PR's
+	// current head as known here is stored alongside, so the review is not
+	// reported OUTDATED right after a run.
 	if info.HeadCommit != "" {
 		req.HeadCommit = info.HeadCommit
+		req.PrHeadCommit = info.HeadCommit
 	}
 	if req.Title != "" || info.HeadCommit != "" {
 		if _, err := s.store.UpdateReview(req); err != nil {

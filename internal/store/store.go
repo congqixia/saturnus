@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -130,6 +131,7 @@ type ReviewRequest struct {
 	TaskURL         string    `json:"task_url"`
 	SessionID       string    `json:"session_id"`
 	HeadCommit      string    `json:"head_commit"`
+	PrHeadCommit    string    `json:"pr_head_commit"`
 	RetryReason     string    `json:"retry_reason"`
 	ResultText      string    `json:"result_text"`
 	Error           string    `json:"error"`
@@ -166,6 +168,133 @@ type ReviewReaction struct {
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
 	CompletedAt  time.Time `json:"completed_at,omitempty"`
+}
+
+// Task is a feature tracking record that binds one GitHub issue to its local
+// design docs and implementing PRs. It is distinct from the Feishu tasks the
+// review pipeline creates; Feishu task references on linked PRs are stored as
+// fs_task_id/fs_task_url.
+type Task struct {
+	ID string `json:"id"`
+	// Title is the human-readable task title.
+	Title string `json:"title"`
+	// Status is open / in_progress / done / archived.
+	Status string `json:"status"`
+	// IssueRepo and IssueNumber identify the bound GitHub issue.
+	IssueRepo   string `json:"issue_repo"`
+	IssueNumber int    `json:"issue_number"`
+	// IssueTitle and IssueState are snapshots from `gh issue view`.
+	IssueTitle string `json:"issue_title"`
+	IssueState string `json:"issue_state"`
+	// IssueURL is the canonical issue URL.
+	IssueURL    string `json:"issue_url"`
+	Description string `json:"description"`
+	// ArchivedAt is set when the task is closed; archived tasks are hidden from
+	// default listings.
+	ArchivedAt time.Time `json:"archived_at,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+// TaskDoc is one attached local design doc: a repo-relative path inside the
+// mapped checkout of a whitelisted repo.
+type TaskDoc struct {
+	ID     string `json:"id"`
+	TaskID string `json:"task_id"`
+	Repo   string `json:"repo"`
+	Path   string `json:"path"`
+	// Title defaults to the file base name when not set.
+	Title     string    `json:"title"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// TaskPR is one linked PR with its per-PR progress snapshot. The review status
+// and Feishu task references are copied from the linked review_requests row
+// (via ReviewID) on attach and refresh, so the row is self-contained and does
+// not depend on live review lookups to render.
+type TaskPR struct {
+	ID     string `json:"id"`
+	TaskID string `json:"task_id"`
+	Repo   string `json:"repo"`
+	// PRNumber and PRURL identify the PR.
+	PRNumber int    `json:"pr_number"`
+	PRURL    string `json:"pr_url"`
+	// PRTitle, PRState and BaseBranch are snapshots from `gh pr view`. PRState
+	// is OPEN / CLOSED / MERGED.
+	PRTitle    string `json:"pr_title"`
+	PRState    string `json:"pr_state"`
+	BaseBranch string `json:"base_branch"`
+	// ReviewID links to review_requests when a review exists; empty otherwise.
+	ReviewID string `json:"review_id"`
+	// ReviewStatus is the snapshot of the linked review's status, or "none".
+	ReviewStatus string `json:"review_status"`
+	// FsTaskID / FsTaskURL snapshot the Feishu task created for the review.
+	FsTaskID  string `json:"fs_task_id"`
+	FsTaskURL string `json:"fs_task_url"`
+	// SyncedAt records the last time the snapshot was refreshed.
+	SyncedAt  time.Time `json:"synced_at,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// Chat mode flags control how the Lark bot behaves inside a group chat. A
+// chat's mode is a `|`-joined set of flags (e.g. "report|review"), so
+// capabilities can be combined instead of being mutually exclusive.
+const (
+	// ChatModeReview is the default: the bot answers direct mentions and can
+	// run reviews and /sat commands in the group.
+	ChatModeReview = "review"
+	// ChatModeReport marks the group as a quiet report channel: the bot does
+	// not respond to ordinary messages. When combined with ChatModeReview
+	// ("report|review") it still acts on review requests, while other /sat
+	// commands and casual chatter are ignored.
+	ChatModeReport = "report"
+)
+
+// ChatMode stores the per-chat behavior mode for a group chat.
+type ChatMode struct {
+	ChatID    string    `json:"chat_id"`
+	Mode      string    `json:"mode"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// NormalizeChatMode parses a user-supplied mode string (flags separated by
+// "|", "," or whitespace), validates each flag, and returns the canonical
+// form: flags sorted and joined by "|". It errors on unknown flags or an
+// empty set.
+func NormalizeChatMode(mode string) (string, error) {
+	seen := map[string]bool{}
+	for _, part := range strings.FieldsFunc(mode, func(r rune) bool {
+		return r == '|' || r == ',' || r == ' ' || r == '\t'
+	}) {
+		if part == "" {
+			continue
+		}
+		if part != ChatModeReview && part != ChatModeReport {
+			return "", fmt.Errorf("unknown mode flag %q (allowed: review, report)", part)
+		}
+		seen[part] = true
+	}
+	if len(seen) == 0 {
+		return "", errors.New("empty chat mode (need at least one of review, report)")
+	}
+	flags := make([]string, 0, len(seen))
+	for flag := range seen {
+		flags = append(flags, flag)
+	}
+	sort.Strings(flags)
+	return strings.Join(flags, "|"), nil
+}
+
+// ChatModeFlags splits a canonical mode string into a flag set.
+func ChatModeFlags(mode string) map[string]bool {
+	flags := map[string]bool{}
+	for _, flag := range strings.Split(mode, "|") {
+		if flag = strings.TrimSpace(flag); flag != "" {
+			flags[flag] = true
+		}
+	}
+	return flags
 }
 
 type Store struct {
@@ -349,6 +478,56 @@ func (s *Store) migrate(ctx context.Context) error {
 			linked_at TEXT NOT NULL,
 			PRIMARY KEY (review_id, thread_id)
 		)`,
+		`CREATE TABLE IF NOT EXISTS chat_modes (
+			chat_id TEXT PRIMARY KEY,
+			mode TEXT NOT NULL DEFAULT 'review',
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS tasks (
+			id TEXT PRIMARY KEY,
+			title TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT 'open',
+			issue_repo TEXT NOT NULL DEFAULT '',
+			issue_number INTEGER NOT NULL DEFAULT 0,
+			issue_title TEXT NOT NULL DEFAULT '',
+			issue_state TEXT NOT NULL DEFAULT '',
+			issue_url TEXT NOT NULL DEFAULT '',
+			description TEXT NOT NULL DEFAULT '',
+			archived_at TEXT,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, created_at DESC)`,
+		`CREATE TABLE IF NOT EXISTS task_docs (
+			id TEXT PRIMARY KEY,
+			task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+			repo TEXT NOT NULL DEFAULT '',
+			path TEXT NOT NULL DEFAULT '',
+			title TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			UNIQUE(task_id, repo, path)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_task_docs_task ON task_docs(task_id)`,
+		`CREATE TABLE IF NOT EXISTS task_prs (
+			id TEXT PRIMARY KEY,
+			task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+			repo TEXT NOT NULL DEFAULT '',
+			pr_number INTEGER NOT NULL,
+			pr_url TEXT NOT NULL DEFAULT '',
+			pr_title TEXT NOT NULL DEFAULT '',
+			pr_state TEXT NOT NULL DEFAULT '',
+			base_branch TEXT NOT NULL DEFAULT '',
+			review_id TEXT NOT NULL DEFAULT '',
+			review_status TEXT NOT NULL DEFAULT 'none',
+			fs_task_id TEXT NOT NULL DEFAULT '',
+			fs_task_url TEXT NOT NULL DEFAULT '',
+			synced_at TEXT,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			UNIQUE(task_id, repo, pr_number)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_task_prs_task ON task_prs(task_id)`,
 	}
 	for _, stmt := range statements {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
@@ -362,6 +541,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "review_requests", "head_commit", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "review_requests", "pr_head_commit", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "review_requests", "retry_reason", "TEXT NOT NULL DEFAULT ''"); err != nil {
@@ -909,13 +1091,13 @@ func (s *Store) CreateReview(req ReviewRequest) (ReviewRequest, error) {
 		INSERT INTO review_requests (
 			id, thread_id, status, pr_url, repo, pr_number, title, base_branch,
 			requester_open_id, requester_name, chat_id, message_id, tool, task_id, task_url,
-			session_id, head_commit, retry_reason, result_text, error, created_at, updated_at, completed_at,
+			session_id, head_commit, pr_head_commit, retry_reason, result_text, error, created_at, updated_at, completed_at,
 			archived_at, refreshed_at, task_synced_at
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, req.ID, req.ThreadID, req.Status, req.PRURL, req.Repo, req.PRNumber, req.Title, req.BaseBranch,
 		req.RequesterOpenID, req.RequesterName, req.ChatID, req.MessageID, req.Tool, req.TaskID, req.TaskURL,
-		req.SessionID, req.HeadCommit, req.RetryReason, req.ResultText, req.Error, timeText(req.CreatedAt), timeText(req.UpdatedAt), nullableTimeText(req.CompletedAt),
+		req.SessionID, req.HeadCommit, req.PrHeadCommit, req.RetryReason, req.ResultText, req.Error, timeText(req.CreatedAt), timeText(req.UpdatedAt), nullableTimeText(req.CompletedAt),
 		nullableTimeText(req.ArchivedAt), nullableTimeText(req.RefreshedAt), nullableTimeText(req.TaskSyncedAt)); err != nil {
 		return ReviewRequest{}, err
 	}
@@ -929,7 +1111,7 @@ func (s *Store) GetReview(id string) (ReviewRequest, error) {
 	row := s.db.QueryRow(`
 		SELECT id, thread_id, status, pr_url, repo, pr_number, title, base_branch,
 			requester_open_id, requester_name, chat_id, message_id, tool, task_id, task_url,
-			session_id, head_commit, retry_reason, result_text, error, created_at, updated_at, completed_at,
+			session_id, head_commit, pr_head_commit, retry_reason, result_text, error, created_at, updated_at, completed_at,
 			archived_at, refreshed_at, task_synced_at
 		FROM review_requests
 		WHERE id = ?
@@ -948,13 +1130,38 @@ func (s *Store) GetReviewByPR(repo string, prNumber int) (ReviewRequest, error) 
 	row := s.db.QueryRow(`
 		SELECT id, thread_id, status, pr_url, repo, pr_number, title, base_branch,
 			requester_open_id, requester_name, chat_id, message_id, tool, task_id, task_url,
-			session_id, head_commit, retry_reason, result_text, error, created_at, updated_at, completed_at,
+			session_id, head_commit, pr_head_commit, retry_reason, result_text, error, created_at, updated_at, completed_at,
 			archived_at, refreshed_at, task_synced_at
 		FROM review_requests
 		WHERE repo = ? AND pr_number = ?
 		ORDER BY created_at DESC
 		LIMIT 1
 	`, repo, prNumber)
+	req, err := scanReviewRequest(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ReviewRequest{}, ErrNotFound
+	}
+	if err != nil {
+		return ReviewRequest{}, err
+	}
+	return req, nil
+}
+
+// GetLatestReviewByThread returns the most recent non-archived review whose
+// thread is rooted at rootMessageID in chatID. It backs the "reply in a review
+// thread" retry trigger.
+func (s *Store) GetLatestReviewByThread(chatID, rootMessageID string) (ReviewRequest, error) {
+	row := s.db.QueryRow(`
+		SELECT r.id, r.thread_id, r.status, r.pr_url, r.repo, r.pr_number, r.title, r.base_branch,
+			r.requester_open_id, r.requester_name, r.chat_id, r.message_id, r.tool, r.task_id, r.task_url,
+			r.session_id, r.head_commit, r.pr_head_commit, r.retry_reason, r.result_text, r.error, r.created_at, r.updated_at, r.completed_at,
+			r.archived_at, r.refreshed_at, r.task_synced_at
+		FROM review_requests r
+		JOIN review_threads t ON t.id = r.thread_id
+		WHERE t.chat_id = ? AND t.root_message_id = ? AND r.status != 'archived'
+		ORDER BY r.created_at DESC
+		LIMIT 1
+	`, chatID, rootMessageID)
 	req, err := scanReviewRequest(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ReviewRequest{}, ErrNotFound
@@ -973,7 +1180,7 @@ func (s *Store) ListReviews(status string, includeArchived bool) []ReviewRequest
 	query := `
 		SELECT id, thread_id, status, pr_url, repo, pr_number, title, base_branch,
 			requester_open_id, requester_name, chat_id, message_id, tool, task_id, task_url,
-			session_id, head_commit, retry_reason, result_text, error, created_at, updated_at, completed_at,
+			session_id, head_commit, pr_head_commit, retry_reason, result_text, error, created_at, updated_at, completed_at,
 			archived_at, refreshed_at, task_synced_at
 		FROM review_requests
 	`
@@ -1019,12 +1226,12 @@ func (s *Store) UpdateReview(req ReviewRequest) (ReviewRequest, error) {
 		UPDATE review_requests
 		SET status = ?, pr_url = ?, repo = ?, pr_number = ?, title = ?, base_branch = ?,
 			requester_open_id = ?, requester_name = ?, chat_id = ?, message_id = ?, tool = ?,
-			task_id = ?, task_url = ?, session_id = ?, head_commit = ?, retry_reason = ?, result_text = ?, error = ?, updated_at = ?, completed_at = ?,
+			task_id = ?, task_url = ?, session_id = ?, head_commit = ?, pr_head_commit = ?, retry_reason = ?, result_text = ?, error = ?, updated_at = ?, completed_at = ?,
 			archived_at = ?, refreshed_at = ?, task_synced_at = ?
 		WHERE id = ?
 	`, req.Status, req.PRURL, req.Repo, req.PRNumber, req.Title, req.BaseBranch,
 		req.RequesterOpenID, req.RequesterName, req.ChatID, req.MessageID, req.Tool,
-		req.TaskID, req.TaskURL, req.SessionID, req.HeadCommit, req.RetryReason, req.ResultText, req.Error, timeText(req.UpdatedAt), nullableTimeText(req.CompletedAt),
+		req.TaskID, req.TaskURL, req.SessionID, req.HeadCommit, req.PrHeadCommit, req.RetryReason, req.ResultText, req.Error, timeText(req.UpdatedAt), nullableTimeText(req.CompletedAt),
 		nullableTimeText(req.ArchivedAt), nullableTimeText(req.RefreshedAt), nullableTimeText(req.TaskSyncedAt),
 		req.ID); err != nil {
 		return ReviewRequest{}, err
@@ -1305,6 +1512,283 @@ func (s *Store) FailInterruptedReactions() ([]string, error) {
 	return ids, nil
 }
 
+const (
+	// TaskStatusOpen is a task bound to an open issue/effort.
+	TaskStatusOpen = "open"
+	// TaskStatusInProgress marks a task actively being worked on.
+	TaskStatusInProgress = "in_progress"
+	// TaskStatusDone marks a task whose issue is closed / PRs merged.
+	TaskStatusDone = "done"
+	// TaskStatusArchived hides a closed task from default listings.
+	TaskStatusArchived = "archived"
+)
+
+func (s *Store) CreateTask(task Task) (Task, error) {
+	ctx := context.Background()
+	if task.ID == "" {
+		task.ID = "tsk_" + newID()
+	}
+	if task.Status == "" {
+		task.Status = TaskStatusOpen
+	}
+	if task.CreatedAt.IsZero() {
+		task.CreatedAt = time.Now().UTC()
+	}
+	task.UpdatedAt = task.CreatedAt
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Task{}, err
+	}
+	defer rollback(tx)
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO tasks (id, title, status, issue_repo, issue_number, issue_title, issue_state, issue_url,
+			description, archived_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, task.ID, task.Title, task.Status, task.IssueRepo, task.IssueNumber, task.IssueTitle, task.IssueState,
+		task.IssueURL, task.Description, nullableTimeText(task.ArchivedAt), timeText(task.CreatedAt), timeText(task.UpdatedAt)); err != nil {
+		return Task{}, err
+	}
+	if err := audit(ctx, tx, "system", "task.create", task.ID, mustJSON(task)); err != nil {
+		return Task{}, err
+	}
+	return task, tx.Commit()
+}
+
+func (s *Store) GetTask(id string) (Task, error) {
+	row := s.db.QueryRow(`
+		SELECT id, title, status, issue_repo, issue_number, issue_title, issue_state, issue_url,
+			description, archived_at, created_at, updated_at
+		FROM tasks
+		WHERE id = ?
+	`, id)
+	task, err := scanTask(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Task{}, ErrNotFound
+	}
+	if err != nil {
+		return Task{}, err
+	}
+	return task, nil
+}
+
+// ListTasks returns tasks, newest first. When status is empty every status is
+// returned. Archived tasks are excluded by default (unless includeArchived is
+// true or status is "archived").
+func (s *Store) ListTasks(status string, includeArchived bool) []Task {
+	query := `
+		SELECT id, title, status, issue_repo, issue_number, issue_title, issue_state, issue_url,
+			description, archived_at, created_at, updated_at
+		FROM tasks
+	`
+	var conds []string
+	var args []any
+	if status != "" {
+		conds = append(conds, `status = ?`)
+		args = append(args, status)
+	}
+	if !includeArchived && status != TaskStatusArchived {
+		conds = append(conds, `status != 'archived'`)
+	}
+	if len(conds) > 0 {
+		query += ` WHERE ` + strings.Join(conds, " AND ")
+	}
+	query += ` ORDER BY created_at DESC`
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return []Task{}
+	}
+	defer rows.Close()
+
+	out := []Task{}
+	for rows.Next() {
+		task, err := scanTask(rows)
+		if err == nil {
+			out = append(out, task)
+		}
+	}
+	return out
+}
+
+func (s *Store) UpdateTask(task Task) (Task, error) {
+	ctx := context.Background()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Task{}, err
+	}
+	defer rollback(tx)
+	task.UpdatedAt = time.Now().UTC()
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE tasks
+		SET title = ?, status = ?, issue_repo = ?, issue_number = ?, issue_title = ?, issue_state = ?,
+			issue_url = ?, description = ?, archived_at = ?, updated_at = ?
+		WHERE id = ?
+	`, task.Title, task.Status, task.IssueRepo, task.IssueNumber, task.IssueTitle, task.IssueState,
+		task.IssueURL, task.Description, nullableTimeText(task.ArchivedAt), timeText(task.UpdatedAt), task.ID); err != nil {
+		return Task{}, err
+	}
+	if err := audit(ctx, tx, "system", "task.update", task.ID, mustJSON(task)); err != nil {
+		return Task{}, err
+	}
+	return task, tx.Commit()
+}
+
+// CloseTask archives a task: sets status archived and records archived_at.
+func (s *Store) CloseTask(id string) (Task, error) {
+	task, err := s.GetTask(id)
+	if err != nil {
+		return Task{}, err
+	}
+	if task.Status == TaskStatusArchived {
+		return task, nil
+	}
+	task.Status = TaskStatusArchived
+	task.ArchivedAt = time.Now().UTC()
+	return s.UpdateTask(task)
+}
+
+func (s *Store) AddTaskDoc(doc TaskDoc) (TaskDoc, error) {
+	ctx := context.Background()
+	if _, err := s.GetTask(doc.TaskID); err != nil {
+		return TaskDoc{}, err
+	}
+	if doc.ID == "" {
+		doc.ID = "tdc_" + newID()
+	}
+	if doc.CreatedAt.IsZero() {
+		doc.CreatedAt = time.Now().UTC()
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO task_docs (id, task_id, repo, path, title, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(task_id, repo, path) DO UPDATE SET title = excluded.title
+	`, doc.ID, doc.TaskID, doc.Repo, doc.Path, doc.Title, timeText(doc.CreatedAt))
+	if err != nil {
+		return TaskDoc{}, err
+	}
+	return doc, nil
+}
+
+func (s *Store) ListTaskDocs(taskID string) []TaskDoc {
+	rows, err := s.db.Query(`
+		SELECT id, task_id, repo, path, title, created_at
+		FROM task_docs
+		WHERE task_id = ?
+		ORDER BY created_at ASC
+	`, taskID)
+	if err != nil {
+		return []TaskDoc{}
+	}
+	defer rows.Close()
+
+	out := []TaskDoc{}
+	for rows.Next() {
+		doc, err := scanTaskDoc(rows)
+		if err == nil {
+			out = append(out, doc)
+		}
+	}
+	return out
+}
+
+func (s *Store) RemoveTaskDoc(id string) error {
+	_, err := s.db.Exec(`DELETE FROM task_docs WHERE id = ?`, id)
+	return err
+}
+
+// AddTaskPR inserts or upserts a linked PR (deduped by task_id+repo+pr_number).
+// On conflict the PR fields and review snapshot are refreshed.
+func (s *Store) AddTaskPR(pr TaskPR) (TaskPR, error) {
+	ctx := context.Background()
+	if _, err := s.GetTask(pr.TaskID); err != nil {
+		return TaskPR{}, err
+	}
+	if pr.ID == "" {
+		pr.ID = "tpr_" + newID()
+	}
+	if pr.ReviewStatus == "" {
+		pr.ReviewStatus = "none"
+	}
+	if pr.CreatedAt.IsZero() {
+		pr.CreatedAt = time.Now().UTC()
+	}
+	pr.UpdatedAt = time.Now().UTC()
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO task_prs (id, task_id, repo, pr_number, pr_url, pr_title, pr_state, base_branch,
+			review_id, review_status, fs_task_id, fs_task_url, synced_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(task_id, repo, pr_number) DO UPDATE SET
+			pr_url = excluded.pr_url, pr_title = excluded.pr_title, pr_state = excluded.pr_state,
+			base_branch = excluded.base_branch, review_id = excluded.review_id,
+			review_status = excluded.review_status,
+			fs_task_id = COALESCE(NULLIF(excluded.fs_task_id, ''), fs_task_id),
+			fs_task_url = COALESCE(NULLIF(excluded.fs_task_url, ''), fs_task_url),
+			synced_at = COALESCE(excluded.synced_at, synced_at), updated_at = excluded.updated_at
+	`, pr.ID, pr.TaskID, pr.Repo, pr.PRNumber, pr.PRURL, pr.PRTitle, pr.PRState, pr.BaseBranch,
+		pr.ReviewID, pr.ReviewStatus, pr.FsTaskID, pr.FsTaskURL, nullableTimeText(pr.SyncedAt), timeText(pr.CreatedAt), timeText(pr.UpdatedAt))
+	if err != nil {
+		return TaskPR{}, err
+	}
+	return pr, nil
+}
+
+func (s *Store) GetTaskPR(id string) (TaskPR, error) {
+	row := s.db.QueryRow(`
+		SELECT id, task_id, repo, pr_number, pr_url, pr_title, pr_state, base_branch,
+			review_id, review_status, fs_task_id, fs_task_url, synced_at, created_at, updated_at
+		FROM task_prs
+		WHERE id = ?
+	`, id)
+	pr, err := scanTaskPR(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return TaskPR{}, ErrNotFound
+	}
+	if err != nil {
+		return TaskPR{}, err
+	}
+	return pr, nil
+}
+
+func (s *Store) ListTaskPRs(taskID string) []TaskPR {
+	rows, err := s.db.Query(`
+		SELECT id, task_id, repo, pr_number, pr_url, pr_title, pr_state, base_branch,
+			review_id, review_status, fs_task_id, fs_task_url, synced_at, created_at, updated_at
+		FROM task_prs
+		WHERE task_id = ?
+		ORDER BY created_at ASC
+	`, taskID)
+	if err != nil {
+		return []TaskPR{}
+	}
+	defer rows.Close()
+
+	out := []TaskPR{}
+	for rows.Next() {
+		pr, err := scanTaskPR(rows)
+		if err == nil {
+			out = append(out, pr)
+		}
+	}
+	return out
+}
+
+func (s *Store) UpdateTaskPR(pr TaskPR) (TaskPR, error) {
+	ctx := context.Background()
+	pr.UpdatedAt = time.Now().UTC()
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE task_prs
+		SET pr_url = ?, pr_title = ?, pr_state = ?, base_branch = ?, review_id = ?,
+			review_status = ?, fs_task_id = ?, fs_task_url = ?, synced_at = ?, updated_at = ?
+		WHERE id = ?
+	`, pr.PRURL, pr.PRTitle, pr.PRState, pr.BaseBranch, pr.ReviewID,
+		pr.ReviewStatus, pr.FsTaskID, pr.FsTaskURL, nullableTimeText(pr.SyncedAt), timeText(pr.UpdatedAt), pr.ID)
+	return pr, err
+}
+
+func (s *Store) RemoveTaskPR(id string) error {
+	_, err := s.db.Exec(`DELETE FROM task_prs WHERE id = ?`, id)
+	return err
+}
+
 type sessionScanner interface {
 	Scan(dest ...any) error
 }
@@ -1330,6 +1814,18 @@ type reviewRunScanner interface {
 }
 
 type reviewReactionScanner interface {
+	Scan(dest ...any) error
+}
+
+type taskScanner interface {
+	Scan(dest ...any) error
+}
+
+type taskDocScanner interface {
+	Scan(dest ...any) error
+}
+
+type taskPRScanner interface {
 	Scan(dest ...any) error
 }
 
@@ -1437,7 +1933,7 @@ func getReviewTx(ctx context.Context, tx *sql.Tx, id string) (ReviewRequest, err
 	row := tx.QueryRowContext(ctx, `
 		SELECT id, thread_id, status, pr_url, repo, pr_number, title, base_branch,
 			requester_open_id, requester_name, chat_id, message_id, tool, task_id, task_url,
-			session_id, head_commit, retry_reason, result_text, error, created_at, updated_at, completed_at,
+			session_id, head_commit, pr_head_commit, retry_reason, result_text, error, created_at, updated_at, completed_at,
 			archived_at, refreshed_at, task_synced_at
 		FROM review_requests
 		WHERE id = ?
@@ -1470,7 +1966,7 @@ func scanReviewRequest(row reviewRequestScanner) (ReviewRequest, error) {
 	if err := row.Scan(
 		&req.ID, &req.ThreadID, &req.Status, &req.PRURL, &req.Repo, &req.PRNumber, &req.Title, &req.BaseBranch,
 		&req.RequesterOpenID, &req.RequesterName, &req.ChatID, &req.MessageID, &req.Tool, &req.TaskID, &req.TaskURL,
-		&req.SessionID, &req.HeadCommit, &req.RetryReason, &req.ResultText, &req.Error, &createdAt, &updatedAt, &completedAt,
+		&req.SessionID, &req.HeadCommit, &req.PrHeadCommit, &req.RetryReason, &req.ResultText, &req.Error, &createdAt, &updatedAt, &completedAt,
 		&archivedAt, &refreshedAt, &taskSyncedAt,
 	); err != nil {
 		return ReviewRequest{}, err
@@ -1519,6 +2015,50 @@ func scanReviewReaction(row reviewReactionScanner) (ReviewReaction, error) {
 	return reac, nil
 }
 
+func scanTask(row taskScanner) (Task, error) {
+	var task Task
+	var archivedAt sql.NullString
+	var createdAt string
+	var updatedAt string
+	if err := row.Scan(
+		&task.ID, &task.Title, &task.Status, &task.IssueRepo, &task.IssueNumber, &task.IssueTitle,
+		&task.IssueState, &task.IssueURL, &task.Description, &archivedAt, &createdAt, &updatedAt,
+	); err != nil {
+		return Task{}, err
+	}
+	task.ArchivedAt, _ = parseNullTime(archivedAt)
+	task.CreatedAt, _ = parseTime(createdAt)
+	task.UpdatedAt, _ = parseTime(updatedAt)
+	return task, nil
+}
+
+func scanTaskDoc(row taskDocScanner) (TaskDoc, error) {
+	var doc TaskDoc
+	var createdAt string
+	if err := row.Scan(&doc.ID, &doc.TaskID, &doc.Repo, &doc.Path, &doc.Title, &createdAt); err != nil {
+		return TaskDoc{}, err
+	}
+	doc.CreatedAt, _ = parseTime(createdAt)
+	return doc, nil
+}
+
+func scanTaskPR(row taskPRScanner) (TaskPR, error) {
+	var pr TaskPR
+	var syncedAt sql.NullString
+	var createdAt string
+	var updatedAt string
+	if err := row.Scan(
+		&pr.ID, &pr.TaskID, &pr.Repo, &pr.PRNumber, &pr.PRURL, &pr.PRTitle, &pr.PRState, &pr.BaseBranch,
+		&pr.ReviewID, &pr.ReviewStatus, &pr.FsTaskID, &pr.FsTaskURL, &syncedAt, &createdAt, &updatedAt,
+	); err != nil {
+		return TaskPR{}, err
+	}
+	pr.SyncedAt, _ = parseNullTime(syncedAt)
+	pr.CreatedAt, _ = parseTime(createdAt)
+	pr.UpdatedAt, _ = parseTime(updatedAt)
+	return pr, nil
+}
+
 func mergeParticipants(existing, extra []string) []string {
 	seen := map[string]bool{}
 	var out []string
@@ -1539,6 +2079,62 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// GetChatMode returns the behavior mode for a chat. Chats without an explicit
+// setting default to ChatModeReview.
+func (s *Store) GetChatMode(chatID string) string {
+	if chatID == "" {
+		return ChatModeReview
+	}
+	row := s.db.QueryRow(`SELECT mode FROM chat_modes WHERE chat_id = ?`, chatID)
+	var mode string
+	if err := row.Scan(&mode); err != nil || mode == "" {
+		return ChatModeReview
+	}
+	if normalized, err := NormalizeChatMode(mode); err == nil {
+		return normalized
+	}
+	return mode
+}
+
+// SetChatMode upserts the behavior mode for a chat and returns the stored row.
+// The mode string is normalized to its canonical flag-set form.
+func (s *Store) SetChatMode(chatID, mode string) (ChatMode, error) {
+	normalized, err := NormalizeChatMode(mode)
+	if err != nil {
+		return ChatMode{}, err
+	}
+	now := time.Now().UTC()
+	if _, err := s.db.Exec(`
+		INSERT INTO chat_modes (chat_id, mode, updated_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(chat_id) DO UPDATE SET mode = excluded.mode, updated_at = excluded.updated_at
+	`, chatID, normalized, timeText(now)); err != nil {
+		return ChatMode{}, err
+	}
+	return ChatMode{ChatID: chatID, Mode: normalized, UpdatedAt: now}, nil
+}
+
+// ListChatModes returns every chat with an explicit mode, most recently
+// updated first.
+func (s *Store) ListChatModes() []ChatMode {
+	rows, err := s.db.Query(`SELECT chat_id, mode, updated_at FROM chat_modes ORDER BY updated_at DESC`)
+	if err != nil {
+		return []ChatMode{}
+	}
+	defer rows.Close()
+	var out []ChatMode
+	for rows.Next() {
+		var raw string
+		var mode ChatMode
+		if err := rows.Scan(&mode.ChatID, &mode.Mode, &raw); err != nil {
+			continue
+		}
+		mode.UpdatedAt, _ = parseTime(raw)
+		out = append(out, mode)
+	}
+	return out
 }
 
 func audit(ctx context.Context, tx *sql.Tx, actor, action, target string, payload json.RawMessage) error {

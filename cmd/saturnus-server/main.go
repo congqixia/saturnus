@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -23,14 +24,17 @@ import (
 	"saturnus/internal/policy"
 	"saturnus/internal/review"
 	"saturnus/internal/store"
+	"saturnus/internal/tasks"
 )
 
 type server struct {
-	store    *store.Store
-	lark     *lark.Client
-	reviews  *review.Service
-	cloudops *cloudops.Client
-	botUsers []string
+	store     *store.Store
+	lark      *lark.Client
+	reviews   *review.Service
+	tasks     *tasks.Service
+	cloudops  *cloudops.Client
+	botUsers  []string
+	botOpenID string
 }
 
 const shutdownTimeout = 15 * time.Second
@@ -68,11 +72,13 @@ func run(ctx context.Context, addr, data, staticDir string) (err error) {
 		return err
 	}
 	s := &server{
-		store:    st,
-		lark:     larkClient,
-		reviews:  review.New(st, larkClient, reviewConfig()),
-		cloudops: cloudopsClient,
-		botUsers: splitCSV(os.Getenv("SATURNUS_COMMAND_ALLOWED_USERS")),
+		store:     st,
+		lark:      larkClient,
+		reviews:   review.New(st, larkClient, reviewConfig()),
+		tasks:     tasks.New(st, tasksConfig()),
+		cloudops:  cloudopsClient,
+		botUsers:  splitCSV(os.Getenv("SATURNUS_COMMAND_ALLOWED_USERS")),
+		botOpenID: resolveBotOpenID(larkClient),
 	}
 	s.reviews.Start()
 	defer s.reviews.Stop()
@@ -92,6 +98,15 @@ func run(ctx context.Context, addr, data, staticDir string) (err error) {
 	mux.HandleFunc("GET /api/reviews", s.listReviews)
 	mux.HandleFunc("GET /api/reviews/{review_id}", s.getReview)
 	mux.HandleFunc("POST /api/reviews", s.createReview)
+	mux.HandleFunc("GET /api/tasks", s.listTasks)
+	mux.HandleFunc("GET /api/tasks/{task_id}", s.getTask)
+	mux.HandleFunc("POST /api/tasks", s.createTask)
+	mux.HandleFunc("POST /api/tasks/{task_id}/docs", s.addTaskDoc)
+	mux.HandleFunc("DELETE /api/tasks/{task_id}/docs/{doc_id}", s.removeTaskDoc)
+	mux.HandleFunc("POST /api/tasks/{task_id}/prs", s.addTaskPR)
+	mux.HandleFunc("DELETE /api/tasks/{task_id}/prs/{pr_id}", s.removeTaskPR)
+	mux.HandleFunc("POST /api/tasks/{task_id}/refresh", s.refreshTask)
+	mux.HandleFunc("PATCH /api/tasks/{task_id}", s.updateTask)
 	mux.HandleFunc("POST /lark/events", s.larkEvents)
 	mux.Handle("/", spaFileServer(staticDir))
 
@@ -364,6 +379,147 @@ func (s *server) createReview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]any{"review": created})
 }
 
+func (s *server) listTasks(w http.ResponseWriter, r *http.Request) {
+	includeArchived := r.URL.Query().Get("archived") == "1" || r.URL.Query().Get("archived") == "true"
+	writeJSON(w, http.StatusOK, map[string]any{"tasks": s.tasks.List(r.URL.Query().Get("status"), includeArchived)})
+}
+
+func (s *server) getTask(w http.ResponseWriter, r *http.Request) {
+	task, err := s.tasks.Get(r.PathValue("task_id"))
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"task": task,
+		"docs": s.tasks.Docs(task.ID),
+		"prs":  s.tasks.PRs(task.ID),
+	})
+}
+
+func (s *server) createTask(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		IssueURL string `json:"issue_url"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.IssueURL == "" {
+		writeError(w, http.StatusBadRequest, errors.New("issue_url is required"))
+		return
+	}
+	task, err := s.tasks.Create(req.IssueURL)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"task": task})
+}
+
+func (s *server) updateTask(w http.ResponseWriter, r *http.Request) {
+	task, err := s.tasks.Get(r.PathValue("task_id"))
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	var req struct {
+		Title       *string `json:"title"`
+		Status      *string `json:"status"`
+		Description *string `json:"description"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Title != nil {
+		task.Title = *req.Title
+	}
+	if req.Status != nil {
+		if *req.Status == store.TaskStatusArchived {
+			updated, err := s.tasks.Close(task.ID)
+			if err != nil {
+				writeStoreError(w, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"task": updated})
+			return
+		}
+		task.Status = *req.Status
+	}
+	if req.Description != nil {
+		task.Description = *req.Description
+	}
+	updated, err := s.store.UpdateTask(task)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"task": updated})
+}
+
+func (s *server) addTaskDoc(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Repo string `json:"repo"`
+		Path string `json:"path"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Repo == "" || req.Path == "" {
+		writeError(w, http.StatusBadRequest, errors.New("repo and path are required"))
+		return
+	}
+	doc, err := s.tasks.AddDoc(r.PathValue("task_id"), tasks.FormatRepoPath(req.Repo, req.Path))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"doc": doc})
+}
+
+func (s *server) removeTaskDoc(w http.ResponseWriter, r *http.Request) {
+	if err := s.tasks.RemoveDoc(r.PathValue("doc_id")); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *server) addTaskPR(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		PRURL string `json:"pr_url"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.PRURL == "" {
+		writeError(w, http.StatusBadRequest, errors.New("pr_url is required"))
+		return
+	}
+	pr, err := s.tasks.AddPR(r.PathValue("task_id"), req.PRURL)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"pr": pr})
+}
+
+func (s *server) removeTaskPR(w http.ResponseWriter, r *http.Request) {
+	if err := s.tasks.RemovePR(r.PathValue("pr_id")); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *server) refreshTask(w http.ResponseWriter, r *http.Request) {
+	task, prs, suggestion, err := s.tasks.Refresh(r.PathValue("task_id"))
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"task": task, "prs": prs, "suggestion": suggestion})
+}
+
 func (s *server) larkEvents(w http.ResponseWriter, r *http.Request) {
 	var payload map[string]any
 	if !decodeJSON(w, r, &payload) {
@@ -374,8 +530,16 @@ func (s *server) larkEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	msg := extractLarkMessage(payload)
+	if !s.shouldRespond(msg) {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+	}
 	command := satCommand(msg.Text)
 	if command == "" {
+		if s.handleReviewThreadReply(msg) {
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+			return
+		}
 		if reply := s.maybeReview(msg); reply != "" {
 			_ = s.lark.SendText("chat_id", msg.ChatID, reply)
 		} else if !s.botAllowed(msg.SenderOpenID) {
@@ -409,6 +573,127 @@ func (s *server) botAllowed(openID string) bool {
 	return false
 }
 
+// shouldRespond reports whether a received Lark message should be handled.
+// Direct (p2p) messages are always handled. In a group the behavior depends on
+// the chat's mode flags (default review):
+//
+//   - review: respond only when the bot is mentioned directly by its own
+//     open_id; "@all" mentions (id "all") and mentions of other users do not
+//     count.
+//   - report: the chat is a quiet report channel — all incoming messages are
+//     ignored.
+//   - report|review: quiet except that review requests are still acted on.
+func (s *server) shouldRespond(msg review.MessageContext) bool {
+	if msg.ChatType != "group" {
+		return true
+	}
+	flags := store.ChatModeFlags(s.store.GetChatMode(msg.ChatID))
+	if flags[store.ChatModeReport] {
+		return flags[store.ChatModeReview] && isReviewRequest(msg.Text) && s.botMentioned(msg)
+	}
+	return s.botMentioned(msg)
+}
+
+// botMentioned reports whether the message directly mentions the bot by its
+// own open_id.
+func (s *server) botMentioned(msg review.MessageContext) bool {
+	if s.botOpenID == "" {
+		log.Printf("lark: group message received but bot open_id is unknown; ignoring (set SATURNUS_LARK_BOT_OPEN_ID)")
+		return false
+	}
+	for _, id := range msg.Mentions {
+		if id == s.botOpenID {
+			return true
+		}
+	}
+	return false
+}
+
+// isReviewRequest reports whether a group message asks for review work: it
+// contains a GitHub PR URL, or is a /sat command from the review lifecycle.
+func isReviewRequest(text string) bool {
+	if _, err := review.FindPRRequest(text); err == nil {
+		return true
+	}
+	fields := strings.Fields(strings.TrimSpace(text))
+	if len(fields) >= 2 && fields[0] == "/sat" {
+		switch fields[1] {
+		case "review", "retry", "refresh", "act", "threads", "describe", "reply":
+			return true
+		}
+	}
+	return false
+}
+
+// attributedRequester returns the open_id of the first @mentioned user other
+// than the bot (and other than the "@all" pseudo-mention). This lets an
+// admin attribute a review's requester to a specific user, e.g.
+// "/sat review <pr-url> @user". Empty when only the bot (or nobody) was
+// mentioned.
+func (s *server) attributedRequester(msg review.MessageContext) string {
+	openID, _ := s.mentionedUser(msg)
+	return openID
+}
+
+// mentionedUser returns the open_id and display name of the first @mentioned
+// user other than the bot (and other than "@all").
+func (s *server) mentionedUser(msg review.MessageContext) (string, string) {
+	for _, id := range msg.Mentions {
+		if id == "" || id == s.botOpenID || id == "all" {
+			continue
+		}
+		return id, msg.MentionNames[id]
+	}
+	return "", ""
+}
+
+// requesterReply handles /sat requester <review_id> @user|ou_xxx, which
+// reassigns the requester of an existing review.
+func (s *server) requesterReply(fields []string, msg review.MessageContext) botReply {
+	if len(fields) < 3 {
+		return botReply{text: "Usage: /sat requester <review_id> @user or /sat requester <review_id> ou_xxx"}
+	}
+	openID, name := s.mentionedUser(msg)
+	if openID == "" && len(fields) >= 4 && strings.HasPrefix(fields[3], "ou_") {
+		openID, name = fields[3], ""
+	}
+	if openID == "" {
+		return botReply{text: "No user specified: mention a user in the command, or pass an open_id (/sat requester <review_id> ou_xxx)."}
+	}
+	req, err := s.reviews.SetRequester(fields[2], openID, name)
+	if err != nil {
+		if errors.Is(err, review.ErrArchived) {
+			return botReply{text: "Review " + fields[2] + " is archived and cannot be reassigned."}
+		}
+		return botReply{text: "Failed to update requester: " + err.Error()}
+	}
+	return botReply{text: fmt.Sprintf("Review %s requester updated to %s (%s)", req.ID, req.RequesterName, req.RequesterOpenID)}
+}
+
+// resolveBotOpenID determines the bot's own open_id, used to detect direct
+// group mentions. An explicit SATURNUS_LARK_BOT_OPEN_ID wins; otherwise the
+// app bot identity is looked up via bot/v3/info. Failures are logged and the
+// result may be empty, in which case group messages are ignored.
+func resolveBotOpenID(larkClient *lark.Client) string {
+	if value := os.Getenv("SATURNUS_LARK_BOT_OPEN_ID"); value != "" {
+		return value
+	}
+	if !larkClient.Enabled() {
+		return ""
+	}
+	info, err := larkClient.BotInfo()
+	if err != nil {
+		log.Printf("lark: could not resolve bot open_id (set SATURNUS_LARK_BOT_OPEN_ID to override): %v", err)
+		return ""
+	}
+	if info.OpenID == "" {
+		log.Printf("lark: bot info returned no open_id (set SATURNUS_LARK_BOT_OPEN_ID)")
+		return ""
+	}
+	log.Printf("lark: resolved bot open_id=%s (app=%s)", info.OpenID, info.Name)
+	return info.OpenID
+}
+
 func (s *server) reviewUsageExample() string {
 	var b strings.Builder
 	b.WriteString("你好，我可以发起代码评审。直接发送 GitHub PR 链接即可，例如：")
@@ -430,6 +715,10 @@ func (s *server) maybeReview(msg review.MessageContext) string {
 	if _, err := review.FindPRRequest(msg.Text); err != nil {
 		return ""
 	}
+	// Natural-language requests keep the sender as the requester. Any @user in
+	// the message is usually the reviewer being asked to approve, so mentions
+	// must NOT be interpreted as requester here; only the explicit
+	// "/sat review <pr-url> @user" command attributes the requester.
 	req, err := s.reviews.SubmitPublic(msg)
 	if err != nil {
 		if errors.Is(err, review.ErrAlreadyPending) {
@@ -441,6 +730,51 @@ func (s *server) maybeReview(msg review.MessageContext) string {
 		return "Review failed: " + err.Error()
 	}
 	return "Review started " + req.ID + " (" + req.PRURL + ")"
+}
+
+// handleReviewThreadReply implements the "reply in a review thread" trigger: a
+// group message that is a direct bot mention inside a review thread re-checks
+// whether the PR head moved and, when it did, re-runs the review (notifying the
+// requester in-thread and the reviewer). Replies that are /sat commands or
+// contain a PR URL are left to the normal paths. It returns true when the
+// message was consumed by this trigger.
+func (s *server) handleReviewThreadReply(msg review.MessageContext) bool {
+	if !s.reviews.Enabled() || msg.ChatType != "group" {
+		return false
+	}
+	if msg.RootMessageID == "" || msg.RootMessageID == msg.MessageID {
+		return false // not a reply in a thread
+	}
+	if _, err := review.FindPRRequest(msg.Text); err == nil {
+		return false // explicit PR URL is handled by the normal review path
+	}
+	req, retried, err := s.reviews.RetryOnReply(msg)
+	if err != nil {
+		if errors.Is(err, review.ErrArchived) {
+			s.replyInThread(msg, "该 review 已归档，无法重新评审。")
+			return true
+		}
+		return false // no active review in this thread; fall through
+	}
+	if retried {
+		return true // requester and reviewer already notified by the service
+	}
+	if req.Status == "pending" || req.Status == "reviewing" {
+		s.replyInThread(msg, fmt.Sprintf("Review %s 正在运行中，无需重复触发。", req.ID))
+	} else {
+		s.replyInThread(msg, fmt.Sprintf("PR head 未变更，Review %s 已是最新，无需重新评审。", req.ID))
+	}
+	return true
+}
+
+// replyInThread replies to a message in its thread.
+func (s *server) replyInThread(msg review.MessageContext, text string) {
+	if msg.MessageID == "" {
+		return
+	}
+	if err := s.lark.ReplyMessage(msg.MessageID, text); err != nil {
+		log.Printf("reply in thread: %v", err)
+	}
 }
 
 type botReply struct {
@@ -481,21 +815,24 @@ func optionTag(text, color string) map[string]any {
 	return map[string]any{"text": text, "color": color}
 }
 
-func statusOption(status string) any {
-	color := ""
+func statusColor(status string) string {
 	switch status {
 	case "succeeded":
-		color = "green"
+		return "green"
 	case "failed":
-		color = "red"
+		return "red"
 	case "pending":
-		color = "blue"
+		return "blue"
 	case "reviewing":
-		color = "orange"
+		return "orange"
 	case "archived":
-		color = "grey"
+		return "grey"
 	}
-	return optionTag(status, color)
+	return ""
+}
+
+func statusOption(status string) any {
+	return optionTag(status, statusColor(status))
 }
 
 func riskOption(risk string) any {
@@ -705,7 +1042,7 @@ func (s *server) reviewsReply(mode string) botReply {
 	for _, req := range reqs {
 		rows = append(rows, map[string]any{
 			"id":        req.ID,
-			"status":    statusOption(req.Status),
+			"status":    reviewStatusCell(req),
 			"repo":      fmt.Sprintf("%s#%d", req.Repo, req.PRNumber),
 			"requester": requesterDisplayName(req),
 			"createdAt": lark.UnixMillis(req.CreatedAt),
@@ -720,15 +1057,291 @@ func (s *server) reviewsReply(mode string) botReply {
 		table: &lark.TableCard{
 			Title: title,
 			Columns: []lark.TableColumn{
-				{Name: "id", Display: "ID", DataType: lark.ColumnText, Width: "20%"},
-				{Name: "status", Display: "Status", DataType: lark.ColumnOption, Width: "12%"},
-				{Name: "repo", Display: "Repo#PR", DataType: lark.ColumnText, Width: "25%"},
-				{Name: "requester", Display: "Requester", DataType: lark.ColumnText, Width: "26%"},
+				{Name: "id", Display: "ID", DataType: lark.ColumnText, Width: "17%"},
+				{Name: "status", Display: "Status", DataType: lark.ColumnOption, Width: "19%"},
+				{Name: "repo", Display: "Repo#PR", DataType: lark.ColumnText, Width: "24%"},
+				{Name: "requester", Display: "Requester", DataType: lark.ColumnText, Width: "23%"},
 				{Name: "createdAt", Display: "Created", DataType: lark.ColumnDate, DateFormat: "YYYY-MM-DD HH:mm", Width: "17%"},
 			},
 			Rows: rows,
 		},
 	}
+}
+
+// tasksReply renders the task list. mode is "" (default, excludes archived),
+// "all" (includes archived), or "archived" (only archived).
+func (s *server) tasksReply(mode string) botReply {
+	includeArchived := mode == "all" || mode == "archived"
+	tasks := s.tasks.List("", includeArchived)
+	if mode == "archived" {
+		tasks = filterTasks(tasks, store.TaskStatusArchived)
+	}
+	if len(tasks) == 0 {
+		switch mode {
+		case "archived":
+			return botReply{text: "No archived tasks."}
+		case "all":
+			return botReply{text: "No tasks."}
+		default:
+			return botReply{text: "No active tasks."}
+		}
+	}
+	if len(tasks) > 10 {
+		tasks = tasks[:10]
+	}
+	rows := make([]map[string]any, 0, len(tasks))
+	for _, task := range tasks {
+		rows = append(rows, map[string]any{
+			"id":        task.ID,
+			"status":    taskStatusOption(task.Status),
+			"title":     task.Title,
+			"issue":     issueRef(task),
+			"prs":       len(s.tasks.PRs(task.ID)),
+			"createdAt": lark.UnixMillis(task.CreatedAt),
+		})
+	}
+	title := "Tasks"
+	if mode == "archived" {
+		title = "Archived Tasks"
+	}
+	return botReply{
+		text: s.tasks.FormatList(tasks),
+		table: &lark.TableCard{
+			Title: title,
+			Columns: []lark.TableColumn{
+				{Name: "id", Display: "ID", DataType: lark.ColumnText, Width: "18%"},
+				{Name: "status", Display: "Status", DataType: lark.ColumnOption, Width: "14%"},
+				{Name: "title", Display: "Title", DataType: lark.ColumnText, Width: "34%"},
+				{Name: "issue", Display: "Issue", DataType: lark.ColumnText, Width: "16%"},
+				{Name: "prs", Display: "PRs", DataType: lark.ColumnNumber, Width: "8%"},
+				{Name: "createdAt", Display: "Created", DataType: lark.ColumnDate, DateFormat: "YYYY-MM-DD HH:mm", Width: "10%"},
+			},
+			Rows: rows,
+		},
+	}
+}
+
+// filterTasks keeps only tasks whose status equals want.
+func filterTasks(tasks []store.Task, want string) []store.Task {
+	out := make([]store.Task, 0, len(tasks))
+	for _, task := range tasks {
+		if task.Status == want {
+			out = append(out, task)
+		}
+	}
+	return out
+}
+
+func taskStatusColor(status string) string {
+	switch status {
+	case store.TaskStatusOpen:
+		return "blue"
+	case store.TaskStatusInProgress:
+		return "orange"
+	case store.TaskStatusDone:
+		return "green"
+	case store.TaskStatusArchived:
+		return "grey"
+	}
+	return ""
+}
+
+func taskStatusOption(status string) any {
+	return optionTag(status, taskStatusColor(status))
+}
+
+// issueRef renders the bound issue as repo#number, or "-" when none is bound.
+func issueRef(task store.Task) string {
+	if task.IssueRepo == "" {
+		return "-"
+	}
+	return fmt.Sprintf("%s#%d", task.IssueRepo, task.IssueNumber)
+}
+
+// taskCommand dispatches the /sat task subcommands.
+func (s *server) taskCommand(fields []string, text string) botReply {
+	if len(fields) < 3 {
+		return botReply{text: "Usage: /sat task <task_id> or /sat task <create|add-doc|rm-doc|add-pr|rm-pr|refresh|close> ..."}
+	}
+	sub := fields[2]
+	switch sub {
+	case "create":
+		if len(fields) < 4 {
+			return botReply{text: "Usage: /sat task create <issue-url>"}
+		}
+		issueURL := strings.TrimSpace(strings.TrimPrefix(text, strings.Join(fields[:3], " ")))
+		if issueURL == "" {
+			return botReply{text: "Usage: /sat task create <issue-url>"}
+		}
+		task, err := s.tasks.Create(issueURL)
+		if err != nil {
+			return botReply{text: "Task create failed: " + err.Error()}
+		}
+		return botReply{text: "Task created " + task.ID + " (" + task.Title + ")"}
+	case "add-doc":
+		if len(fields) < 5 {
+			return botReply{text: "Usage: /sat task add-doc <task_id> <owner/repo:path>"}
+		}
+		doc, err := s.tasks.AddDoc(fields[3], fields[4])
+		if err != nil {
+			return botReply{text: "Add doc failed: " + err.Error()}
+		}
+		return botReply{text: "Doc added " + doc.ID + " (" + tasks.FormatRepoPath(doc.Repo, doc.Path) + ")"}
+	case "rm-doc":
+		if len(fields) < 4 {
+			return botReply{text: "Usage: /sat task rm-doc <task_id> <doc_id>"}
+		}
+		if err := s.tasks.RemoveDoc(fields[3]); err != nil {
+			return botReply{text: "Remove doc failed: " + err.Error()}
+		}
+		return botReply{text: "Doc removed " + fields[3]}
+	case "add-pr":
+		if len(fields) < 5 {
+			return botReply{text: "Usage: /sat task add-pr <task_id> <pr-url>"}
+		}
+		pr, err := s.tasks.AddPR(fields[3], fields[4])
+		if err != nil {
+			return botReply{text: "Add PR failed: " + err.Error()}
+		}
+		return botReply{text: "PR added " + pr.ID + " (" + pr.PRURL + ") review=" + pr.ReviewStatus}
+	case "rm-pr":
+		if len(fields) < 4 {
+			return botReply{text: "Usage: /sat task rm-pr <task_id> <pr_id>"}
+		}
+		if err := s.tasks.RemovePR(fields[3]); err != nil {
+			return botReply{text: "Remove PR failed: " + err.Error()}
+		}
+		return botReply{text: "PR removed " + fields[3]}
+	case "refresh":
+		if len(fields) < 4 {
+			return botReply{text: "Usage: /sat task refresh <task_id|all>"}
+		}
+		return s.taskRefreshReply(fields[3])
+	case "close":
+		if len(fields) < 4 {
+			return botReply{text: "Usage: /sat task close <task_id>"}
+		}
+		task, err := s.tasks.Close(fields[3])
+		if err != nil {
+			return botReply{text: "Close failed: " + err.Error()}
+		}
+		return botReply{text: "Task closed " + task.ID}
+	default:
+		task, err := s.tasks.Get(sub)
+		if err != nil {
+			return botReply{text: "Task not found. Usage: /sat task <task_id> or /sat task <create|add-doc|rm-doc|add-pr|rm-pr|refresh|close> ..."}
+		}
+		return s.taskDetailReply(task)
+	}
+}
+
+func (s *server) taskDetailReply(task store.Task) botReply {
+	docs := s.tasks.Docs(task.ID)
+	prs := s.tasks.PRs(task.ID)
+	return botReply{text: s.tasks.FormatOne(task, docs, prs)}
+}
+
+// taskRefreshReply refreshes one task (or all non-archived tasks) and reports
+// the resulting snapshots.
+func (s *server) taskRefreshReply(target string) botReply {
+	if target == "all" {
+		refreshed, notes, err := s.tasks.RefreshAll()
+		if err != nil {
+			return botReply{text: "Refresh failed: " + err.Error()}
+		}
+		return botReply{text: s.tasks.FormatRefreshAll(refreshed, notes)}
+	}
+	task, prs, suggestion, err := s.tasks.Refresh(target)
+	if err != nil {
+		return botReply{text: "Refresh failed: " + err.Error()}
+	}
+	return botReply{text: s.tasks.FormatRefreshResult(task, prs, suggestion)}
+}
+
+// reviewStatusCell renders a review's status as a colored tag, appending an
+// OUTDATED marker (keeping the status color) when the last reviewed head is
+// behind the PR's current head.
+func reviewStatusCell(req store.ReviewRequest) any {
+	if review.ReviewOutdated(req) {
+		return optionTag(req.Status+" / OUTDATED", statusColor(req.Status))
+	}
+	return statusOption(req.Status)
+}
+
+// prsReply lists the open pull requests authored by the current gh user in the
+// whitelisted review repos. Each PR's base branch is shown so the merge target
+// is distinguishable at a glance. Repos whose gh lookup fails are reported
+// instead of hiding the results of the others.
+func (s *server) prsReply() botReply {
+	repos := s.reviews.RepoList()
+	if len(repos) == 0 {
+		return botReply{text: "No repos whitelisted. Set SATURNUS_REVIEW_REPOS=owner/repo=/path/to/checkout,..."}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	prs, errs := review.ListOpenPRs(ctx, s.reviews.GHCli(), repos)
+	if len(prs) == 0 {
+		if len(errs) > 0 {
+			var b strings.Builder
+			b.WriteString("Failed to list open PRs (is gh configured?):\n")
+			keys := make([]string, 0, len(errs))
+			for repo := range errs {
+				keys = append(keys, repo)
+			}
+			sort.Strings(keys)
+			for _, repo := range keys {
+				fmt.Fprintf(&b, "%s: %v\n", repo, errs[repo])
+			}
+			return botReply{text: strings.TrimSpace(b.String())}
+		}
+		return botReply{text: "No open PRs authored by the current gh user in the whitelisted repos."}
+	}
+	if len(prs) > 10 {
+		prs = prs[:10]
+	}
+	sort.Slice(prs, func(i, j int) bool {
+		if prs[i].Repo != prs[j].Repo {
+			return prs[i].Repo < prs[j].Repo
+		}
+		return prs[i].Number < prs[j].Number
+	})
+	var b strings.Builder
+	rows := make([]map[string]any, 0, len(prs))
+	for _, pr := range prs {
+		fmt.Fprintf(&b, "%s#%d %s base=%s head=%s updated=%s\n", pr.Repo, pr.Number, pr.Title, pr.BaseBranch, pr.HeadBranch, pr.UpdatedAt)
+		rows = append(rows, map[string]any{
+			"repo":      fmt.Sprintf("%s#%d", pr.Repo, pr.Number),
+			"title":     pr.Title,
+			"base":      pr.BaseBranch,
+			"head":      pr.HeadBranch,
+			"draft":     boolOption(pr.IsDraft),
+			"updatedAt": lark.UnixMillis(parseRFC3339(pr.UpdatedAt)),
+		})
+	}
+	return botReply{
+		text: strings.TrimSpace(b.String()),
+		table: &lark.TableCard{
+			Title: "Open PRs",
+			Columns: []lark.TableColumn{
+				{Name: "repo", Display: "Repo#PR", DataType: lark.ColumnText, Width: "18%"},
+				{Name: "title", Display: "Title", DataType: lark.ColumnText, Width: "32%"},
+				{Name: "base", Display: "Base", DataType: lark.ColumnText, Width: "12%"},
+				{Name: "head", Display: "Head", DataType: lark.ColumnText, Width: "12%"},
+				{Name: "draft", Display: "Draft", DataType: lark.ColumnOption, Width: "10%"},
+				{Name: "updatedAt", Display: "Updated", DataType: lark.ColumnDate, DateFormat: "YYYY-MM-DD HH:mm", Width: "16%"},
+			},
+			Rows: rows,
+		},
+	}
+}
+
+// parseRFC3339 parses a gh timestamp, returning the zero time when unparseable.
+func parseRFC3339(value string) time.Time {
+	t, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
 }
 
 // filterStatus keeps only reviews whose status equals want.
@@ -749,6 +1362,137 @@ func requesterDisplayName(req store.ReviewRequest) string {
 		return req.RequesterName
 	}
 	return req.RequesterOpenID
+}
+
+// groupsReply lists every group chat the bot has joined with its behavior
+// mode (default review unless explicitly set).
+func (s *server) groupsReply() botReply {
+	chats, err := s.lark.ListChats()
+	if err != nil {
+		return botReply{text: "Failed to list groups: " + err.Error()}
+	}
+	modes := make(map[string]string)
+	for _, m := range s.store.ListChatModes() {
+		modes[m.ChatID] = m.Mode
+	}
+	groups := make([]lark.Chat, 0, len(chats))
+	for _, ch := range chats {
+		if ch.IsGroupChat() {
+			groups = append(groups, ch)
+		}
+	}
+	if len(groups) == 0 {
+		return botReply{text: "Bot is not a member of any group chat."}
+	}
+	sort.Slice(groups, func(i, j int) bool {
+		return strings.ToLower(groups[i].Name) < strings.ToLower(groups[j].Name)
+	})
+	var b strings.Builder
+	rows := make([]map[string]any, 0, len(groups))
+	for _, g := range groups {
+		mode := modes[g.ChatID]
+		if mode == "" {
+			mode = store.ChatModeReview
+		}
+		name := g.Name
+		if name == "" {
+			name = "(unnamed)"
+		}
+		fmt.Fprintf(&b, "%s  mode=%s\n%s\n", name, mode, g.ChatID)
+		rows = append(rows, map[string]any{
+			"name":   name,
+			"mode":   mode,
+			"chatID": g.ChatID,
+		})
+	}
+	return botReply{
+		text: strings.TrimSuffix(b.String(), "\n"),
+		table: &lark.TableCard{
+			Title: "Joined Groups",
+			Columns: []lark.TableColumn{
+				{Name: "name", Display: "Group", DataType: lark.ColumnText, Width: "38%"},
+				{Name: "mode", Display: "Mode", DataType: lark.ColumnText, Width: "14%"},
+				{Name: "chatID", Display: "Chat ID", DataType: lark.ColumnText, Width: "48%"},
+			},
+			Rows: rows,
+		},
+	}
+}
+
+// groupReply handles /sat group and /sat group mode. Without an explicit
+// chat_id the current group (msg.ChatID) is used when the command is issued
+// inside a group; otherwise the chat_id must be given explicitly.
+func (s *server) groupReply(fields []string, text string, msg review.MessageContext) botReply {
+	if len(fields) >= 3 && fields[2] == "mode" {
+		return s.groupModeReply(fields, msg)
+	}
+	chatID := ""
+	if len(fields) >= 3 {
+		chatID = fields[2]
+	} else if msg.ChatType == "group" && msg.ChatID != "" {
+		chatID = msg.ChatID
+	}
+	if chatID == "" {
+		return botReply{text: "Usage: /sat group [chat_id] or /sat group mode <flags> [chat_id] (flags: review|report, e.g. report|review)"}
+	}
+	name := chatID
+	if s.lark.Enabled() {
+		ch, err := s.lark.GetChat(chatID)
+		if err != nil {
+			if msg.ChatID != chatID {
+				return botReply{text: "Cannot find chat " + chatID + ": " + err.Error()}
+			}
+		} else {
+			if ch.Name != "" {
+				name = ch.Name
+			}
+			if ch.IsKnownNonGroup() {
+				return botReply{text: fmt.Sprintf("%s is not a group chat (chat_mode=%s).", chatID, ch.ChatMode)}
+			}
+		}
+	}
+	return botReply{text: fmt.Sprintf("%s (%s) mode=%s", name, chatID, s.store.GetChatMode(chatID))}
+}
+
+// groupModeReply handles /sat group mode <flags> [chat_id]. The mode is a
+// `|`-joined flag set (e.g. review, report, report|review). A chat_id passed
+// explicitly (outside the group) is validated against the bot's memberships so
+// typos fail fast.
+func (s *server) groupModeReply(fields []string, msg review.MessageContext) botReply {
+	if len(fields) < 4 {
+		return botReply{text: "Usage: /sat group mode <review|report|report|review> [chat_id]"}
+	}
+	mode, err := store.NormalizeChatMode(fields[3])
+	if err != nil {
+		return botReply{text: "Invalid mode: " + err.Error()}
+	}
+	chatID := ""
+	if len(fields) >= 5 {
+		chatID = fields[4]
+	} else if msg.ChatType == "group" && msg.ChatID != "" {
+		chatID = msg.ChatID
+	}
+	if chatID == "" {
+		return botReply{text: "Not running in a group; provide the group chat_id: /sat group mode <review|report|report|review> <chat_id>"}
+	}
+	if msg.ChatID != chatID && s.lark.Enabled() {
+		ch, err := s.lark.GetChat(chatID)
+		if err != nil {
+			return botReply{text: "Cannot find chat " + chatID + ": " + err.Error()}
+		}
+		if ch.IsKnownNonGroup() {
+			return botReply{text: chatID + " is not a group chat (chat_mode=" + ch.ChatMode + ")."}
+		}
+	}
+	stored, err := s.store.SetChatMode(chatID, mode)
+	if err != nil {
+		return botReply{text: "Failed to set group mode: " + err.Error()}
+	}
+	name := chatID
+	if ch, err := s.lark.GetChat(chatID); err == nil && ch.Name != "" {
+		name = ch.Name
+	}
+	return botReply{text: fmt.Sprintf("Group %s (%s) mode is now %s", name, stored.ChatID, stored.Mode)}
 }
 
 // refreshReply refreshes one review (or all non-archived reviews) against its
@@ -914,7 +1658,11 @@ func markdownTableCell(s string) string {
 //     (falling back to the output tail when the tool omitted the marker).
 func formatReviewMarkdown(req store.ReviewRequest, tool string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "**Status**: `%s`\n", req.Status)
+	status := req.Status
+	if review.ReviewOutdated(req) {
+		status += " (OUTDATED)"
+	}
+	fmt.Fprintf(&b, "**Status**: `%s`\n", status)
 	if req.PRURL != "" {
 		label := fmt.Sprintf("%s#%d", req.Repo, req.PRNumber)
 		fmt.Fprintf(&b, "**PR**: [%s](%s)\n", label, req.PRURL)
@@ -924,6 +1672,9 @@ func formatReviewMarkdown(req store.ReviewRequest, tool string) string {
 	}
 	if req.HeadCommit != "" {
 		fmt.Fprintf(&b, "**Head**: `%s`\n", req.HeadCommit)
+	}
+	if review.ReviewOutdated(req) {
+		fmt.Fprintf(&b, "**PR head**: `%s` (outdated)\n", req.PrHeadCommit)
 	}
 	if req.RetryReason != "" {
 		fmt.Fprintf(&b, "**Retry reason**: %s\n", escapeMarkdown(req.RetryReason))
@@ -1030,16 +1781,31 @@ var satCommandList = []struct {
 	{"/sat autopass on|off <session_id>", "toggle auto-approve for a session"},
 	{"/sat reviews", "list recent PR reviews (archived reviews are hidden)"},
 	{"/sat reviews all|archived", "list PR reviews including archived, or only archived"},
-	{"/sat review <pr-url|review_id>", "start a review, or show one review by id"},
+	{"/sat review <pr-url|review_id> [@user]", "start a review (optionally attribute the requester to @user), or show one review by id"},
 	{"/sat retry <review_id>", "retry a failed review, or re-run after the PR head changed"},
 	{"/sat refresh <review_id|all>", "sync PR/task state: archive merged/closed PRs, complete their task, append reviewer comments to the task"},
 	{"/sat act <review_id> <instruction>", "resume the review session to act on the PR (e.g. inline comments for selected issues, concrete code for an issue)"},
 	{"/sat threads <review_id>", "list all chat threads a review was requested in"},
 	{"/sat describe review <review_id>", "show full details of one review"},
 	{"/sat repos", "show the configured review repos"},
+	{"/sat prs", "list open PRs (authored by the current gh user) in the whitelisted repos, with base branch"},
+	{"/sat groups", "list groups the bot has joined and their modes"},
+	{"/sat group [chat_id]", "show a group's mode (defaults to the current group)"},
+	{"/sat group mode <flags> [chat_id]", "set a group's mode flags (review, report, or report|review); omit chat_id when running inside the group"},
 	{"/sat whoami", "show your open_id"},
 	{"/sat whois <name|email|mobile>", "resolve a user to open_id"},
 	{"/sat reply <review_id> <message>", "reviewer replies to the requester"},
+	{"/sat requester <review_id> @user|ou_xxx", "update a review's requester (mention the user, or pass an open_id)"},
+	{"/sat tasks", "list feature tasks (archived tasks are hidden)"},
+	{"/sat tasks all|archived", "list tasks including archived, or only archived"},
+	{"/sat task <task_id>", "show one task: issue, docs, and per-PR progress"},
+	{"/sat task create <issue-url>", "create a task from a GitHub issue"},
+	{"/sat task add-doc <task_id> <owner/repo:path>", "attach a local design doc to a task"},
+	{"/sat task rm-doc <task_id> <doc_id>", "detach a design doc"},
+	{"/sat task add-pr <task_id> <pr-url>", "attach a PR and snapshot its review/Feishu-task state"},
+	{"/sat task rm-pr <task_id> <pr_id>", "detach a PR"},
+	{"/sat task refresh <task_id|all>", "re-sync issue/PR/review/Feishu-task state"},
+	{"/sat task close <task_id>", "archive a task"},
 }
 
 func helpText() string {
@@ -1161,11 +1927,28 @@ func (s *server) handleBotCommand(text string, msg review.MessageContext) botRep
 			return botReply{text: "Usage: /sat reviews [all|archived]"}
 		}
 		return s.reviewsReply(mode)
+	case "tasks":
+		mode := ""
+		if len(fields) >= 3 {
+			mode = fields[2]
+		}
+		if mode != "" && mode != "all" && mode != "archived" {
+			return botReply{text: "Usage: /sat tasks [all|archived]"}
+		}
+		return s.tasksReply(mode)
+	case "task":
+		return s.taskCommand(fields, text)
 	case "repos":
 		return botReply{text: s.reviews.FormatRepos()}
+	case "prs":
+		return s.prsReply()
+	case "groups":
+		return s.groupsReply()
+	case "group":
+		return s.groupReply(fields, text, msg)
 	case "review":
 		if len(fields) < 3 {
-			return botReply{text: "Usage: /sat review <pr-url> or /sat review <review_id>"}
+			return botReply{text: "Usage: /sat review <pr-url> [@user] or /sat review <review_id>"}
 		}
 		if strings.HasPrefix(fields[2], "rvw_") {
 			req, err := s.reviews.Get(fields[2])
@@ -1174,6 +1957,14 @@ func (s *server) handleBotCommand(text string, msg review.MessageContext) botRep
 			}
 			s.reviews.ResolveRequesterName(&req)
 			return botReply{text: s.reviews.FormatOne(req)}
+		}
+		// Optional requester attribution: a @user mention (the bot itself is
+		// excluded), or a trailing open_id (ou_xxx) for conversations where the
+		// target user cannot be @mentioned (e.g. a p2p chat with the bot).
+		if requester := s.attributedRequester(msg); requester != "" {
+			msg.RequesterOpenID = requester
+		} else if len(fields) >= 4 && strings.HasPrefix(fields[3], "ou_") {
+			msg.RequesterOpenID = fields[3]
 		}
 		msg.Text = text
 		req, err := s.reviews.Submit(msg)
@@ -1242,6 +2033,8 @@ func (s *server) handleBotCommand(text string, msg review.MessageContext) botRep
 			return botReply{text: "Reply failed: " + err.Error()}
 		}
 		return botReply{text: "Replied to requester for " + fields[2]}
+	case "requester":
+		return s.requesterReply(fields, msg)
 	case "cluster-actions":
 		if len(fields) < 3 {
 			return botReply{text: "Usage: /sat cluster-actions <instance_id> [hours]"}
@@ -1275,7 +2068,9 @@ func extractLarkMessage(payload map[string]any) review.MessageContext {
 
 	var msg review.MessageContext
 	msg.ChatID, _ = message["chat_id"].(string)
+	msg.ChatType, _ = message["chat_type"].(string)
 	msg.MessageID, _ = message["message_id"].(string)
+	msg.ReplyTo, _ = message["reply_to"].(string)
 	msg.RootMessageID, _ = message["thread_id"].(string)
 	if msg.RootMessageID == "" {
 		msg.RootMessageID, _ = message["root_id"].(string)
@@ -1285,6 +2080,22 @@ func extractLarkMessage(payload map[string]any) review.MessageContext {
 	}
 	msg.SenderOpenID, _ = senderID["open_id"].(string)
 	msg.SenderName, _ = sender["sender_name"].(string)
+
+	if raw, ok := message["mentions"].([]any); ok {
+		for _, item := range raw {
+			if mention, ok := item.(map[string]any); ok {
+				if id, _ := mention["id"].(string); id != "" {
+					msg.Mentions = append(msg.Mentions, id)
+					if name, _ := mention["name"].(string); name != "" {
+						if msg.MentionNames == nil {
+							msg.MentionNames = map[string]string{}
+						}
+						msg.MentionNames[id] = name
+					}
+				}
+			}
+		}
+	}
 
 	content, _ := message["content"].(string)
 	var parsed struct {
@@ -1313,7 +2124,19 @@ func reviewConfig() review.Config {
 		Timeout:         envDuration("SATURNUS_REVIEW_TIMEOUT", 15*time.Minute),
 		CreateTask:      os.Getenv("SATURNUS_REVIEW_CREATE_TASK") == "1",
 		TaskDueHours:    envInt("SATURNUS_REVIEW_TASK_DUE_HOURS", 24),
+		TaskGroup:       os.Getenv("SATURNUS_REVIEW_TASK_GROUP"),
+		TaskGroupID:     os.Getenv("SATURNUS_REVIEW_TASK_GROUP_ID"),
 		LogDir:          os.Getenv("SATURNUS_REVIEW_LOG_DIR"),
+	}
+}
+
+// tasksConfig loads the Tasks module config. The repo whitelist is shared with
+// the review module (SATURNUS_REVIEW_REPOS).
+func tasksConfig() tasks.Config {
+	return tasks.Config{
+		Enabled: os.Getenv("SATURNUS_TASKS_ENABLED") == "1",
+		GHCli:   os.Getenv("SATURNUS_TASKS_GH_CLI"),
+		Repos:   review.ParseRepoMap(os.Getenv("SATURNUS_REVIEW_REPOS")),
 	}
 }
 

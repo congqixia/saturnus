@@ -77,6 +77,48 @@ export type ReviewRun = {
   updated_at: string
 }
 
+export type Task = {
+  id: string
+  title: string
+  status: string
+  issue_repo: string
+  issue_number: number
+  issue_title: string
+  issue_state: string
+  issue_url: string
+  description: string
+  archived_at?: string
+  created_at: string
+  updated_at: string
+}
+
+export type TaskDoc = {
+  id: string
+  task_id: string
+  repo: string
+  path: string
+  title: string
+  created_at: string
+}
+
+export type TaskPR = {
+  id: string
+  task_id: string
+  repo: string
+  pr_number: number
+  pr_url: string
+  pr_title: string
+  pr_state: string
+  base_branch: string
+  review_id: string
+  review_status: string
+  fs_task_id: string
+  fs_task_url: string
+  synced_at?: string
+  created_at: string
+  updated_at: string
+}
+
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(path, {
     headers: { 'Content-Type': 'application/json', ...(options.headers ?? {}) },

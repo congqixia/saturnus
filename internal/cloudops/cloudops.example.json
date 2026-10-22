@@ -1,0 +1,46 @@
+{
+  "environments": [
+    {
+      "name": "prod-overseas",
+      "base_url": "https://cloud-ops.example.com",
+      "api_key_env": "OPS_API_KEY_PROD",
+      "api_key_default": "",
+      "instance_prefixes": ["in01-"],
+      "page_size": 200,
+      "timeout": "8s"
+    },
+    {
+      "name": "prod-cn",
+      "base_url": "https://cloud-ops.example.cn",
+      "api_key_env": "OPS_API_KEY_CN",
+      "api_key_default": "",
+      "instance_prefixes": ["in01-"],
+      "page_size": 200,
+      "timeout": "8s"
+    }
+  ],
+  "links": {
+    "dolphin": "{base}/resource/scheduler/instance/detail?id={processInstanceId}&projectCode={projectCode}&serviceId=1",
+    "grafana": "{base}/resource/log/request?limit=1000&startTime={startTimeSec}&endTime={endTimeSec}&keywords={requestId}",
+    "ops_log": "{base}/resource/log/request?limit=1000&startTime={startTimeSec}&endTime={endTimeSec}&keywords={requestId}"
+  },
+  "display": {
+    "title": "Cluster Actions",
+    "columns": [
+      { "key": "createTime", "label": "Time", "type": "date", "width": "22%" },
+      { "key": "action", "label": "Action", "type": "text", "width": "20%" },
+      { "key": "change", "label": "Change", "type": "text", "width": "26%" },
+      { "key": "status", "label": "Status", "type": "options", "width": "12%" },
+      { "key": "links", "label": "Links", "type": "markdown", "width": "20%" }
+    ]
+  },
+  "status_labels": {
+    "0": "pending",
+    "1": "running",
+    "2": "success",
+    "3": "failed",
+    "4": "timeout",
+    "5": "cancelled",
+    "7": "done"
+  }
+}

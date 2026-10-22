@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 type PRInfo struct {
@@ -66,4 +67,59 @@ func ResolvePRReviews(ctx context.Context, ghCLI, repo string, num int) []PRRevi
 func IsGitDir(path string) bool {
 	info, err := os.Stat(filepath.Join(path, ".git"))
 	return err == nil && info.IsDir()
+}
+
+// OpenPR is one open pull request as reported by `gh pr list`. The BaseBranch
+// is the PR's merge target, which distinguishes where the change lands; the
+// HeadBranch is the source branch carrying the change.
+type OpenPR struct {
+	// Repo is the repository the PR belongs to (owner/name). It is injected by
+	// ListOpenPRs because gh pr list is scoped to one repo per invocation.
+	Repo       string `json:"-"`
+	Number     int    `json:"number"`
+	Title      string `json:"title"`
+	HeadBranch string `json:"headRefName"`
+	BaseBranch string `json:"baseRefName"`
+	URL        string `json:"url"`
+	IsDraft    bool   `json:"isDraft"`
+	UpdatedAt  string `json:"updatedAt"`
+}
+
+// ListOpenPRs returns the open pull requests authored by the current gh user
+// across the given repos (the review whitelist). One `gh pr list` call is made
+// per repo; a repo whose lookup fails is reported in errs instead of aborting
+// the whole sweep, so one broken repo does not hide the others.
+func ListOpenPRs(ctx context.Context, ghCLI string, repos []string) ([]OpenPR, map[string]error) {
+	errs := map[string]error{}
+	if ghCLI == "" {
+		return nil, errs
+	}
+	var out []OpenPR
+	for _, repo := range repos {
+		repo = strings.TrimSpace(repo)
+		if repo == "" {
+			continue
+		}
+		cmd := exec.CommandContext(ctx, ghCLI, "pr", "list",
+			"--repo", repo,
+			"--author", "@me",
+			"--state", "open",
+			"--json", "number,title,headRefName,baseRefName,isDraft,url,updatedAt",
+		)
+		raw, err := cmd.Output()
+		if err != nil {
+			errs[repo] = err
+			continue
+		}
+		var prs []OpenPR
+		if err := json.Unmarshal(raw, &prs); err != nil {
+			errs[repo] = err
+			continue
+		}
+		for i := range prs {
+			prs[i].Repo = repo
+		}
+		out = append(out, prs...)
+	}
+	return out, errs
 }

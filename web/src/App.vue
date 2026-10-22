@@ -19,7 +19,7 @@ import {
   type DataTableColumns
 } from 'naive-ui'
 import { Check, RefreshCw, X, Zap, ZapOff } from 'lucide-vue-next'
-import { formatTime, pretty, type Approval, type Event, type Review, type Session } from './api'
+import { formatTime, pretty, type Approval, type Event, type Review, type Session, type Task, type TaskPR } from './api'
 import { useControlPlaneStore } from './stores/controlPlane'
 
 const store = useControlPlaneStore()
@@ -178,6 +178,120 @@ function reviewTagType(status: string): 'success' | 'error' | 'warning' | 'defau
   }
 }
 
+function taskTagType(status: string): 'success' | 'error' | 'warning' | 'info' | 'default' {
+  switch (status) {
+    case 'done':
+      return 'success'
+    case 'in_progress':
+      return 'warning'
+    case 'open':
+      return 'info'
+    case 'archived':
+      return 'default'
+    default:
+      return 'default'
+  }
+}
+
+const taskColumns = computed<DataTableColumns<Task>>(() => [
+  {
+    title: 'Task',
+    key: 'id',
+    width: 180
+  },
+  {
+    title: 'Title',
+    key: 'title',
+    render(row) {
+      return row.title
+    }
+  },
+  {
+    title: 'Status',
+    key: 'status',
+    width: 110,
+    render(row) {
+      return h(
+        NTag,
+        { size: 'small', round: true, type: taskTagType(row.status) },
+        { default: () => row.status }
+      )
+    }
+  },
+  {
+    title: 'Issue',
+    key: 'issue',
+    render(row) {
+      return row.issue_repo ? `${row.issue_repo}#${row.issue_number}` : '-'
+    }
+  },
+  {
+    title: 'Updated',
+    key: 'updated_at',
+    width: 168,
+    render(row) {
+      return formatTime(row.updated_at)
+    }
+  }
+])
+
+const taskPrColumns = computed<DataTableColumns<TaskPR>>(() => [
+  {
+    title: 'PR',
+    key: 'pr',
+    render(row) {
+      return `${row.repo}#${row.pr_number}`
+    }
+  },
+  {
+    title: 'State',
+    key: 'pr_state',
+    width: 110,
+    render(row) {
+      return h(
+        NTag,
+        { size: 'small', round: true, type: prStateTagType(row.pr_state) },
+        { default: () => row.pr_state || 'unknown' }
+      )
+    }
+  },
+  {
+    title: 'Review',
+    key: 'review_status',
+    width: 110,
+    render(row) {
+      return h(
+        NTag,
+        { size: 'small', round: true, type: reviewTagType(row.review_status) },
+        { default: () => row.review_status }
+      )
+    }
+  },
+  {
+    title: 'Feishu Task',
+    key: 'fs_task',
+    render(row) {
+      if (!row.fs_task_id) return '-'
+      return row.fs_task_url
+        ? h('a', { href: row.fs_task_url, target: '_blank' }, row.fs_task_id)
+        : row.fs_task_id
+    }
+  }
+])
+
+function prStateTagType(state: string): 'success' | 'error' | 'warning' | 'default' {
+  switch (state) {
+    case 'MERGED':
+      return 'success'
+    case 'CLOSED':
+      return 'error'
+    case 'OPEN':
+      return 'warning'
+    default:
+      return 'default'
+  }
+}
+
 function hButton(
   label: string,
   icon: Component,
@@ -275,6 +389,10 @@ import { h } from 'vue'
                 <strong>{{ store.reviewCount }}</strong>
               </div>
               <div class="metric">
+                <span>Tasks</span>
+                <strong>{{ store.taskCount }}</strong>
+              </div>
+              <div class="metric">
                 <span>Events</span>
                 <strong>{{ store.events.length }}</strong>
               </div>
@@ -337,6 +455,64 @@ import { h } from 'vue'
                   {{ store.selectedReview.error }}
                 </div>
                 <pre v-if="store.selectedReview.result_text" class="review-result">{{ store.selectedReview.result_text }}</pre>
+              </template>
+            </section>
+
+            <section class="panel">
+              <div class="panel-head">
+                <h2>Tasks</h2>
+                <NTag :type="store.taskCount > 0 ? 'info' : 'default'" round>
+                  {{ store.taskCount }}
+                </NTag>
+              </div>
+              <NDataTable
+                v-if="store.tasks.length"
+                :columns="taskColumns"
+                :data="store.tasks"
+                :bordered="false"
+                :single-line="false"
+                :row-key="(row: Task) => row.id"
+                :row-props="(row: Task) => ({ onClick: () => store.selectTask(row.id), style: 'cursor: pointer' })"
+              />
+              <NEmpty v-else class="empty-state" description="No tasks" />
+              <template v-if="store.selectedTask">
+                <NDescriptions bordered :column="2" label-placement="left" size="small" class="review-detail">
+                  <NDescriptionsItem label="Task">
+                    <code>{{ store.selectedTask.id }}</code>
+                  </NDescriptionsItem>
+                  <NDescriptionsItem label="Status">
+                    {{ store.selectedTask.status }}
+                  </NDescriptionsItem>
+                  <NDescriptionsItem label="Issue">
+                    <template v-if="store.selectedTask.issue_url">
+                      <a :href="store.selectedTask.issue_url" target="_blank">
+                        {{ store.selectedTask.issue_repo }}#{{ store.selectedTask.issue_number }}
+                      </a>
+                    </template>
+                    <span v-else>-</span>
+                  </NDescriptionsItem>
+                  <NDescriptionsItem label="Updated">
+                    {{ formatTime(store.selectedTask.updated_at) }}
+                  </NDescriptionsItem>
+                </NDescriptions>
+                <div v-if="store.selectedTaskDocs.length" class="task-docs">
+                  <strong>Design docs</strong>
+                  <ul>
+                    <li v-for="doc in store.selectedTaskDocs" :key="doc.id">
+                      <code>{{ doc.repo }}:{{ doc.path }}</code>
+                    </li>
+                  </ul>
+                </div>
+                <div v-if="store.selectedTaskPrs.length" class="task-prs">
+                  <strong>Linked PRs</strong>
+                  <NDataTable
+                    :columns="taskPrColumns"
+                    :data="store.selectedTaskPrs"
+                    :bordered="false"
+                    :single-line="false"
+                    size="small"
+                  />
+                </div>
               </template>
             </section>
 

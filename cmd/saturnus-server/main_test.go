@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -12,6 +14,7 @@ import (
 	"saturnus/internal/lark"
 	"saturnus/internal/review"
 	"saturnus/internal/store"
+	"saturnus/internal/tasks"
 )
 
 func TestServeUntilShutdown(t *testing.T) {
@@ -100,6 +103,254 @@ func TestBotAllowed(t *testing.T) {
 	}
 }
 
+func TestShouldRespondGroupMentionGating(t *testing.T) {
+	s := &server{botOpenID: "ou_bot"}
+
+	p2p := review.MessageContext{ChatType: "p2p"}
+	if !s.shouldRespond(p2p) {
+		t.Fatal("expected p2p message to be handled")
+	}
+
+	unknown := review.MessageContext{}
+	if !s.shouldRespond(unknown) {
+		t.Fatal("expected message without chat_type to be handled")
+	}
+
+	noMention := review.MessageContext{ChatType: "group", Mentions: nil}
+	if s.shouldRespond(noMention) {
+		t.Fatal("expected group message without bot mention to be ignored")
+	}
+
+	atAll := review.MessageContext{ChatType: "group", Mentions: []string{"all"}}
+	if s.shouldRespond(atAll) {
+		t.Fatal("expected @all to not count as a bot mention")
+	}
+
+	atOther := review.MessageContext{ChatType: "group", Mentions: []string{"ou_other"}}
+	if s.shouldRespond(atOther) {
+		t.Fatal("expected mention of another user to not count")
+	}
+
+	atAllAndBot := review.MessageContext{ChatType: "group", Mentions: []string{"all", "ou_bot"}}
+	if !s.shouldRespond(atAllAndBot) {
+		t.Fatal("expected direct bot mention to count even alongside @all")
+	}
+
+	atBot := review.MessageContext{ChatType: "group", Mentions: []string{"ou_bot"}}
+	if !s.shouldRespond(atBot) {
+		t.Fatal("expected direct bot mention to trigger handling")
+	}
+}
+
+func TestShouldRespondIgnoresGroupWhenBotUnknown(t *testing.T) {
+	s := &server{} // botOpenID empty
+	group := review.MessageContext{ChatType: "group", Mentions: []string{"ou_anyone"}}
+	if s.shouldRespond(group) {
+		t.Fatal("expected group message to be ignored when bot open_id is unknown")
+	}
+	if !s.shouldRespond(review.MessageContext{ChatType: "p2p"}) {
+		t.Fatal("expected p2p to still be handled when bot open_id is unknown")
+	}
+}
+
+func TestShouldRespondReportModeSilencesGroup(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	s := &server{store: st, botOpenID: "ou_bot"}
+
+	atBot := review.MessageContext{ChatType: "group", ChatID: "oc_report", Mentions: []string{"ou_bot"}}
+	if !s.shouldRespond(atBot) {
+		t.Fatal("expected direct bot mention to be handled in default (review) mode")
+	}
+
+	if _, err := st.SetChatMode("oc_report", store.ChatModeReport); err != nil {
+		t.Fatal(err)
+	}
+	if s.shouldRespond(atBot) {
+		t.Fatal("expected report-mode group to ignore even a direct bot mention")
+	}
+	p2p := review.MessageContext{ChatType: "p2p", ChatID: "oc_report"}
+	if !s.shouldRespond(p2p) {
+		t.Fatal("expected p2p messages to remain handled regardless of group mode")
+	}
+}
+
+func TestShouldRespondReportReviewCombination(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	s := &server{store: st, botOpenID: "ou_bot"}
+
+	if _, err := st.SetChatMode("oc_mix", "report|review"); err != nil {
+		t.Fatal(err)
+	}
+	base := review.MessageContext{ChatType: "group", ChatID: "oc_mix", Mentions: []string{"ou_bot"}}
+
+	// Review requests pass through in report|review.
+	reviewMsg := base
+	reviewMsg.Text = "review https://github.com/congqixia/saturnus/pull/1"
+	if !s.shouldRespond(reviewMsg) {
+		t.Fatal("expected PR link to be handled in report|review")
+	}
+	reviewCmd := base
+	reviewCmd.Text = "/sat review https://github.com/congqixia/saturnus/pull/1"
+	if !s.shouldRespond(reviewCmd) {
+		t.Fatal("expected /sat review to be handled in report|review")
+	}
+	retryCmd := base
+	retryCmd.Text = "/sat retry rvw_abc"
+	if !s.shouldRespond(retryCmd) {
+		t.Fatal("expected /sat retry to be handled in report|review")
+	}
+
+	// Ordinary @chatter and non-review commands stay silent.
+	chatter := base
+	chatter.Text = "hello bot"
+	if s.shouldRespond(chatter) {
+		t.Fatal("expected casual chatter to be ignored in report|review")
+	}
+	sessionsCmd := base
+	sessionsCmd.Text = "/sat sessions"
+	if s.shouldRespond(sessionsCmd) {
+		t.Fatal("expected non-review /sat command to be ignored in report|review")
+	}
+
+	// report|review still requires a direct mention: a PR link without @ is ignored.
+	noMention := review.MessageContext{ChatType: "group", ChatID: "oc_mix", Text: "https://github.com/congqixia/saturnus/pull/1"}
+	if s.shouldRespond(noMention) {
+		t.Fatal("expected PR link without a bot mention to be ignored")
+	}
+
+	// Plain report mode (no review flag) ignores even review requests.
+	if _, err := st.SetChatMode("oc_report", store.ChatModeReport); err != nil {
+		t.Fatal(err)
+	}
+	reportReview := review.MessageContext{
+		ChatType: "group", ChatID: "oc_report", Mentions: []string{"ou_bot"},
+		Text: "review https://github.com/congqixia/saturnus/pull/1",
+	}
+	if s.shouldRespond(reportReview) {
+		t.Fatal("expected report-only group to ignore even review requests")
+	}
+}
+
+func TestGroupModeReplyInGroup(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	s := &server{store: st, lark: lark.New(lark.Config{})} // lark disabled
+
+	msg := review.MessageContext{ChatType: "group", ChatID: "oc_group", SenderOpenID: "ou_admin"}
+	reply := s.groupReply([]string{"/sat", "group", "mode", "report"}, "/sat group mode report", msg)
+	if !strings.Contains(reply.text, "oc_group") || !strings.Contains(reply.text, "report") {
+		t.Fatalf("unexpected reply: %q", reply.text)
+	}
+	if got := st.GetChatMode("oc_group"); got != store.ChatModeReport {
+		t.Fatalf("mode = %q, want report", got)
+	}
+
+	reply = s.groupReply([]string{"/sat", "group", "mode", "review"}, "/sat group mode review", msg)
+	if !strings.Contains(reply.text, "review") {
+		t.Fatalf("unexpected reply: %q", reply.text)
+	}
+	if got := st.GetChatMode("oc_group"); got != store.ChatModeReview {
+		t.Fatalf("mode = %q, want review", got)
+	}
+}
+
+func TestGroupModeReplyExplicitIDOutsideGroup(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	s := &server{store: st, lark: lark.New(lark.Config{})}
+
+	msg := review.MessageContext{ChatType: "p2p", SenderOpenID: "ou_admin"}
+	reply := s.groupReply([]string{"/sat", "group", "mode", "report", "oc_remote"}, "/sat group mode report oc_remote", msg)
+	if !strings.Contains(reply.text, "oc_remote") || !strings.Contains(reply.text, "report") {
+		t.Fatalf("unexpected reply: %q", reply.text)
+	}
+	if got := st.GetChatMode("oc_remote"); got != store.ChatModeReport {
+		t.Fatalf("mode = %q, want report", got)
+	}
+}
+
+func TestGroupModeReplyInvalid(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	s := &server{store: st, lark: lark.New(lark.Config{})}
+
+	msg := review.MessageContext{ChatType: "p2p", SenderOpenID: "ou_admin"}
+	if reply := s.groupReply([]string{"/sat", "group", "mode", "bogus"}, "/sat group mode bogus", msg); !strings.Contains(reply.text, "Invalid mode") {
+		t.Fatalf("unexpected reply: %q", reply.text)
+	}
+	// no chat_id and not in a group
+	if reply := s.groupReply([]string{"/sat", "group", "mode", "report"}, "/sat group mode report", msg); !strings.Contains(reply.text, "chat_id") {
+		t.Fatalf("expected usage error, got: %q", reply.text)
+	}
+}
+
+func TestGroupModeReplyCombinedFlags(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	s := &server{store: st, lark: lark.New(lark.Config{})}
+
+	msg := review.MessageContext{ChatType: "group", ChatID: "oc_group", SenderOpenID: "ou_admin"}
+	reply := s.groupReply([]string{"/sat", "group", "mode", "review|report"}, "/sat group mode review|report", msg)
+	if !strings.Contains(reply.text, "report|review") {
+		t.Fatalf("unexpected reply: %q", reply.text)
+	}
+	if got := st.GetChatMode("oc_group"); got != "report|review" {
+		t.Fatalf("mode = %q, want report|review", got)
+	}
+}
+
+func TestGroupReplyShowsMode(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	s := &server{store: st, lark: lark.New(lark.Config{})}
+
+	inGroup := review.MessageContext{ChatType: "group", ChatID: "oc_g"}
+	reply := s.groupReply([]string{"/sat", "group"}, "/sat group", inGroup)
+	if !strings.Contains(reply.text, "oc_g") || !strings.Contains(reply.text, "review") {
+		t.Fatalf("unexpected reply: %q", reply.text)
+	}
+
+	reply = s.groupReply([]string{"/sat", "group", "oc_other"}, "/sat group oc_other", inGroup)
+	if !strings.Contains(reply.text, "oc_other") {
+		t.Fatalf("unexpected reply: %q", reply.text)
+	}
+}
+
+func TestGroupsReplyRequiresLark(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	s := &server{store: st, lark: lark.New(lark.Config{})}
+	if reply := s.groupsReply(); !strings.Contains(reply.text, "lark client disabled") {
+		t.Fatalf("expected disabled lark error, got: %q", reply.text)
+	}
+}
+
 func TestReviewUsageExampleNoSat(t *testing.T) {
 	s := &server{}
 	msg := s.reviewUsageExample()
@@ -136,6 +387,51 @@ func TestFormatReviewMarkdown(t *testing.T) {
 		if !strings.Contains(md, want) {
 			t.Fatalf("markdown missing %q:\n%s", want, md)
 		}
+	}
+}
+
+func TestPRsReplyListsOpenPRsWithBaseBranch(t *testing.T) {
+	gh := filepath.Join(t.TempDir(), "gh")
+	content := `#!/bin/sh
+printf '%s\n' '[{"number":3,"title":"Fix","headRefName":"fix/x","baseRefName":"release","isDraft":false,"url":"https://github.com/a/b/pull/3","updatedAt":"2026-09-24T10:00:00Z"}]'
+`
+	if err := os.WriteFile(gh, []byte(content), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	svc := review.New(st, &fakeLarkName{}, review.Config{
+		Enabled: true,
+		Repos:   map[string]string{"a/b": t.TempDir()},
+		GHCli:   gh,
+	})
+	s := &server{store: st, reviews: svc}
+	reply := s.prsReply()
+	if reply.table == nil || len(reply.table.Rows) != 1 {
+		t.Fatalf("expected single-row table, got %#v", reply.table)
+	}
+	row := reply.table.Rows[0]
+	if row["repo"] != "a/b#3" || row["base"] != "release" || row["head"] != "fix/x" {
+		t.Fatalf("unexpected row: %#v", row)
+	}
+	if !strings.Contains(reply.text, "base=release") {
+		t.Fatalf("plain text missing base branch: %q", reply.text)
+	}
+}
+
+func TestPRsReplyNoWhitelistedRepos(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	svc := review.New(st, &fakeLarkName{}, review.Config{Enabled: true})
+	s := &server{store: st, reviews: svc}
+	if reply := s.prsReply(); !strings.Contains(reply.text, "No repos whitelisted") {
+		t.Fatalf("unexpected reply: %q", reply.text)
 	}
 }
 
@@ -267,6 +563,8 @@ func (f *fakeLarkName) CreateTask(lark.CreateTaskInput) (lark.Task, error) {
 func (f *fakeLarkName) GetTask(string) (lark.Task, error)             { return lark.Task{}, nil }
 func (f *fakeLarkName) UpdateTask(string, lark.UpdateTaskInput) error { return nil }
 func (f *fakeLarkName) ReplyMessage(_, _ string) error                { return nil }
+func (f *fakeLarkName) EnsureTaskList(string) (lark.TaskList, error)  { return lark.TaskList{}, nil }
+func (f *fakeLarkName) AddTaskToList(_, _ string) error               { return nil }
 
 func newTestReviewWithName(t *testing.T, name string) (botReply, *server) {
 	t.Helper()
@@ -414,6 +712,247 @@ func TestReviewsReplyArchivedMode(t *testing.T) {
 	}
 }
 
+func TestExtractLarkMessageParsesMentionsAndChatType(t *testing.T) {
+	payload := map[string]any{
+		"header": map[string]any{"event_type": "im.message.receive_v1"},
+		"event": map[string]any{
+			"sender": map[string]any{
+				"sender_id": map[string]any{"open_id": "ou_user"},
+			},
+			"message": map[string]any{
+				"chat_id":      "oc_123",
+				"chat_type":    "group",
+				"message_id":   "om_123",
+				"message_type": "text",
+				"mentions": []any{
+					map[string]any{"id": "all", "name": "所有人"},
+					map[string]any{"id": "ou_bot", "name": "saturnus"},
+					map[string]any{"id": "ou_zhang", "name": "张三"},
+				},
+				"content": `{"text":"/sat sessions"}`,
+			},
+		},
+	}
+	msg := extractLarkMessage(payload)
+	if msg.ChatType != "group" {
+		t.Fatalf("chat_type = %q, want group", msg.ChatType)
+	}
+	if msg.Text != "/sat sessions" {
+		t.Fatalf("text = %q, want /sat sessions", msg.Text)
+	}
+	if len(msg.Mentions) != 3 || msg.Mentions[0] != "all" || msg.Mentions[1] != "ou_bot" {
+		t.Fatalf("mentions = %#v, want [all ou_bot ou_zhang]", msg.Mentions)
+	}
+	if msg.MentionNames["ou_zhang"] != "张三" || msg.MentionNames["all"] != "所有人" {
+		t.Fatalf("mention names = %#v", msg.MentionNames)
+	}
+}
+
+func TestAttributedRequester(t *testing.T) {
+	s := &server{botOpenID: "ou_bot"}
+	msg := review.MessageContext{
+		Mentions:     []string{"all", "ou_bot", "ou_zhang"},
+		MentionNames: map[string]string{"ou_zhang": "张三"},
+	}
+	if got := s.attributedRequester(msg); got != "ou_zhang" {
+		t.Fatalf("attributed = %q, want ou_zhang", got)
+	}
+	onlyBot := review.MessageContext{Mentions: []string{"ou_bot"}}
+	if got := s.attributedRequester(onlyBot); got != "" {
+		t.Fatalf("attributed = %q, want empty when only the bot is mentioned", got)
+	}
+	none := review.MessageContext{}
+	if got := s.attributedRequester(none); got != "" {
+		t.Fatalf("attributed = %q, want empty without mentions", got)
+	}
+	atAll := review.MessageContext{Mentions: []string{"all"}}
+	if got := s.attributedRequester(atAll); got != "" {
+		t.Fatalf("attributed = %q, want empty for @all", got)
+	}
+}
+
+func TestReviewStatusCellOutdatedKeepsColor(t *testing.T) {
+	outdated := store.ReviewRequest{Status: "succeeded", HeadCommit: "abc123", PrHeadCommit: "def456"}
+	cell := reviewStatusCell(outdated)
+	tag := cell.(map[string]any)
+	if tag["text"] != "succeeded / OUTDATED" {
+		t.Fatalf("text = %v, want 'succeeded / OUTDATED'", tag["text"])
+	}
+	if tag["color"] != "green" {
+		t.Fatalf("color = %v, want green (status color preserved)", tag["color"])
+	}
+	current := store.ReviewRequest{Status: "failed", HeadCommit: "abc123", PrHeadCommit: "abc123"}
+	cell = reviewStatusCell(current)
+	tag = cell.(map[string]any)
+	if tag["text"] != "failed" || tag["color"] != "red" {
+		t.Fatalf("cell = %#v, want failed/red", tag)
+	}
+}
+
+func TestMaybeReviewKeepsSenderAsRequester(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	svc := review.New(st, lark.New(lark.Config{}), review.Config{
+		Enabled:      true,
+		AllowedUsers: []string{"ou_sender"},
+		Repos:        map[string]string{"a/b": t.TempDir()},
+	})
+	s := &server{store: st, lark: lark.New(lark.Config{}), reviews: svc, botOpenID: "ou_bot"}
+
+	// A natural-language request: PR link + @the-person-asked-to-approve + @bot.
+	msg := review.MessageContext{
+		Text:         "fix: batch clustering by XuanYang-cn · Pull Request #1 · https://github.com/a/b/pull/1 这个PR 请@Reviewer 帮忙approve一下，THX！@Bot",
+		ChatID:       "oc_c",
+		MessageID:    "om_1",
+		SenderOpenID: "ou_sender",
+		SenderName:   "Sender",
+		Mentions:     []string{"ou_bot", "ou_reviewer"},
+		MentionNames: map[string]string{"ou_reviewer": "Reviewer"},
+	}
+	if reply := s.maybeReview(msg); !strings.Contains(reply, "Review started") {
+		t.Fatalf("unexpected reply: %q", reply)
+	}
+	req, err := st.GetReviewByPR("a/b", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.RequesterOpenID != "ou_sender" {
+		t.Fatalf("requester = %q, want ou_sender (mentions must not be reinterpreted as requester)", req.RequesterOpenID)
+	}
+	if req.RequesterName != "Sender" {
+		t.Fatalf("requester name = %q, want Sender", req.RequesterName)
+	}
+}
+
+func TestRequesterReplyByMention(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	svc := review.New(st, lark.New(lark.Config{}), review.Config{
+		Enabled:      true,
+		AllowedUsers: []string{"ou_admin"},
+		Repos:        map[string]string{"a/b": t.TempDir()},
+	})
+	s := &server{store: st, lark: lark.New(lark.Config{}), reviews: svc, botOpenID: "ou_bot"}
+
+	req, err := svc.Submit(review.MessageContext{
+		Text: "review https://github.com/a/b/pull/1", ChatID: "oc_c", MessageID: "om_1",
+		SenderOpenID: "ou_admin", SenderName: "Admin",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.RequesterOpenID != "ou_admin" {
+		t.Fatalf("initial requester = %q, want ou_admin", req.RequesterOpenID)
+	}
+
+	msg := review.MessageContext{
+		ChatID: "oc_c", SenderOpenID: "ou_admin",
+		Mentions:     []string{"ou_bot", "ou_zhang"},
+		MentionNames: map[string]string{"ou_zhang": "张三"},
+	}
+	reply := s.requesterReply([]string{"/sat", "requester", req.ID}, msg)
+	if !strings.Contains(reply.text, req.ID) || !strings.Contains(reply.text, "张三") {
+		t.Fatalf("unexpected reply: %q", reply.text)
+	}
+	got, err := svc.Get(req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RequesterOpenID != "ou_zhang" || got.RequesterName != "张三" {
+		t.Fatalf("requester = %s (%s), want ou_zhang (张三)", got.RequesterOpenID, got.RequesterName)
+	}
+}
+
+func TestRequesterReplyByOpenID(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	svc := review.New(st, lark.New(lark.Config{}), review.Config{
+		Enabled:      true,
+		AllowedUsers: []string{"ou_admin"},
+		Repos:        map[string]string{"a/b": t.TempDir()},
+	})
+	s := &server{store: st, lark: lark.New(lark.Config{}), reviews: svc, botOpenID: "ou_bot"}
+
+	req, err := svc.Submit(review.MessageContext{
+		Text: "review https://github.com/a/b/pull/2", ChatID: "oc_c", MessageID: "om_2",
+		SenderOpenID: "ou_admin",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := review.MessageContext{ChatType: "p2p", SenderOpenID: "ou_admin"}
+	reply := s.requesterReply([]string{"/sat", "requester", req.ID, "ou_alice"}, msg)
+	if !strings.Contains(reply.text, "ou_alice") {
+		t.Fatalf("unexpected reply: %q", reply.text)
+	}
+	got, err := svc.Get(req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RequesterOpenID != "ou_alice" {
+		t.Fatalf("requester = %q, want ou_alice", got.RequesterOpenID)
+	}
+}
+
+func TestRequesterReplyNoUser(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	svc := review.New(st, lark.New(lark.Config{}), review.Config{Enabled: true, Repos: map[string]string{"a/b": t.TempDir()}})
+	s := &server{store: st, lark: lark.New(lark.Config{}), reviews: svc, botOpenID: "ou_bot"}
+	msg := review.MessageContext{ChatType: "p2p", SenderOpenID: "ou_admin"}
+	if reply := s.requesterReply([]string{"/sat", "requester", "rvw_x"}, msg); !strings.Contains(reply.text, "No user specified") {
+		t.Fatalf("unexpected reply: %q", reply.text)
+	}
+}
+
+func TestHandleReviewThreadReplyGating(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	svc := review.New(st, lark.New(lark.Config{}), review.Config{
+		Enabled:      true,
+		AllowedUsers: []string{"ou_me"},
+		Repos:        map[string]string{"a/b": t.TempDir()},
+	})
+	s := &server{store: st, lark: lark.New(lark.Config{}), reviews: svc}
+
+	// Only group thread replies are eligible.
+	if s.handleReviewThreadReply(review.MessageContext{ChatType: "p2p"}) {
+		t.Fatal("expected p2p messages to be left to normal handling")
+	}
+	// A message that is its own thread root is not a reply.
+	if s.handleReviewThreadReply(review.MessageContext{ChatType: "group", ChatID: "oc_c", MessageID: "om_x", RootMessageID: "om_x"}) {
+		t.Fatal("expected a non-reply group message to fall through")
+	}
+	// A reply containing a PR URL is left to the normal review path.
+	if s.handleReviewThreadReply(review.MessageContext{
+		ChatType: "group", ChatID: "oc_c", MessageID: "om_y", RootMessageID: "om_root",
+		Text: "review https://github.com/a/b/pull/1",
+	}) {
+		t.Fatal("expected a PR-URL reply to fall through to maybeReview")
+	}
+	// A thread reply with no active review rooted there falls through.
+	if s.handleReviewThreadReply(review.MessageContext{
+		ChatType: "group", ChatID: "oc_c", MessageID: "om_y", RootMessageID: "om_unknown",
+	}) {
+		t.Fatal("expected a reply in an unknown thread to fall through")
+	}
+}
+
 func TestSatCommandTokenMatch(t *testing.T) {
 	cases := []struct {
 		text string
@@ -430,6 +969,121 @@ func TestSatCommandTokenMatch(t *testing.T) {
 		if got := satCommand(tc.text); got != tc.want {
 			t.Fatalf("satCommand(%q) = %q, want %q", tc.text, got, tc.want)
 		}
+	}
+}
+
+func newTasksTestServer(t *testing.T, repos map[string]string) (*server, *store.Store) {
+	t.Helper()
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := tasks.New(st, tasks.Config{Enabled: true, GHCli: "no-such-gh", Repos: repos})
+	return &server{store: st, tasks: svc}, st
+}
+
+func TestTasksReplyListsAndFilters(t *testing.T) {
+	srv, st := newTasksTestServer(t, map[string]string{"a/b": "/tmp/a"})
+	task, err := srv.tasks.Create("https://github.com/a/b/issues/1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply := srv.tasksReply("")
+	if reply.table == nil || len(reply.table.Rows) != 1 {
+		t.Fatalf("expected a single-row task table, got %#v", reply.table)
+	}
+	if got := reply.table.Rows[0]["issue"]; got != "a/b#1" {
+		t.Fatalf("expected issue ref, got %v", got)
+	}
+	if srv.tasksReply("archived").table != nil {
+		t.Fatal("expected no table for archived mode before closing any task")
+	}
+	if _, err := st.CloseTask(task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if reply := srv.tasksReply(""); reply.table != nil {
+		t.Fatal("expected archived task hidden from default listing")
+	}
+	if reply := srv.tasksReply("archived"); reply.table == nil {
+		t.Fatal("expected archived task listed in archived mode")
+	}
+}
+
+func TestTaskCommandCreateAndDetail(t *testing.T) {
+	srv, _ := newTasksTestServer(t, map[string]string{"a/b": "/tmp/a"})
+	reply := srv.taskCommand([]string{"/sat", "task", "create", "https://github.com/a/b/issues/9"}, "/sat task create https://github.com/a/b/issues/9")
+	if !strings.HasPrefix(reply.text, "Task created tsk_") {
+		t.Fatalf("unexpected create reply: %q", reply.text)
+	}
+	id := strings.Fields(reply.text)[2]
+	detail := srv.taskCommand([]string{"/sat", "task", id}, "/sat task "+id)
+	if !strings.Contains(detail.text, "a/b#9") {
+		t.Fatalf("unexpected detail reply: %q", detail.text)
+	}
+	missing := srv.taskCommand([]string{"/sat", "task", "tsk_missing"}, "/sat task tsk_missing")
+	if !strings.Contains(missing.text, "Task not found") {
+		t.Fatalf("expected not-found reply, got %q", missing.text)
+	}
+}
+
+func TestTaskCommandAddDocAndPR(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "docs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "docs", "x.md"), []byte("# x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srv, st := newTasksTestServer(t, map[string]string{"a/b": dir})
+	task, err := srv.tasks.Create("https://github.com/a/b/issues/1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	docReply := srv.taskCommand([]string{"/sat", "task", "add-doc", task.ID, "a/b:docs/x.md"}, "/sat task add-doc "+task.ID+" a/b:docs/x.md")
+	if !strings.HasPrefix(docReply.text, "Doc added tdc_") {
+		t.Fatalf("unexpected add-doc reply: %q", docReply.text)
+	}
+
+	prReply := srv.taskCommand([]string{"/sat", "task", "add-pr", task.ID, "https://github.com/a/b/pull/1"}, "/sat task add-pr "+task.ID+" https://github.com/a/b/pull/1")
+	if !strings.HasPrefix(prReply.text, "PR added tpr_") || !strings.Contains(prReply.text, "review=none") {
+		t.Fatalf("unexpected add-pr reply: %q", prReply.text)
+	}
+
+	detail := srv.taskDetailReply(task)
+	if !strings.Contains(detail.text, "docs:") || !strings.Contains(detail.text, "a/b:docs/x.md") || !strings.Contains(detail.text, "a/b#1") {
+		t.Fatalf("detail missing docs/prs:\n%s", detail.text)
+	}
+
+	// Archived tasks reject new PRs.
+	if _, err := st.CloseTask(task.ID); err != nil {
+		t.Fatal(err)
+	}
+	rejected := srv.taskCommand([]string{"/sat", "task", "add-pr", task.ID, "https://github.com/a/b/pull/2"}, "/sat task add-pr "+task.ID+" https://github.com/a/b/pull/2")
+	if !strings.Contains(rejected.text, "archived") {
+		t.Fatalf("expected archived rejection, got %q", rejected.text)
+	}
+}
+
+func TestTaskRefreshReply(t *testing.T) {
+	srv, _ := newTasksTestServer(t, map[string]string{"a/b": "/tmp/a"})
+	task, err := srv.tasks.Create("https://github.com/a/b/issues/1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.tasks.AddPR(task.ID, "https://github.com/a/b/pull/1"); err != nil {
+		t.Fatal(err)
+	}
+	reply := srv.taskRefreshReply(task.ID)
+	if !strings.Contains(reply.text, "Refreshed") || !strings.Contains(reply.text, "prs=1") {
+		t.Fatalf("unexpected refresh reply: %q", reply.text)
+	}
+	all := srv.taskRefreshReply("all")
+	if !strings.Contains(all.text, "Refreshed") {
+		t.Fatalf("unexpected refresh-all reply: %q", all.text)
 	}
 }
 

@@ -2,6 +2,7 @@ package store
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 )
@@ -525,5 +526,248 @@ func TestStoreListReviewsFiltersArchived(t *testing.T) {
 	succeeded := st.ListReviews("succeeded", false)
 	if len(succeeded) != 1 || succeeded[0].ID != "rvw_active" {
 		t.Fatalf("expected only active succeeded review, got %#v", succeeded)
+	}
+}
+
+func TestChatModes(t *testing.T) {
+	st, err := Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if got := st.GetChatMode("oc_none"); got != ChatModeReview {
+		t.Fatalf("default mode = %q, want review", got)
+	}
+	if got := st.GetChatMode(""); got != ChatModeReview {
+		t.Fatalf("empty chat mode = %q, want review", got)
+	}
+
+	if _, err := st.SetChatMode("oc_a", ChatModeReport); err != nil {
+		t.Fatal(err)
+	}
+	if got := st.GetChatMode("oc_a"); got != ChatModeReport {
+		t.Fatalf("mode = %q, want report", got)
+	}
+
+	if _, err := st.SetChatMode("oc_b", ChatModeReview); err != nil {
+		t.Fatal(err)
+	}
+	// Upsert overrides.
+	if _, err := st.SetChatMode("oc_a", ChatModeReview); err != nil {
+		t.Fatal(err)
+	}
+	if got := st.GetChatMode("oc_a"); got != ChatModeReview {
+		t.Fatalf("mode after upsert = %q, want review", got)
+	}
+
+	modes := st.ListChatModes()
+	if len(modes) != 2 {
+		t.Fatalf("list len = %d, want 2", len(modes))
+	}
+	seen := map[string]bool{}
+	for _, m := range modes {
+		seen[m.ChatID] = true
+	}
+	if !seen["oc_a"] || !seen["oc_b"] {
+		t.Fatalf("list = %#v, want oc_a and oc_b", modes)
+	}
+}
+
+func TestChatModesCombinedFlags(t *testing.T) {
+	st, err := Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	for input, want := range map[string]string{
+		"report|review":   "report|review",
+		"review|report":   "report|review",
+		"report,review":   "report|review",
+		"review | report": "report|review",
+		"report":          "report",
+		"review":          "review",
+	} {
+		if got, err := NormalizeChatMode(input); err != nil || got != want {
+			t.Fatalf("NormalizeChatMode(%q) = %q, %v; want %q", input, got, err, want)
+		}
+	}
+
+	if _, err := NormalizeChatMode(""); err == nil {
+		t.Fatal("expected error for empty mode")
+	}
+	if _, err := NormalizeChatMode("report|bogus"); err == nil {
+		t.Fatal("expected error for unknown flag")
+	}
+
+	if _, err := st.SetChatMode("oc_mix", "review|report"); err != nil {
+		t.Fatal(err)
+	}
+	if got := st.GetChatMode("oc_mix"); got != "report|review" {
+		t.Fatalf("mode = %q, want report|review", got)
+	}
+	flags := ChatModeFlags(st.GetChatMode("oc_mix"))
+	if !flags[ChatModeReport] || !flags[ChatModeReview] {
+		t.Fatalf("flags = %#v, want both report and review", flags)
+	}
+}
+
+func TestGetLatestReviewByThread(t *testing.T) {
+	st, err := Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	thread, err := st.GetOrCreateReviewThread("oc_c", "om_root", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateReview(ReviewRequest{
+		ID: "rvw_1", ThreadID: thread.ID, Status: "succeeded",
+		PRURL: "https://github.com/a/b/pull/1", Repo: "a/b", PRNumber: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// A second, older review in the same thread loses to the newest.
+	if _, err := st.CreateReview(ReviewRequest{
+		ID: "rvw_old", ThreadID: thread.ID, Status: "succeeded",
+		PRURL: "https://github.com/a/b/pull/0", Repo: "a/b", PRNumber: 0,
+		CreatedAt: time.Now().UTC().Add(-time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.GetLatestReviewByThread("oc_c", "om_root")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != "rvw_1" {
+		t.Fatalf("got review %q, want rvw_1 (newest)", got.ID)
+	}
+
+	if _, err := st.GetLatestReviewByThread("oc_c", "om_missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for unknown thread root, got %v", err)
+	}
+}
+
+func TestStoreTasksFlow(t *testing.T) {
+	st, err := Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	task, err := st.CreateTask(Task{
+		Title:       "Feature X",
+		IssueRepo:   "a/b",
+		IssueNumber: 10,
+		IssueURL:    "https://github.com/a/b/issues/10",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.ID == "" || task.Status != TaskStatusOpen {
+		t.Fatalf("unexpected task: %#v", task)
+	}
+
+	// Attach a design doc.
+	doc, err := st.AddTaskDoc(TaskDoc{TaskID: task.ID, Repo: "a/b", Path: "docs/plan/x.md"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Adding the same doc path again dedupes.
+	if _, err := st.AddTaskDoc(TaskDoc{TaskID: task.ID, Repo: "a/b", Path: "docs/plan/x.md", Title: "X"}); err != nil {
+		t.Fatal(err)
+	}
+	docs := st.ListTaskDocs(task.ID)
+	if len(docs) != 1 || docs[0].Title != "X" {
+		t.Fatalf("unexpected docs: %#v", docs)
+	}
+
+	// Attach a PR with a linked review snapshot.
+	pr, err := st.AddTaskPR(TaskPR{
+		TaskID:       task.ID,
+		Repo:         "a/b",
+		PRNumber:     1,
+		PRURL:        "https://github.com/a/b/pull/1",
+		PRTitle:      "PR one",
+		PRState:      "OPEN",
+		ReviewID:     "rvw_1",
+		ReviewStatus: "succeeded",
+		FsTaskID:     "guid1",
+		FsTaskURL:    "https://task",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Same PR re-added updates the snapshot rather than duplicating.
+	_, err = st.AddTaskPR(TaskPR{
+		TaskID:       task.ID,
+		Repo:         "a/b",
+		PRNumber:     1,
+		PRURL:        "https://github.com/a/b/pull/1",
+		PRState:      "MERGED",
+		ReviewID:     "rvw_1",
+		ReviewStatus: "archived",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prs := st.ListTaskPRs(task.ID)
+	if len(prs) != 1 {
+		t.Fatalf("expected 1 PR, got %#v", prs)
+	}
+	if prs[0].PRState != "MERGED" || prs[0].ReviewStatus != "archived" || prs[0].FsTaskID != "guid1" {
+		t.Fatalf("PR snapshot not updated: %#v", prs[0])
+	}
+
+	// Update and reload a task.
+	task.Status = TaskStatusInProgress
+	if _, err := st.UpdateTask(task); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != TaskStatusInProgress || got.IssueNumber != 10 {
+		t.Fatalf("task round-trip mismatch: %#v", got)
+	}
+
+	// Close archives it.
+	closed, err := st.CloseTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closed.Status != TaskStatusArchived || closed.ArchivedAt.IsZero() {
+		t.Fatalf("expected archived task, got %#v", closed)
+	}
+	// Closing twice is idempotent.
+	if _, err := st.CloseTask(task.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	if tasks := st.ListTasks("", false); len(tasks) != 0 {
+		t.Fatalf("expected archived task hidden from default listing, got %#v", tasks)
+	}
+	if tasks := st.ListTasks("", true); len(tasks) != 1 {
+		t.Fatalf("expected archived task with includeArchived, got %#v", tasks)
+	}
+
+	// Detach doc and PR.
+	if err := st.RemoveTaskDoc(doc.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RemoveTaskPR(pr.ID); err != nil {
+		t.Fatal(err)
+	}
+	if len(st.ListTaskDocs(task.ID)) != 0 || len(st.ListTaskPRs(task.ID)) != 0 {
+		t.Fatalf("expected empty docs and prs after removal")
+	}
+
+	if _, err := st.GetTask("tsk_missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for unknown task, got %v", err)
 	}
 }

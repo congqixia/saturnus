@@ -106,6 +106,7 @@ Supported text commands:
 - `/sat reviews`
 - `/sat reviews all` / `/sat reviews archived` — include archived reviews, or list only archived
 - `/sat review <pr-url>` (also works as natural language: any message containing a GitHub PR URL)
+- `/sat review <pr-url> @user` — start the review but attribute the requester to the @mentioned user (e.g. when the request came to you by DM instead of the bot). `@all` and the bot itself are ignored; for chats where the user can't be @mentioned (e.g. a p2p chat with the bot) pass the open_id instead: `/sat review <pr-url> ou_xxx`
 - `/sat review <review_id>`
 - `/sat retry <review_id>` — retry a failed review, or re-run a successful one after its PR head commit moved
 - `/sat refresh <review_id|all>` — re-sync PR/task state: archive merged/closed PRs (and complete their task), restore reopened PRs, append new reviewer comments to the task
@@ -113,9 +114,24 @@ Supported text commands:
 - `/sat threads <review_id>` — list every chat thread a review was requested in
 - `/sat describe review <review_id>` — show full details of one review (as a card), including the run history
 - `/sat repos` — show the configured repo whitelist
+- `/sat prs` — list open PRs authored by the current `gh` user in the whitelisted repos, showing each PR's base branch
+- `/sat groups` — list groups the bot has joined and their modes
+- `/sat group [chat_id]` — show a group's mode (defaults to the current group)
+- `/sat group mode <flags> [chat_id]` — set a group's mode flags (review, report, or report|review); omit `chat_id` when running inside the group
 - `/sat whoami` — show the sender's own open_id
 - `/sat whois <name|email|mobile>` — resolve a user to open_id via the contact API
 - `/sat reply <review_id> <message>` — reviewer replies to the requester via DM
+- `/sat requester <review_id> @user|ou_xxx` — update an existing review's requester (mention the user, or pass an open_id); archived reviews are rejected
+- `/sat tasks` — list feature tasks (archived tasks are hidden)
+- `/sat tasks all|archived` — list tasks including archived, or only archived
+- `/sat task <task_id>` — show one task: issue, design docs, and per-PR progress
+- `/sat task create <issue-url>` — create a task from a GitHub issue
+- `/sat task add-doc <task_id> <owner/repo:path>` — attach a local design doc (a repo-relative path inside the whitelisted checkout) to a task
+- `/sat task rm-doc <task_id> <doc_id>` — detach a design doc
+- `/sat task add-pr <task_id> <pr-url>` — attach a PR and snapshot its review/Feishu-task state
+- `/sat task rm-pr <task_id> <pr_id>` — detach a PR
+- `/sat task refresh <task_id|all>` — re-sync issue/PR/review/Feishu-task state
+- `/sat task close <task_id>` — archive a task
 
 ## PR Review
 
@@ -161,6 +177,8 @@ Environment variables:
 | `SATURNUS_REVIEW_TIMEOUT` | 15m | per-review timeout |
 | `SATURNUS_REVIEW_CREATE_TASK` | 0 | create a Feishu task assigned to reviewer + requester |
 | `SATURNUS_REVIEW_TASK_DUE_HOURS` | 24 | task due offset in hours |
+| `SATURNUS_REVIEW_TASK_GROUP` | - | task group (任务分组) name tasks are filed under; Saturnus looks it up and creates it if missing (needs `task:tasklist:read/write`) |
+| `SATURNUS_REVIEW_TASK_GROUP_ID` | - | pin an existing task group by guid, bypassing the name lookup/create |
 | `SATURNUS_REVIEW_LOG_DIR` | `<tmp>/saturnus-review-logs` | per-review transcript logs |
 | `SATURNUS_REVIEW_GUIDES` | - | per-repo review guide files: `owner/repo=/path/to/guide.txt,...` |
 
@@ -185,7 +203,22 @@ when its head commit moved, otherwise the request is reported as already up to
 date (`ErrReviewUnchanged`). `/sat retry <review_id>` forces another run: failed
 reviews always retry, successful ones only when the head changed. Retries keep
 the previous tool session (`session_id`), so the run resumes the same review
-conversation via `opencode run --session <id> --title ...`. Reviewer identities
+conversation via `opencode run --session <id> --title ...`.
+
+### Reply-triggered re-review
+
+In a group, replying inside the thread of a review-triggering message while
+@mentioning the bot re-checks whether the PR head moved:
+
+- If the head changed (or the review has no recorded baseline, e.g. a failed
+  run), the review is re-queued, the requester gets an in-thread reply
+  ("重新评审已开始") and the reviewer is notified about the trigger.
+- If the head is unchanged, the bot replies in-thread that the review is
+  already current (no re-run, no reviewer ping).
+
+Explicit `/sat retry`, `/sat review`, or replies that contain a PR URL take
+the normal paths instead. This requires the reply's thread context, which the
+bridge now forwards (`root_id`/`thread_id`/`reply_to`). Reviewer identities
 are resolved to names via the contact API (new submissions, result messages,
 and backfilled on startup), and the result message includes the opencode
 `session=` id so the reviewer can continue the session with
@@ -198,6 +231,24 @@ original requester. Only when no real requester is recorded (empty, or the
 HTTP-API `"api"` sentinel) is the new sender adopted. The chat/message/thread
 context still updates per request, so the review thread records everyone who
 keeps participating.
+
+A request can also be attributed to a different user than the command sender:
+`/sat review <pr-url> @user` records the @mentioned user as the requester, so
+they — not the admin who typed the command — receive the result notification
+and task assignment. This is useful when a review was requested in a DM to a
+human rather than to the bot. The requester name is taken from the mention
+(falling back to the contact API), and access control stays on the actual
+sender.
+
+Note: attribution only happens on the explicit `/sat review <pr-url> @user`
+command. Natural-language submissions (a bare PR URL pasted in a group) always
+keep the message sender as the requester — in a group the @mentions next to a
+PR link are usually the reviewer being asked to approve, not the requester, so
+they must not be reinterpreted.
+
+To reassign the requester of an existing review (e.g. after a mistake), use
+`/sat requester <review_id> @user` (or pass the open_id directly). This updates
+the stored requester and its display name; archived reviews are rejected.
 
 Every thread a review is requested in is recorded in a `review_thread_links`
 table (deduped per review+thread), so a review re-requested or retried from
@@ -219,6 +270,15 @@ review) re-syncs a review with its PR and Feishu task:
 - If the reviewer submitted new reviews/comments on the PR, they are appended to
   the task description (tracked by `task_synced_at`, so each comment is synced
   once). This requires `gh` and the `task:task` write scope.
+- The PR's current head commit is recorded as `pr_head_commit` (separate from
+  `head_commit`, the last reviewed head), so listings can flag stale results.
+
+Listings (`/sat reviews`, `/sat review <id>`, `/sat describe review`) compare
+the last reviewed head against the PR head recorded at refresh: when they
+differ, the status is marked **OUTDATED** (e.g. `succeeded / OUTDATED`),
+meaning the PR moved since the review ran. Re-running the review
+(`/sat retry`, a re-submission, or the reply-trigger) refreshes both heads, so
+the tag clears once the review is current again.
 
 Default listings (`/sat reviews`, `GET /api/reviews`) exclude archived reviews;
 use `/sat reviews all` / `/sat reviews archived` (or `?archived=1` on the API)
@@ -370,6 +430,104 @@ export SATURNUS_LARK_CLI=lark-cli
 export SATURNUS_LARK_EVENT_KEY=im.message.receive_v1
 export SATURNUS_LARK_AS=bot
 ```
+
+### Group mention gating
+
+In group chats the bot only responds when it is **directly @mentioned** by its
+own `open_id`. `@all` and mentions of other users do **not** trigger it;
+direct (p2p) messages are always handled. The bot's own `open_id` is resolved
+automatically via `bot/v3/info` at startup, or set explicitly:
+
+```sh
+export SATURNUS_LARK_BOT_OPEN_ID=ou_xxx
+```
+
+If the open_id cannot be resolved, group messages are ignored (with a warning
+log) and only p2p messages are answered. The mention metadata is carried by
+the bridge: `im.message.receive_v1` events expose a `mentions` list whose
+`id` is each mentioned user's `open_id` (the special value `all` for
+`@everyone`), and the server compares those ids against the bot's open_id.
+
+### Per-group modes
+
+The bot can behave differently in each group it has joined. The mode is a set
+of `|`-joined capability flags (set with `/sat group mode`, listed with
+`/sat groups`):
+
+- **review** (default): the bot answers direct mentions, runs `/sat` commands
+  and can start PR reviews in the group.
+- **report**: the group is a quiet report channel — the bot stays silent to
+  ordinary messages, and the group is only used to publish periodic reports
+  (message sending from the server is unaffected).
+- **report|review**: quiet for ordinary messages and non-review `/sat`
+  commands, but review requests (a PR URL or `/sat review`/`retry`/`refresh`/
+  `act`/`threads`/`describe`/`reply` with a bot mention) are still acted on.
+
+The mode is persisted in the SQLite store. To set it, either run the command
+**inside** the group (the bot senses the current chat) or pass the `chat_id`
+explicitly from anywhere. Flags are normalized (order and separators do not
+matter):
+
+```text
+/sat group mode report           # inside the target group (mention the bot)
+/sat group mode report oc_xxx    # from any chat, using the group id
+/sat group mode report|review    # quiet group that still runs reviews
+/sat group mode review oc_xxx    # switch a group back to full interactive
+```
+
+`/sat groups` lists every group the bot has joined (via `im/v1/chats`) with its
+mode, so you can pick the `chat_id` for groups you are not currently in. A
+group in report mode ignores everything, including `/sat` commands sent inside
+it, so toggle it back by id from another chat. The bot needs the `im:chat`
+read scope to list and resolve chats.
+
+## Tasks
+
+The Tasks module tracks a feature/effort end to end by binding it to **one
+GitHub issue**, the **local design docs** that define it, and the **PRs** that
+implement it. For every linked PR it tracks progress independently: PR state
+(open/closed/merged), review status, and the Feishu task created for the PR's
+review. Everything is queryable from the bot (`/sat task ...`) and the web UI
+(Tasks panel).
+
+Enable it with:
+
+```sh
+export SATURNUS_TASKS_ENABLED=1
+export SATURNUS_TASKS_GH_CLI=gh            # optional; default gh
+export SATURNUS_REVIEW_REPOS='owner/repo=/path/to/local/checkout,...'   # shared repo whitelist
+make run-server
+```
+
+The repo whitelist is shared with the review module (`SATURNUS_REVIEW_REPOS`):
+only whitelisted repos can host issues, design docs and PRs.
+
+Workflow:
+
+```text
+/sat task create https://github.com/acme/foo/issues/42   # bind the issue
+/sat task add-doc <task_id> acme/foo:docs/plan/feature.md  # attach a design doc
+/sat task add-pr <task_id> https://github.com/acme/foo/pull/5  # attach a PR
+/sat task refresh <task_id>     # re-sync issue/PR/review/Feishu-task state
+/sat task <task_id>             # show the full picture
+```
+
+Per-PR progress is tracked **standalone**: each `task_prs` row keeps its own
+snapshot of PR state, review status, and Feishu task id/url. The snapshot is
+copied from the linked `review_requests` row when a review exists (via
+`review_id`), so it never depends on a live review lookup to render. Attaching a
+PR never starts a review; use `/sat review <pr-url>` as usual, then refresh the
+task to pick up the review status and its Feishu task.
+
+Environment variables:
+
+| variable | default | note |
+|---|---|---|
+| `SATURNUS_TASKS_ENABLED` | 0 | master switch; set to `1` to enable |
+| `SATURNUS_TASKS_GH_CLI` | gh | GitHub CLI for issue/PR resolution |
+| `SATURNUS_REVIEW_REPOS` | - | shared repo whitelist `owner/repo=/local/path,...` |
+
+See `docs/plan/tasks.md` for the full design.
 
 ## Codex Hook Direction
 

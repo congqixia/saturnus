@@ -186,6 +186,150 @@ func larkErrorDetail(raw []byte) string {
 	return "body=" + strconv.Quote(body)
 }
 
+// TaskList is a Feishu task group (任务分组) a task can be filed under.
+type TaskList struct {
+	GUID string `json:"guid"`
+	Name string `json:"name"`
+}
+
+// EnsureTaskList returns the task group with the given name, creating it when
+// it does not exist (searched by name first to avoid duplicates). Requires the
+// task:tasklist:read/write scopes.
+func (c *Client) EnsureTaskList(name string) (TaskList, error) {
+	if !c.Enabled() {
+		return TaskList{}, errors.New("lark client disabled")
+	}
+	if name == "" {
+		return TaskList{}, errors.New("empty tasklist name")
+	}
+	token, err := c.tenantToken()
+	if err != nil {
+		return TaskList{}, err
+	}
+	pageToken := ""
+	for {
+		u := "https://open.feishu.cn/open-apis/task/v2/tasklists?page_size=100"
+		if pageToken != "" {
+			u += "&page_token=" + url.QueryEscape(pageToken)
+		}
+		req, err := http.NewRequest(http.MethodGet, u, nil)
+		if err != nil {
+			return TaskList{}, err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return TaskList{}, err
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode >= 300 {
+			return TaskList{}, fmt.Errorf("lark list tasklists failed: %s (%s)", resp.Status, larkErrorDetail(raw))
+		}
+		var out struct {
+			Code int    `json:"code"`
+			Msg  string `json:"msg"`
+			Data struct {
+				Items     []TaskList `json:"items"`
+				PageToken string     `json:"page_token"`
+				HasMore   bool       `json:"has_more"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(raw, &out); err != nil {
+			return TaskList{}, err
+		}
+		if out.Code != 0 {
+			return TaskList{}, fmt.Errorf("lark list tasklists failed: %s", out.Msg)
+		}
+		for _, item := range out.Data.Items {
+			if item.Name == name {
+				return item, nil
+			}
+		}
+		if !out.Data.HasMore || out.Data.PageToken == "" {
+			break
+		}
+		pageToken = out.Data.PageToken
+	}
+	payload := map[string]any{"name": name}
+	body, _ := json.Marshal(payload)
+	req, err := http.NewRequest(http.MethodPost, "https://open.feishu.cn/open-apis/task/v2/tasklists", bytes.NewReader(body))
+	if err != nil {
+		return TaskList{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return TaskList{}, err
+	}
+	defer resp.Body.Close()
+	createdRaw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return TaskList{}, fmt.Errorf("lark create tasklist failed: %s (%s)", resp.Status, larkErrorDetail(createdRaw))
+	}
+	var created struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			TaskList TaskList `json:"tasklist"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(createdRaw, &created); err != nil {
+		return TaskList{}, err
+	}
+	if created.Code != 0 {
+		return TaskList{}, fmt.Errorf("lark create tasklist failed: %s", created.Msg)
+	}
+	if created.Data.TaskList.GUID == "" {
+		return TaskList{}, errors.New("lark create tasklist: no guid in response")
+	}
+	return created.Data.TaskList, nil
+}
+
+// AddTaskToList files an existing task under a task group (tasklist).
+func (c *Client) AddTaskToList(taskGUID, taskListGUID string) error {
+	if !c.Enabled() {
+		return errors.New("lark client disabled")
+	}
+	if taskGUID == "" || taskListGUID == "" {
+		return errors.New("empty task/tasklist guid")
+	}
+	token, err := c.tenantToken()
+	if err != nil {
+		return err
+	}
+	payload := map[string]any{"tasklist_guid": taskListGUID}
+	body, _ := json.Marshal(payload)
+	u := "https://open.feishu.cn/open-apis/task/v2/tasks/" + url.PathEscape(taskGUID) + "/add_tasklist?user_id_type=open_id"
+	req, err := http.NewRequest(http.MethodPost, u, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("lark add task to tasklist failed: %s (%s)", resp.Status, larkErrorDetail(raw))
+	}
+	var out struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return err
+	}
+	if out.Code != 0 {
+		return fmt.Errorf("lark add task to tasklist failed: %s", out.Msg)
+	}
+	return nil
+}
+
 // Task is the subset of a Feishu task v2 object the server cares about.
 type Task struct {
 	GUID        string
@@ -325,6 +469,193 @@ func truncateRunes(s string, max int) string {
 		return s
 	}
 	return string(r[:max])
+}
+
+// BotInfo is the identity of the current app's bot, resolved from
+// bot/v3/info.
+type BotInfo struct {
+	OpenID string
+	Name   string
+}
+
+// BotInfo resolves the app bot's own open_id via bot/v3/info. The bot
+// object is tolerated at both "bot" (classic shape) and "data.bot", since
+// the endpoint's nesting has varied. It is used to detect whether a group
+// message directly mentions the bot.
+func (c *Client) BotInfo() (BotInfo, error) {
+	if !c.Enabled() {
+		return BotInfo{}, errors.New("lark client disabled")
+	}
+	token, err := c.tenantToken()
+	if err != nil {
+		return BotInfo{}, err
+	}
+	req, err := http.NewRequest(http.MethodGet, "https://open.feishu.cn/open-apis/bot/v3/info", nil)
+	if err != nil {
+		return BotInfo{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return BotInfo{}, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return BotInfo{}, fmt.Errorf("lark bot info failed: %s (%s)", resp.Status, larkErrorDetail(raw))
+	}
+	var out struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Bot  struct {
+			OpenID  string `json:"open_id"`
+			AppName string `json:"app_name"`
+		} `json:"bot"`
+		Data struct {
+			Bot struct {
+				OpenID  string `json:"open_id"`
+				AppName string `json:"app_name"`
+			} `json:"bot"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return BotInfo{}, err
+	}
+	if out.Code != 0 {
+		return BotInfo{}, fmt.Errorf("lark bot info failed: %s", out.Msg)
+	}
+	bot := out.Bot
+	if bot.OpenID == "" {
+		bot = out.Data.Bot
+	}
+	if bot.OpenID == "" {
+		return BotInfo{}, errors.New("lark bot info: no open_id in response")
+	}
+	return BotInfo{OpenID: bot.OpenID, Name: bot.AppName}, nil
+}
+
+// Chat is the subset of a Feishu chat the server cares about when listing the
+// groups the bot has joined. Group chats are identified by chat_mode
+// ("group"/"topic"); chat_type is only present on the single-chat response and
+// uses different values (e.g. "private"), so it is not a reliable discriminator.
+type Chat struct {
+	ChatID   string `json:"chat_id"`
+	Name     string `json:"name"`
+	ChatMode string `json:"chat_mode"`
+}
+
+// IsGroupChat reports whether the chat is a multi-member group (a normal
+// group or a topic group).
+func (ch Chat) IsGroupChat() bool {
+	switch ch.ChatMode {
+	case "group", "topic":
+		return true
+	}
+	return false
+}
+
+// IsKnownNonGroup reports whether the chat is definitely not a group. An empty
+// chat_mode means the type is unknown, which is treated as not-non-group so
+// validation stays lenient.
+func (ch Chat) IsKnownNonGroup() bool {
+	return ch.ChatMode != "" && !ch.IsGroupChat()
+}
+
+// ListChats returns the chats the bot is a member of, following pagination.
+func (c *Client) ListChats() ([]Chat, error) {
+	if !c.Enabled() {
+		return nil, errors.New("lark client disabled")
+	}
+	token, err := c.tenantToken()
+	if err != nil {
+		return nil, err
+	}
+	var chats []Chat
+	pageToken := ""
+	for {
+		u := "https://open.feishu.cn/open-apis/im/v1/chats?page_size=100"
+		if pageToken != "" {
+			u += "&page_token=" + url.QueryEscape(pageToken)
+		}
+		req, err := http.NewRequest(http.MethodGet, u, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		if resp.StatusCode >= 300 {
+			return nil, fmt.Errorf("lark list chats failed: %s (%s)", resp.Status, larkErrorDetail(body))
+		}
+		var out struct {
+			Code int    `json:"code"`
+			Msg  string `json:"msg"`
+			Data struct {
+				Items     []Chat `json:"items"`
+				PageToken string `json:"page_token"`
+				HasMore   bool   `json:"has_more"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(body, &out); err != nil {
+			return nil, err
+		}
+		if out.Code != 0 {
+			return nil, fmt.Errorf("lark list chats failed: %s", out.Msg)
+		}
+		chats = append(chats, out.Data.Items...)
+		if !out.Data.HasMore || out.Data.PageToken == "" {
+			break
+		}
+		pageToken = out.Data.PageToken
+	}
+	return chats, nil
+}
+
+// GetChat fetches one chat the bot can see. It is used to validate an
+// explicit chat_id given outside the chat (e.g. when setting a group mode).
+func (c *Client) GetChat(chatID string) (Chat, error) {
+	if !c.Enabled() {
+		return Chat{}, errors.New("lark client disabled")
+	}
+	token, err := c.tenantToken()
+	if err != nil {
+		return Chat{}, err
+	}
+	req, err := http.NewRequest(http.MethodGet, "https://open.feishu.cn/open-apis/im/v1/chats/"+url.PathEscape(chatID), nil)
+	if err != nil {
+		return Chat{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return Chat{}, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return Chat{}, fmt.Errorf("lark get chat failed: %s (%s)", resp.Status, larkErrorDetail(raw))
+	}
+	var out struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			Chat Chat `json:"chat"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return Chat{}, err
+	}
+	if out.Code != 0 {
+		return Chat{}, fmt.Errorf("lark get chat failed: %s", out.Msg)
+	}
+	return out.Data.Chat, nil
 }
 
 type ContactUser struct {

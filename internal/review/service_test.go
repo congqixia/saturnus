@@ -59,6 +59,67 @@ func TestServiceSubmitFlow(t *testing.T) {
 	}
 }
 
+func TestServiceSubmitAttributedRequester(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	svc := New(st, lark.New(lark.Config{}), Config{
+		Enabled:      true,
+		AllowedUsers: []string{"ou_admin"},
+		Repos:        map[string]string{"a/b": t.TempDir()},
+	})
+	req, err := svc.Submit(MessageContext{
+		Text:            "review https://github.com/a/b/pull/9 @zhang",
+		ChatID:          "oc_chat",
+		MessageID:       "om_1",
+		SenderOpenID:    "ou_admin",
+		RequesterOpenID: "ou_zhang",
+		MentionNames:    map[string]string{"ou_zhang": "张三"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.RequesterOpenID != "ou_zhang" {
+		t.Fatalf("requester open_id = %q, want ou_zhang", req.RequesterOpenID)
+	}
+	if req.RequesterName != "张三" {
+		t.Fatalf("requester name = %q, want 张三", req.RequesterName)
+	}
+}
+
+func TestServiceSubmitWithoutAttributionUsesSender(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	svc := New(st, lark.New(lark.Config{}), Config{
+		Enabled:      true,
+		AllowedUsers: []string{"ou_admin"},
+		Repos:        map[string]string{"a/b": t.TempDir()},
+	})
+	req, err := svc.Submit(MessageContext{
+		Text:         "review https://github.com/a/b/pull/10",
+		ChatID:       "oc_chat",
+		MessageID:    "om_2",
+		SenderOpenID: "ou_admin",
+		SenderName:   "Admin",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.RequesterOpenID != "ou_admin" {
+		t.Fatalf("requester open_id = %q, want ou_admin", req.RequesterOpenID)
+	}
+	if req.RequesterName != "Admin" {
+		t.Fatalf("requester name = %q, want Admin", req.RequesterName)
+	}
+}
+
 func TestServiceSubmitRejectsUnauthorizedAndDisabled(t *testing.T) {
 	st, err := store.Open(t.TempDir() + "/saturnus.db")
 	if err != nil {
@@ -439,13 +500,15 @@ func TestFormatResultFallsBackToRawSummary(t *testing.T) {
 }
 
 type fakeLark struct {
-	enabled     bool
-	task        lark.Task
-	sent        []string
-	chatSent    []string
-	taskUpdates []string
-	userName    string
-	userCalls   int
+	enabled      bool
+	task         lark.Task
+	sent         []string
+	chatSent     []string
+	taskUpdates  []string
+	replies      []string
+	tasklistAdds []string
+	userName     string
+	userCalls    int
 }
 
 func (f *fakeLark) Enabled() bool { return f.enabled }
@@ -479,7 +542,63 @@ func (f *fakeLark) UpdateTask(taskGUID string, input lark.UpdateTaskInput) error
 	f.taskUpdates = append(f.taskUpdates, fmt.Sprintf("%s|completed=%v|%s", taskGUID, completed, desc))
 	return nil
 }
-func (f *fakeLark) ReplyMessage(_, _ string) error { return nil }
+func (f *fakeLark) ReplyMessage(id, text string) error {
+	f.replies = append(f.replies, id+": "+text)
+	return nil
+}
+
+func (f *fakeLark) EnsureTaskList(name string) (lark.TaskList, error) {
+	return lark.TaskList{GUID: "tkl_group", Name: name}, nil
+}
+
+func (f *fakeLark) AddTaskToList(taskGUID, taskListGUID string) error {
+	f.tasklistAdds = append(f.tasklistAdds, taskGUID+"->"+taskListGUID)
+	return nil
+}
+
+func TestCreateTaskFilesUnderTaskGroup(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	fake := &fakeLark{enabled: true, task: lark.Task{GUID: "t_1", URL: "https://task"}}
+	svc := New(st, fake, Config{
+		Enabled: true, AllowedUsers: []string{"ou_me"},
+		Repos:      map[string]string{"a/b": t.TempDir()},
+		CreateTask: true, TaskGroup: "SaturnusReview",
+	})
+	if _, err := svc.Submit(MessageContext{
+		Text: "review https://github.com/a/b/pull/1", ChatID: "oc_c", MessageID: "om_1", SenderOpenID: "ou_me",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.tasklistAdds) != 1 || !strings.HasPrefix(fake.tasklistAdds[0], "t_1->tkl_group") {
+		t.Fatalf("tasklist adds = %v, want [t_1->tkl_group]", fake.tasklistAdds)
+	}
+}
+
+func TestCreateTaskFilesUnderPinnedGroup(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	fake := &fakeLark{enabled: true, task: lark.Task{GUID: "t_2", URL: "https://task"}}
+	svc := New(st, fake, Config{
+		Enabled: true, AllowedUsers: []string{"ou_me"},
+		Repos:      map[string]string{"a/b": t.TempDir()},
+		CreateTask: true, TaskGroupID: "tkl_pinned",
+	})
+	if _, err := svc.Submit(MessageContext{
+		Text: "review https://github.com/a/b/pull/2", ChatID: "oc_c", MessageID: "om_2", SenderOpenID: "ou_me",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.tasklistAdds) != 1 || !strings.HasPrefix(fake.tasklistAdds[0], "t_2->tkl_pinned") {
+		t.Fatalf("tasklist adds = %v, want [t_2->tkl_pinned]", fake.tasklistAdds)
+	}
+}
 
 func TestMaybeCreateTaskNotifiesRequester(t *testing.T) {
 	st, err := store.Open(t.TempDir() + "/saturnus.db")
@@ -755,6 +874,52 @@ func retryService(t *testing.T, st *store.Store, gh string) *Service {
 	}
 }
 
+func TestSetRequester(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	newReviewForRetry(t, st, "rvw_req", "succeeded", "abc123", "ses_1", "")
+
+	svc := retryService(t, st, "")
+	req, err := svc.SetRequester("rvw_req", "ou_new", "New User")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.RequesterOpenID != "ou_new" || req.RequesterName != "New User" {
+		t.Fatalf("requester = %s (%s), want ou_new (New User)", req.RequesterOpenID, req.RequesterName)
+	}
+	// Persisted.
+	got, err := svc.Get("rvw_req")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RequesterOpenID != "ou_new" || got.RequesterName != "New User" {
+		t.Fatalf("persisted requester = %s (%s)", got.RequesterOpenID, got.RequesterName)
+	}
+
+	if _, err := svc.SetRequester("rvw_missing", "ou_x", ""); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+	if _, err := svc.SetRequester("rvw_req", "", ""); err == nil {
+		t.Fatal("expected error for empty open_id")
+	}
+}
+
+func TestSetRequesterRejectsArchived(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	newReviewForRetry(t, st, "rvw_arch", "archived", "abc123", "ses_1", "")
+	svc := retryService(t, st, "")
+	if _, err := svc.SetRequester("rvw_arch", "ou_new", "New"); !errors.Is(err, ErrArchived) {
+		t.Fatalf("expected ErrArchived, got %v", err)
+	}
+}
+
 func TestRetryFailedAlwaysReruns(t *testing.T) {
 	st, err := store.Open(t.TempDir() + "/saturnus.db")
 	if err != nil {
@@ -812,6 +977,107 @@ func TestRetrySucceededHeadChangedReruns(t *testing.T) {
 	}
 	if !strings.Contains(req.RetryReason, "head changed") {
 		t.Fatalf("unexpected retry_reason: %q", req.RetryReason)
+	}
+}
+
+func TestRetryOnReplyHeadChangedRerunsAndNotifies(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	newReviewForRetry(t, st, "rvw_reply", "succeeded", "abc123", "ses_1", "")
+	fk := &fakeLark{enabled: true, userName: "Me"}
+	svc := &Service{
+		store: st,
+		lark:  fk,
+		cfg: Config{
+			Enabled:        true,
+			AllowedUsers:   []string{"ou_me"},
+			Repos:          map[string]string{"a/b": t.TempDir()},
+			GHCli:          fakeGHCli(t, "def456"),
+			ReviewerOpenID: "ou_reviewer",
+		},
+	}
+	req, retried, err := svc.RetryOnReply(MessageContext{
+		ChatID:        "oc_c",
+		RootMessageID: "om_1",
+		MessageID:     "om_reply",
+		SenderOpenID:  "ou_me",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !retried {
+		t.Fatal("expected retry when PR head moved")
+	}
+	if req.Status != "pending" {
+		t.Fatalf("expected pending, got %s", req.Status)
+	}
+	if !strings.Contains(req.RetryReason, "reply in review thread") {
+		t.Fatalf("unexpected retry_reason: %q", req.RetryReason)
+	}
+	// Reviewer notified via DM.
+	foundReviewer := false
+	for _, s := range fk.sent {
+		if strings.Contains(s, "ou_reviewer") && strings.Contains(s, req.ID) {
+			foundReviewer = true
+		}
+	}
+	if !foundReviewer {
+		t.Fatalf("reviewer not notified: %v", fk.sent)
+	}
+	// Requester acknowledged in-thread.
+	if len(fk.replies) == 0 {
+		t.Fatal("expected in-thread reply to the requester")
+	}
+}
+
+func TestRetryOnReplyHeadUnchangedNoRerun(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	newReviewForRetry(t, st, "rvw_nochange", "succeeded", "abc123", "ses_1", "")
+	fk := &fakeLark{enabled: true}
+	svc := &Service{
+		store: st,
+		lark:  fk,
+		cfg: Config{
+			Enabled:        true,
+			AllowedUsers:   []string{"ou_me"},
+			Repos:          map[string]string{"a/b": t.TempDir()},
+			GHCli:          fakeGHCli(t, "abc123"),
+			ReviewerOpenID: "ou_reviewer",
+		},
+	}
+	_, retried, err := svc.RetryOnReply(MessageContext{
+		ChatID:        "oc_c",
+		RootMessageID: "om_1",
+		MessageID:     "om_reply",
+		SenderOpenID:  "ou_me",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retried {
+		t.Fatal("expected no retry when PR head unchanged")
+	}
+	if len(fk.sent) != 0 || len(fk.replies) != 0 {
+		t.Fatalf("expected no notifications when head unchanged, sent=%v replies=%v", fk.sent, fk.replies)
+	}
+}
+
+func TestRetryOnReplyNoReviewInThread(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	svc := retryService(t, st, "")
+	if _, _, err := svc.RetryOnReply(MessageContext{ChatID: "oc_other", RootMessageID: "om_none"}); err == nil {
+		t.Fatal("expected error when no review is rooted at the reply thread")
 	}
 }
 
@@ -1454,6 +1720,67 @@ func newRefreshReview(t *testing.T, st *store.Store, id, status, taskID string) 
 		RequesterOpenID: "ou_me", TaskID: taskID, TaskURL: "https://task.example/t/" + taskID,
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestReviewOutdatedAndFormatting(t *testing.T) {
+	outdated := store.ReviewRequest{ID: "rvw_o", Status: "succeeded", HeadCommit: "abc123", PrHeadCommit: "def456"}
+	if !ReviewOutdated(outdated) {
+		t.Fatal("expected outdated when PR head moved past the reviewed head")
+	}
+	current := store.ReviewRequest{ID: "rvw_c", Status: "succeeded", HeadCommit: "abc123", PrHeadCommit: "abc123"}
+	if ReviewOutdated(current) {
+		t.Fatal("expected not outdated when heads match")
+	}
+	noBaseline := store.ReviewRequest{ID: "rvw_n", Status: "pending"}
+	if ReviewOutdated(noBaseline) {
+		t.Fatal("expected not outdated without head baselines")
+	}
+
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	svc := retryService(t, st, "")
+	if !strings.Contains(svc.FormatOne(outdated), "OUTDATED") {
+		t.Fatalf("FormatOne missing OUTDATED: %q", svc.FormatOne(outdated))
+	}
+	if !strings.Contains(svc.FormatOne(outdated), "pr_head=def456 (outdated)") {
+		t.Fatalf("FormatOne missing pr_head detail: %q", svc.FormatOne(outdated))
+	}
+	if strings.Contains(svc.FormatOne(current), "OUTDATED") {
+		t.Fatalf("FormatOne wrongly flags current review: %q", svc.FormatOne(current))
+	}
+	if !strings.Contains(svc.FormatList([]store.ReviewRequest{outdated}), "OUTDATED") {
+		t.Fatalf("FormatList missing OUTDATED: %q", svc.FormatList([]store.ReviewRequest{outdated}))
+	}
+}
+
+func TestRefreshRecordsPRHeadCommit(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	newReviewForRetry(t, st, "rvw_ref", "succeeded", "oldhead", "ses_1", "")
+
+	svc := retryService(t, st, fakeGHRefresh(t, "OPEN", "[]"))
+	req, res, err := svc.Refresh("rvw_ref", MessageContext{SenderOpenID: "ou_me"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.PRState != "OPEN" {
+		t.Fatalf("pr state = %q, want OPEN", res.PRState)
+	}
+	if req.PrHeadCommit != "abc123" {
+		t.Fatalf("pr_head_commit = %q, want abc123 (from gh)", req.PrHeadCommit)
+	}
+	if req.HeadCommit != "oldhead" {
+		t.Fatalf("head_commit = %q, want oldhead (last reviewed head unchanged)", req.HeadCommit)
+	}
+	if !ReviewOutdated(req) {
+		t.Fatal("expected the review to be flagged OUTDATED after refresh found a newer head")
 	}
 }
 

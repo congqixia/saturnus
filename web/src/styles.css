@@ -252,6 +252,31 @@ pre {
   overflow: auto;
 }
 
+.task-docs,
+.task-prs {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid #e4e7ec;
+  border-radius: 6px;
+}
+
+.task-docs strong,
+.task-prs strong {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+
+.task-docs ul {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.task-docs li {
+  margin: 3px 0;
+  font-size: 12px;
+}
+
 @media (max-width: 860px) {
   .main {
     display: block;

@@ -83,6 +83,43 @@ func TestIsAllDigits(t *testing.T) {
 	}
 }
 
+func TestChatGroupDetection(t *testing.T) {
+	// The list endpoint identifies groups via chat_mode ("group"/"topic"),
+	// not chat_type (which is absent on list items and "private" on single
+	// chats). Parse a realistic list payload and verify the filter.
+	var out struct {
+		Items []Chat `json:"items"`
+	}
+	raw := []byte(`{"items":[
+		{"chat_id":"oc_a","name":"Team Milvus I","chat_mode":"group"},
+		{"chat_id":"oc_b","name":"Topic Group","chat_mode":"topic"},
+		{"chat_id":"oc_c","name":"Private Group","chat_mode":"private"}
+	]}`)
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatal(err)
+	}
+	groups := []string{}
+	for _, ch := range out.Items {
+		if ch.IsGroupChat() {
+			groups = append(groups, ch.ChatID)
+		}
+	}
+	if len(groups) != 2 || groups[0] != "oc_a" || groups[1] != "oc_b" {
+		t.Fatalf("groups = %v, want [oc_a oc_b]", groups)
+	}
+	if !out.Items[2].IsKnownNonGroup() {
+		t.Fatal("expected chat_mode=private to be a known non-group")
+	}
+	// An empty/unknown chat_mode is treated leniently: not a known non-group.
+	var unknown Chat
+	if unknown.IsKnownNonGroup() {
+		t.Fatal("expected unknown chat_mode to not be a known non-group")
+	}
+	if unknown.IsGroupChat() {
+		t.Fatal("expected unknown chat_mode to not be a group")
+	}
+}
+
 func TestLarkErrorDetail(t *testing.T) {
 	got := larkErrorDetail([]byte(`{"code":1470400,"msg":"invalid params"}`))
 	if !strings.Contains(got, "1470400") || !strings.Contains(got, "invalid params") {

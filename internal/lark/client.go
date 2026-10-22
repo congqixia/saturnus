@@ -40,8 +40,16 @@ func (c *Client) Enabled() bool {
 }
 
 func (c *Client) SendText(receiveIDType, receiveID, text string) error {
+	_, err := c.SendTextGetID(receiveIDType, receiveID, text)
+	return err
+}
+
+// SendTextGetID sends a plain text message and returns the created
+// message_id, so the caller can rewrite it in place later (e.g. an ACK that
+// is updated with the final result once a long-running command finishes).
+func (c *Client) SendTextGetID(receiveIDType, receiveID, text string) (string, error) {
 	if !c.Enabled() {
-		return nil
+		return "", nil
 	}
 	payload := map[string]any{
 		"receive_id": receiveID,
@@ -49,7 +57,37 @@ func (c *Client) SendText(receiveIDType, receiveID, text string) error {
 		"content":    mustMarshal(map[string]string{"text": text}),
 	}
 	url := "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=" + receiveIDType
-	return c.postJSON(url, payload)
+	var out struct {
+		Code int `json:"code"`
+		Data struct {
+			MessageID string `json:"message_id"`
+		} `json:"data"`
+	}
+	if err := c.postJSONDecode(url, payload, &out); err != nil {
+		return "", err
+	}
+	if out.Code != 0 {
+		return "", fmt.Errorf("lark send text failed: code=%d", out.Code)
+	}
+	return out.Data.MessageID, nil
+}
+
+// UpdateMessage rewrites the content of a previously sent text message
+// (PUT /im/v1/messages/:message_id). Feishu only allows editing text/post
+// messages sent by the app itself, up to 20 times per message.
+func (c *Client) UpdateMessage(messageID, text string) error {
+	if !c.Enabled() {
+		return nil
+	}
+	if messageID == "" {
+		return errors.New("empty message id")
+	}
+	payload := map[string]any{
+		"msg_type": "text",
+		"content":  mustMarshal(map[string]string{"text": text}),
+	}
+	url := "https://open.feishu.cn/open-apis/im/v1/messages/" + url.PathEscape(messageID)
+	return c.sendJSON(http.MethodPut, url, payload)
 }
 
 func (c *Client) SendTextToUser(openID, text string) error {
@@ -139,9 +177,21 @@ func (c *Client) postJSON(url string, payload any) error {
 	return c.sendJSON(http.MethodPost, url, payload)
 }
 
+// postJSONDecode issues a POST request and decodes the response body into out.
+func (c *Client) postJSONDecode(url string, payload any, out any) error {
+	return c.sendJSONDecode(http.MethodPost, url, payload, out)
+}
+
 // sendJSON issues a JSON request with the tenant token. Empty payloads are
 // allowed (e.g. a PATCH with an empty object).
 func (c *Client) sendJSON(method, url string, payload any) error {
+	return c.sendJSONDecode(method, url, payload, nil)
+}
+
+// sendJSONDecode issues a JSON request with the tenant token and, when out is
+// non-nil, decodes the response body into it. Empty payloads are allowed (e.g.
+// a PATCH with an empty object).
+func (c *Client) sendJSONDecode(method, url string, payload any, out any) error {
 	token, err := c.tenantToken()
 	if err != nil {
 		return err
@@ -158,9 +208,14 @@ func (c *Client) sendJSON(method, url string, payload any) error {
 		return err
 	}
 	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 300 {
-		raw, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("lark api failed: %s (%s)", resp.Status, larkErrorDetail(raw))
+	}
+	if out != nil {
+		if err := json.Unmarshal(raw, out); err != nil {
+			return err
+		}
 	}
 	return nil
 }

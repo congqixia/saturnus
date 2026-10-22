@@ -972,6 +972,15 @@ func TestSatCommandTokenMatch(t *testing.T) {
 	}
 }
 
+func TestAckMessagesIncludeCommand(t *testing.T) {
+	if got := ackText("/sat refresh all"); !strings.Contains(got, "/sat refresh all") {
+		t.Fatalf("ack text should echo the command, got %q", got)
+	}
+	if got := ackDoneText("/sat refresh all"); !strings.Contains(got, "/sat refresh all") {
+		t.Fatalf("done text should echo the command, got %q", got)
+	}
+}
+
 func newTasksTestServer(t *testing.T, repos map[string]string) (*server, *store.Store) {
 	t.Helper()
 	st, err := store.Open(t.TempDir() + "/saturnus.db")

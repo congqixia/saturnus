@@ -429,7 +429,18 @@ export SATURNUS_SERVER=http://localhost:8787
 export SATURNUS_LARK_CLI=lark-cli
 export SATURNUS_LARK_EVENT_KEY=im.message.receive_v1
 export SATURNUS_LARK_AS=bot
+export SATURNUS_LARK_POST_TIMEOUT=5m   # max time to wait for the server's /lark/events response
 ```
+
+Some `/sat` commands (e.g. `/sat refresh all`) run long enough that the sender
+would otherwise wait without knowing whether the server received the command.
+The bot therefore sends an ACK text message as soon as a `/sat` command is
+received ("Command received, processing: ..."), then rewrites that same message
+in place with the result once the command finishes (Feishu lets apps edit their
+own text messages). Card replies are delivered as a separate card message and
+the ACK is updated to a short "Done: ..." summary. This uses
+`PUT /im/v1/messages/:message_id`, so the app needs the `im:message` /
+`im:message:send_as_bot` scope (already implied by sending messages).
 
 ### Group mention gating
 

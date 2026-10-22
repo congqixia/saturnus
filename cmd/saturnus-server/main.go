@@ -553,8 +553,34 @@ func (s *server) larkEvents(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 		return
 	}
+	// ACK first: some commands (e.g. /sat refresh all) can take minutes, and
+	// without an immediate reply the sender cannot tell whether the server
+	// received the command or is just down. The ACK text message is then
+	// rewritten in place with the final result (Feishu allows editing text
+	// messages), or marked done when the reply is delivered as a card.
+	ackID, ackErr := s.lark.SendTextGetID("chat_id", msg.ChatID, ackText(command))
 	reply := s.handleBotCommand(command, msg)
-	s.sendReply(msg, reply)
+	switch {
+	case ackErr != nil || ackID == "":
+		// ACK could not be sent; fall back to the plain reply path.
+		s.sendReply(msg, reply)
+	case reply.table == nil && reply.md == nil:
+		// Plain-text result: turn the ACK into the answer. If the in-place
+		// update fails, send the reply as a fresh message instead.
+		if reply.text != "" && s.lark.UpdateMessage(ackID, reply.text) == nil {
+			break
+		}
+		_ = s.lark.UpdateMessage(ackID, ackDoneText(command))
+		if reply.text != "" {
+			s.sendReply(msg, reply)
+		}
+	default:
+		// Card result: mark the ACK as done and deliver the card separately.
+		_ = s.lark.UpdateMessage(ackID, ackDoneText(command))
+		if !s.sendCard(msg, reply) {
+			s.sendReply(msg, reply)
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "reply": reply.text})
 }
 
@@ -806,6 +832,42 @@ func (s *server) sendReply(msg review.MessageContext, reply botReply) {
 			log.Printf("send text to %s: %v", msg.ChatID, err)
 		}
 	}
+}
+
+// sendCard delivers only the card part of a reply (table or markdown), falling
+// back to nothing. It reports whether the card was sent, so the caller can
+// decide whether a text fallback is still needed.
+func (s *server) sendCard(msg review.MessageContext, reply botReply) bool {
+	if msg.ChatID == "" {
+		return false
+	}
+	if reply.table != nil {
+		if err := s.lark.SendTable("chat_id", msg.ChatID, *reply.table); err == nil {
+			return true
+		} else {
+			log.Printf("send card to %s: %v", msg.ChatID, err)
+		}
+	}
+	if reply.md != nil {
+		if err := s.lark.SendMarkdownCard("chat_id", msg.ChatID, *reply.md); err == nil {
+			return true
+		} else {
+			log.Printf("send card to %s: %v", msg.ChatID, err)
+		}
+	}
+	return false
+}
+
+// ackText is the immediate "command received, executing" message sent before a
+// /sat command runs. It is later rewritten in place with the result.
+func ackText(command string) string {
+	return "Command received, processing: " + command + "\nI'll update this message with the result when it's done."
+}
+
+// ackDoneText is the summary the ACK message is rewritten to when the reply is
+// delivered as a card (so the card, not the ACK, carries the details).
+func ackDoneText(command string) string {
+	return "Done: " + command
 }
 
 func optionTag(text, color string) map[string]any {

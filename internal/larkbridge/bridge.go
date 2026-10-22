@@ -20,6 +20,7 @@ type Config struct {
 	EventKey     string
 	Identity     string
 	ReadyTimeout time.Duration
+	PostTimeout  time.Duration
 	MaxEvents    string
 	Timeout      string
 }
@@ -31,6 +32,7 @@ func DefaultConfig() Config {
 		EventKey:     env("SATURNUS_LARK_EVENT_KEY", "im.message.receive_v1"),
 		Identity:     env("SATURNUS_LARK_AS", "bot"),
 		ReadyTimeout: envDuration("SATURNUS_LARK_READY_TIMEOUT", 30*time.Second),
+		PostTimeout:  envDuration("SATURNUS_LARK_POST_TIMEOUT", 5*time.Minute),
 		MaxEvents:    os.Getenv("SATURNUS_LARK_MAX_EVENTS"),
 		Timeout:      os.Getenv("SATURNUS_LARK_CONSUME_TIMEOUT"),
 	}
@@ -43,9 +45,12 @@ type Bridge struct {
 
 func New(cfg Config) *Bridge {
 	cfg.ServerURL = strings.TrimRight(cfg.ServerURL, "/")
+	if cfg.PostTimeout <= 0 {
+		cfg.PostTimeout = 5 * time.Minute
+	}
 	return &Bridge{
 		cfg:  cfg,
-		http: &http.Client{Timeout: 10 * time.Second},
+		http: &http.Client{Timeout: cfg.PostTimeout},
 	}
 }
 

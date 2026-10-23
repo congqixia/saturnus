@@ -771,3 +771,188 @@ func TestStoreTasksFlow(t *testing.T) {
 		t.Fatalf("expected ErrNotFound for unknown task, got %v", err)
 	}
 }
+
+func TestStoreStructuredReviewResult(t *testing.T) {
+	st, err := Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	thread, err := st.GetOrCreateReviewThread("oc_chat", "om_root", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := st.CreateReview(ReviewRequest{
+		ThreadID: thread.ID, PRURL: "https://github.com/a/b/pull/1",
+		Repo: "a/b", PRNumber: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := st.CreateReviewRun(ReviewRun{ReviewID: req.ID, Status: "running", Tool: "opencode"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The POST writes verdict/summary via a targeted update.
+	if err := st.SetReviewResult(req.ID, "request_change", "Fixes the restore race."); err != nil {
+		t.Fatal(err)
+	}
+	// A concurrent progress flush must not clobber it.
+	if err := st.UpdateReviewProgress(req.ID, "progress..."); err != nil {
+		t.Fatal(err)
+	}
+	// The terminal outcome update must not clobber it either.
+	completed := time.Now().UTC()
+	if err := st.UpdateReviewOutcome(req.ID, "succeeded", "full transcript", "", completed); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.GetReview(req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Verdict != "request_change" || got.Summary != "Fixes the restore race." {
+		t.Fatalf("verdict/summary clobbered by progress/outcome writes: %#v", got)
+	}
+	if got.Status != "succeeded" || got.ResultText != "full transcript" || got.CompletedAt.IsZero() {
+		t.Fatalf("outcome not persisted: %#v", got)
+	}
+
+	// Findings are persisted (upsert) and tied to the run.
+	findings := []ReviewFinding{
+		{Severity: "P0", Path: "a.go", Line: 1, Title: "bug", Message: "msg", Suggestion: "fix"},
+		{Severity: "P2", Path: "b.go", Message: "nit"},
+	}
+	if err := st.SaveFindings(req.ID, run.ID, findings); err != nil {
+		t.Fatal(err)
+	}
+	if got := st.ListFindings(req.ID); len(got) != 2 {
+		t.Fatalf("expected 2 findings, got %#v", got)
+	} else {
+		if got[0].RunID != run.ID || got[0].Line != 1 || got[0].Severity != "P0" {
+			t.Fatalf("finding mismatch: %#v", got[0])
+		}
+		if got[0].Status != "open" || got[0].GithubCommentID != "" {
+			t.Fatalf("new finding should default to open without a comment id: %#v", got[0])
+		}
+	}
+
+	// A new submission adds new findings without discarding the old ones, and
+	// a status update by id updates in place while preserving content.
+	firstID := st.ListFindings(req.ID)[0].ID
+	if err := st.SaveFindings(req.ID, run.ID, []ReviewFinding{
+		{ID: firstID, Status: "addressed"},
+		{Severity: "P1", Path: "c.go", Message: "new"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	after := st.ListFindings(req.ID)
+	if len(after) != 3 {
+		t.Fatalf("expected 3 findings (old kept + new), got %d: %#v", len(after), after)
+	}
+	var updated *ReviewFinding
+	for i := range after {
+		if after[i].ID == firstID {
+			updated = &after[i]
+		}
+	}
+	if updated == nil {
+		t.Fatal("expected the first finding to still exist")
+	}
+	if updated.Status != "addressed" || updated.Path != "a.go" || updated.Message != "msg" {
+		t.Fatalf("status update should change status but preserve content: %#v", updated)
+	}
+
+	// Comment id and status are settable directly.
+	if err := st.SetFindingCommentID(firstID, "123456"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateFindingStatus(firstID, "resolved"); err != nil {
+		t.Fatal(err)
+	}
+	if got := st.ListFindings(req.ID); got[0].GithubCommentID != "123456" || got[0].Status != "resolved" {
+		t.Fatalf("comment id / status not persisted: %#v", got[0])
+	}
+
+	// Updating a finding that belongs to another review is rejected.
+	other, err := st.CreateReview(ReviewRequest{
+		ThreadID: thread.ID, PRURL: "https://github.com/a/b/pull/2",
+		Repo: "a/b", PRNumber: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveFindings(other.ID, "", []ReviewFinding{{ID: firstID, Status: "commented"}}); err == nil {
+		t.Fatal("expected error when updating a finding of another review")
+	}
+
+	// The run preserves the verdict/summary of its result.
+	runs := st.ListRuns(req.ID)
+	if len(runs) != 1 || runs[0].Verdict != "" {
+		t.Fatalf("run verdict/summary not updated by finish path: %#v", runs)
+	}
+	run2 := runs[0]
+	run2.Verdict = "request_change"
+	run2.Summary = "Fixes the restore race."
+	if err := st.UpdateReviewRun(run2); err != nil {
+		t.Fatal(err)
+	}
+	runs = st.ListRuns(req.ID)
+	if runs[0].Verdict != "request_change" || runs[0].Summary != "Fixes the restore race." {
+		t.Fatalf("run verdict/summary not persisted: %#v", runs[0])
+	}
+}
+
+func TestStoreCommentsPostedMarker(t *testing.T) {
+	st, err := Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	thread, err := st.GetOrCreateReviewThread("oc_chat", "om_root", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := st.CreateReview(ReviewRequest{
+		ThreadID: thread.ID, PRURL: "https://github.com/a/b/pull/1",
+		Repo: "a/b", PRNumber: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetReview(req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.CommentsPostedAt.IsZero() {
+		t.Fatalf("expected zero comments_posted_at initially, got %v", got.CommentsPostedAt)
+	}
+
+	when := time.Now().UTC()
+	if err := st.SetCommentsPosted(req.ID, when); err != nil {
+		t.Fatal(err)
+	}
+	got, err = st.GetReview(req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CommentsPostedAt.IsZero() || !got.CommentsPostedAt.Equal(when) {
+		t.Fatalf("comments_posted_at not persisted: %#v", got)
+	}
+
+	// A full UpdateReview with a zero marker clears it (re-run path).
+	got.CommentsPostedAt = time.Time{}
+	if _, err := st.UpdateReview(got); err != nil {
+		t.Fatal(err)
+	}
+	got, err = st.GetReview(req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.CommentsPostedAt.IsZero() {
+		t.Fatalf("expected comments_posted_at cleared by re-run update, got %v", got.CommentsPostedAt)
+	}
+}

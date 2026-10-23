@@ -1963,3 +1963,488 @@ func TestFormatRefreshResult(t *testing.T) {
 		t.Fatalf("FormatRefreshAll missing info:\n%s", sweep)
 	}
 }
+
+func newReviewingReview(t *testing.T, st *store.Store, id string) store.ReviewRequest {
+	t.Helper()
+	thread, err := st.GetOrCreateReviewThread("oc_c", "om_1", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := st.CreateReview(store.ReviewRequest{
+		ID: id, ThreadID: thread.ID, Status: "reviewing",
+		PRURL: "https://github.com/a/b/pull/1", Repo: "a/b", PRNumber: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateReviewRun(store.ReviewRun{ReviewID: req.ID, Status: "running", Tool: "opencode"}); err != nil {
+		t.Fatal(err)
+	}
+	return req
+}
+
+func TestIngestResultPersistsStructuredResult(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	newReviewingReview(t, st, "rvw_ingest")
+
+	svc := New(st, &fakeLark{enabled: true}, Config{Enabled: true})
+	if err := svc.IngestResult("rvw_ingest", "request_change", "Fixes the restore race.", []Finding{
+		{Severity: "p0", Path: "internal/etcd_restore.go", Line: 40, Title: "data race", Message: "shared err var", Suggestion: "use a channel"},
+		{Severity: "P2", Path: "internal/foo.go", Line: 5, Title: "nit", Message: "unused import", Suggestion: "remove it"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := svc.Get("rvw_ingest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Verdict != "request_change" || got.Summary != "Fixes the restore race." {
+		t.Fatalf("verdict/summary not stored: %#v", got)
+	}
+	findings := svc.ListFindings("rvw_ingest")
+	if len(findings) != 2 {
+		t.Fatalf("expected 2 findings, got %#v", findings)
+	}
+	if findings[0].Severity != "P0" || findings[0].Path != "internal/etcd_restore.go" || findings[0].Line != 40 {
+		t.Fatalf("finding #0 mismatch: %#v", findings[0])
+	}
+	if findings[0].RunID == "" {
+		t.Fatalf("finding not tied to the running run: %#v", findings[0])
+	}
+	if findings[1].Severity != "P2" || findings[1].Suggestion != "remove it" {
+		t.Fatalf("finding #1 mismatch: %#v", findings[1])
+	}
+}
+
+func TestIngestResultPersistsFindingsAcrossRounds(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	newReviewingReview(t, st, "rvw_repl")
+
+	svc := New(st, &fakeLark{enabled: true}, Config{Enabled: true})
+	if err := svc.IngestResult("rvw_repl", "lgtm", "all good", []Finding{
+		{Severity: "P0", Path: "a.go", Line: 1, Message: "old finding"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	first := svc.ListFindings("rvw_repl")
+	if len(first) != 1 {
+		t.Fatalf("expected 1 finding after first ingest, got %d", len(first))
+	}
+	firstID := first[0].ID
+
+	// A later round updates the first finding's status by id and adds a new one;
+	// the old finding must persist (not be replaced away).
+	if err := svc.IngestResult("rvw_repl", "nit_comments", "mostly good", []Finding{
+		{ID: firstID, Status: "addressed"},
+		{Severity: "P2", Path: "b.go", Line: 5, Message: "new finding"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	findings := svc.ListFindings("rvw_repl")
+	if len(findings) != 2 {
+		t.Fatalf("expected 2 findings (old + new), got %d: %#v", len(findings), findings)
+	}
+	if findings[0].ID != firstID || findings[0].Status != "addressed" {
+		t.Fatalf("first finding status not updated: %#v", findings[0])
+	}
+	if findings[1].ID == firstID || findings[1].Status != "open" {
+		t.Fatalf("new finding should be open: %#v", findings[1])
+	}
+}
+
+func TestIngestResultValidation(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	newReviewingReview(t, st, "rvw_val")
+
+	svc := New(st, &fakeLark{enabled: true}, Config{Enabled: true})
+	badVerdict := func() error { return svc.IngestResult("rvw_val", "approve", "summary", nil) }
+	if err := badVerdict(); err == nil || !strings.Contains(err.Error(), "invalid verdict") {
+		t.Fatalf("expected invalid-verdict error, got %v", err)
+	}
+	emptySummary := func() error { return svc.IngestResult("rvw_val", "lgtm", "  ", nil) }
+	if err := emptySummary(); err == nil || !strings.Contains(err.Error(), "summary is required") {
+		t.Fatalf("expected empty-summary error, got %v", err)
+	}
+	badSeverity := func() error {
+		return svc.IngestResult("rvw_val", "lgtm", "summary", []Finding{{Severity: "P5", Path: "a.go", Message: "m"}})
+	}
+	if err := badSeverity(); err == nil || !strings.Contains(err.Error(), "invalid severity") {
+		t.Fatalf("expected invalid-severity error, got %v", err)
+	}
+	emptyPath := func() error {
+		return svc.IngestResult("rvw_val", "lgtm", "summary", []Finding{{Severity: "P0", Message: "m"}})
+	}
+	if err := emptyPath(); err == nil || !strings.Contains(err.Error(), "empty path") {
+		t.Fatalf("expected empty-path error, got %v", err)
+	}
+	if _, err := svc.Get("rvw_val"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIngestResultRejectsWrongStateAndDisabled(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	newReviewingReview(t, st, "rvw_state")
+
+	disabled := New(st, &fakeLark{enabled: true}, Config{Enabled: false})
+	if err := disabled.IngestResult("rvw_state", "lgtm", "s", nil); err == nil {
+		t.Fatal("expected disabled error")
+	}
+
+	// Mark the review finished with a verdict already recorded: a second
+	// submission is rejected so a late duplicate cannot clobber the result.
+	svc := New(st, &fakeLark{enabled: true}, Config{Enabled: true})
+	if err := svc.IngestResult("rvw_state", "lgtm", "s", nil); err != nil {
+		t.Fatal(err)
+	}
+	req, err := st.GetReview("rvw_state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Status = "succeeded"
+	if _, err := st.UpdateReview(req); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.IngestResult("rvw_state", "lgtm", "s", nil); err == nil || !strings.Contains(err.Error(), "already has a structured result") {
+		t.Fatalf("expected duplicate-result rejection, got %v", err)
+	}
+
+	// Missing review -> ErrNotFound.
+	if err := svc.IngestResult("rvw_missing", "lgtm", "s", nil); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestFormatFindingsAndStructuredFormatResult(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	newReviewingReview(t, st, "rvw_fmt")
+
+	svc := New(st, &fakeLark{enabled: true}, Config{Enabled: true})
+	if err := svc.IngestResult("rvw_fmt", "request_change", "Fixes the restore race.", []Finding{
+		{Severity: "P0", Path: "internal/etcd_restore.go", Line: 40, Title: "data race", Message: "shared err var", Suggestion: "use a channel"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req, err := svc.Get("rvw_fmt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Status = "succeeded"
+	if _, err := st.UpdateReview(req); err != nil {
+		t.Fatal(err)
+	}
+
+	got := svc.FormatResult(req)
+	for _, want := range []string{"Verdict: Request change", "Fixes the restore race.", "Findings:", "[P0] data race (internal/etcd_restore.go:40)", "Fix: use a channel"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("FormatResult missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "REVIEW SUMMARY:") {
+		t.Fatalf("FormatResult should prefer the structured result, not the text summary:\n%s", got)
+	}
+
+	// FormatFindings with an empty slice renders nothing.
+	if rendered := FormatFindings(nil); rendered != "" {
+		t.Fatalf("expected empty findings render, got %q", rendered)
+	}
+}
+
+func TestPostPRInlineComments(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	newReviewingReview(t, st, "rvw_post")
+
+	gh := (&fakeGHPost{}).ghScript(t)
+	log := filepath.Join(t.TempDir(), "gh.log")
+	t.Setenv("FGH_LOG", log)
+
+	svc := New(st, &fakeLark{enabled: true}, Config{
+		Enabled: true, GHCli: gh,
+		PostInlineComments:    true,
+		PostInlineMinSeverity: "P1",
+	})
+	if err := svc.IngestResult("rvw_post", "request_change", "Fixes the restore race.", []Finding{
+		{Severity: "P0", Path: "internal/etcd_restore.go", Line: 40, Title: "data race", Message: "shared err var", Suggestion: "use a channel"},
+		{Severity: "P1", Path: "internal/foo.go", Line: 5, Title: "lost update", Message: "update can be lost"},
+		{Severity: "P2", Path: "internal/nit.go", Line: 2, Title: "style", Message: "reorder imports"},
+		{Severity: "P1", Path: "internal/outofdiff.go", Line: 0, Title: "no line", Message: "needs a line"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req, err := svc.Get("rvw_post")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Status = "succeeded"
+	req.HeadCommit = "abc1234"
+	if _, err := st.UpdateReview(req); err != nil {
+		t.Fatal(err)
+	}
+
+	posted, err := svc.PostPRInlineComments(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if posted != 2 {
+		t.Fatalf("expected 2 inline comments (P0+P1), got %d", posted)
+	}
+
+	data, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("expected 3 gh calls (2 comments + 1 review), got %d: %#v", len(lines), lines)
+	}
+	var comments int
+	var reviewLine string
+	for _, line := range lines {
+		parts := strings.SplitN(line, " ", 3)
+		if strings.HasSuffix(parts[1], "/comments") {
+			comments++
+			if !strings.Contains(parts[2], `"line":40`) && !strings.Contains(parts[2], `"line":5`) {
+				t.Fatalf("unexpected inline comment payload: %q", parts[2])
+			}
+			if strings.Contains(parts[2], "nit.go") {
+				t.Fatalf("P2 finding should be skipped: %q", parts[2])
+			}
+			if strings.Contains(parts[2], "outofdiff") {
+				t.Fatalf("finding without line should be skipped: %q", parts[2])
+			}
+		}
+		if strings.HasSuffix(parts[1], "/reviews") {
+			reviewLine = parts[2]
+		}
+	}
+	if comments != 2 {
+		t.Fatalf("expected 2 inline comments, got %d", comments)
+	}
+	if !strings.Contains(reviewLine, `"event":"REQUEST_CHANGES"`) {
+		t.Fatalf("verdict not mapped to review event: %q", reviewLine)
+	}
+	if !strings.Contains(reviewLine, "Fixes the restore race.") {
+		t.Fatalf("summary not carried into the review: %q", reviewLine)
+	}
+}
+
+func TestPostPRInlineCommentsGating(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	newReviewingReview(t, st, "rvw_gate")
+
+	svc := New(st, &fakeLark{enabled: true}, Config{Enabled: true, GHCli: "gh"})
+	if err := svc.IngestResult("rvw_gate", "lgtm", "all good", nil); err != nil {
+		t.Fatal(err)
+	}
+	req, err := svc.Get("rvw_gate")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// No verdict -> no-op (regardless of the PostInlineComments flag).
+	req.Verdict = ""
+	if posted, err := svc.PostPRInlineComments(req); err != nil || posted != 0 {
+		t.Fatalf("expected no-op without verdict, got posted=%d err=%v", posted, err)
+	}
+
+	// Verdict set but no gh cli -> failure surfaced.
+	req.Verdict = "lgtm"
+	if posted, err := svc.PostPRInlineComments(req); err == nil {
+		t.Fatalf("expected gh failure surfaced (no gh stub), got posted=%d err=%v", posted, err)
+	}
+}
+
+func TestPostCommentsManualTrigger(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	newReviewingReview(t, st, "rvw_manual")
+
+	gh := (&fakeGHPost{}).ghScript(t)
+	log := filepath.Join(t.TempDir(), "gh.log")
+	t.Setenv("FGH_LOG", log)
+
+	svc := New(st, &fakeLark{enabled: true}, Config{Enabled: true, GHCli: gh, PostInlineComments: true})
+	if err := svc.IngestResult("rvw_manual", "nit_comments", "mostly fine", []Finding{
+		{Severity: "P2", Path: "a.go", Line: 3, Title: "nit", Message: "reorder imports"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req, err := svc.Get("rvw_manual")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Status = "succeeded"
+	if _, err := st.UpdateReview(req); err != nil {
+		t.Fatal(err)
+	}
+
+	// Trigger the manual publish path (feature was "off" for the auto path, but
+	// PostComments works regardless of PostInlineComments flag since it is an
+	// explicit reviewer action).
+	posted, err := svc.PostComments("rvw_manual")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if posted != 1 {
+		t.Fatalf("expected 1 inline comment, got %d", posted)
+	}
+
+	got, err := svc.Get("rvw_manual")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CommentsPostedAt.IsZero() {
+		t.Fatal("comments_posted_at not recorded after successful publish")
+	}
+
+	// Re-triggering is refused so no duplicates are posted.
+	if _, err := svc.PostComments("rvw_manual"); err == nil || !strings.Contains(err.Error(), "already posted") {
+		t.Fatalf("expected already-posted refusal, got %v", err)
+	}
+}
+
+func TestPostCommentsRejectsInvalid(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	newReviewingReview(t, st, "rvw_manual2")
+	newRefreshReview(t, st, "rvw_arch", "archived", "")
+
+	svc := New(st, &fakeLark{enabled: true}, Config{Enabled: true, GHCli: "gh"})
+	// No verdict yet.
+	if _, err := svc.PostComments("rvw_manual2"); err == nil || !strings.Contains(err.Error(), "no structured verdict") {
+		t.Fatalf("expected no-verdict error, got %v", err)
+	}
+	// Archived review.
+	if _, err := svc.PostComments("rvw_arch"); !errors.Is(err, ErrArchived) {
+		t.Fatalf("expected ErrArchived, got %v", err)
+	}
+	// Missing review.
+	if _, err := svc.PostComments("rvw_missing"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+	// Disabled service.
+	disabled := New(st, &fakeLark{enabled: true}, Config{Enabled: false})
+	if _, err := disabled.PostComments("rvw_manual2"); err == nil {
+		t.Fatal("expected disabled error")
+	}
+}
+
+// fakeGHPostResolve writes a combined "gh" stub handling inline comment POSTs,
+// the verdict review POST and the two GraphQL calls of ResolveInlineComment.
+// The inline comment and review POSTs read stdin and answer with the given id.
+func fakeGHPostResolve(t *testing.T, commentID string) string {
+	t.Helper()
+	script := filepath.Join(t.TempDir(), "gh")
+	lookup := `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"T_1","isResolved":false,"comments":{"nodes":[{"databaseId":` + commentID + `}]}}]}}}}}`
+	content := `#!/bin/sh
+case "$*" in
+  *pulls/*/comments*) cat >/dev/null; printf '%s\n' '{"id":` + commentID + `}' ;;
+  *pulls/*/reviews*) cat >/dev/null; printf '%s\n' '{"id":99}' ;;
+  *reviewThreads*) printf '%s\n' '` + lookup + `' ;;
+  *resolveReviewThread*) printf '%s\n' '{"data":{"resolveReviewThread":{"thread":{"id":"T_1","isResolved":true}}}' ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac
+`
+	if err := os.WriteFile(script, []byte(content), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return script
+}
+
+func TestPostPRInlineCommentsRecordsIDsAndResolvesAddressed(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	newReviewingReview(t, st, "rvw_resolve")
+
+	svc := New(st, &fakeLark{enabled: true}, Config{Enabled: true, GHCli: fakeGHPostResolve(t, "123456"), PostInlineComments: true})
+	if err := svc.IngestResult("rvw_resolve", "request_change", "needs work", []Finding{
+		{Severity: "P0", Path: "a.go", Line: 1, Message: "blocking bug"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	firstID := svc.ListFindings("rvw_resolve")[0].ID
+	// Pretend round 1 already posted this finding's inline comment.
+	if err := st.SetFindingCommentID(firstID, "123456"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Round 2: the old finding is addressed, a new one is introduced.
+	if err := svc.IngestResult("rvw_resolve", "nit_comments", "addressed, one nit left", []Finding{
+		{ID: firstID, Status: "addressed"},
+		{Severity: "P2", Path: "b.go", Line: 5, Message: "new nit"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req, err := svc.Get("rvw_resolve")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Status = "succeeded"
+	req.HeadCommit = "abc1234"
+	if _, err := st.UpdateReview(req); err != nil {
+		t.Fatal(err)
+	}
+
+	posted, err := svc.PostPRInlineComments(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One new inline comment (b.go); the addressed one is resolved, not re-posted.
+	if posted != 1 {
+		t.Fatalf("expected 1 new inline comment, got %d", posted)
+	}
+
+	findings := svc.ListFindings("rvw_resolve")
+	var oldF, newF *store.ReviewFinding
+	for i := range findings {
+		if findings[i].ID == firstID {
+			oldF = &findings[i]
+		} else {
+			newF = &findings[i]
+		}
+	}
+	if oldF == nil || oldF.Status != "resolved" || oldF.GithubCommentID != "123456" {
+		t.Fatalf("addressed finding should be resolved with its comment id kept: %#v", oldF)
+	}
+	if newF == nil || newF.GithubCommentID == "" {
+		t.Fatalf("new finding should have its comment id recorded: %#v", newF)
+	}
+}

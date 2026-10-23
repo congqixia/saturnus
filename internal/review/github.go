@@ -3,6 +3,7 @@ package review
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -67,6 +68,188 @@ func ResolvePRReviews(ctx context.Context, ghCLI, repo string, num int) []PRRevi
 func IsGitDir(path string) bool {
 	info, err := os.Stat(filepath.Join(path, ".git"))
 	return err == nil && info.IsDir()
+}
+
+// InlineComment is one inline review comment to post on a PR at a specific
+// path:line of the diff.
+type InlineComment struct {
+	Path string
+	Line int
+	Body string
+}
+
+// PostInlineComment posts a single inline review comment on the PR head at
+// path:line via `gh api`. The line must be part of the PR diff (added line or
+// within a hunk's context); otherwise GitHub rejects it and the error is
+// returned so callers can skip that finding without failing the review. On
+// success it returns the GitHub comment id, which uniquely identifies the
+// comment (used later to resolve the thread when the finding is addressed).
+func PostInlineComment(ctx context.Context, ghCLI, repo string, num int, headCommit string, c InlineComment) (string, error) {
+	if ghCLI == "" || c.Path == "" || c.Line <= 0 {
+		return "", errors.New("cannot post inline comment: gh cli, path and line are required")
+	}
+	payload := map[string]any{
+		"body": c.Body,
+		"path": c.Path,
+		"line": c.Line,
+		"side": "RIGHT",
+	}
+	if headCommit != "" {
+		payload["commit_id"] = headCommit
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	cmd := exec.CommandContext(ctx, ghCLI, "api",
+		fmt.Sprintf("repos/%s/pulls/%d/comments", repo, num),
+		"--method", "POST", "--input", "-",
+	)
+	cmd.Stdin = strings.NewReader(string(raw))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("post inline comment %s:%d: %w: %s", c.Path, c.Line, err, strings.TrimSpace(string(out)))
+	}
+	var resp struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal(out, &resp); err != nil || resp.ID == 0 {
+		return "", fmt.Errorf("post inline comment %s:%d: no id in gh response: %s", c.Path, c.Line, strings.TrimSpace(string(out)))
+	}
+	return strconv.FormatInt(resp.ID, 10), nil
+}
+
+// ResolveInlineComment resolves the GitHub review thread for a previously
+// posted inline comment. There is no REST endpoint for thread resolution, so
+// this uses the GraphQL API: it locates the thread whose comments include the
+// given comment databaseId and runs resolveReviewThread. Already-resolved or
+// missing threads are treated as no-ops.
+func ResolveInlineComment(ctx context.Context, ghCLI, repo string, num int, commentID string) error {
+	if ghCLI == "" || commentID == "" {
+		return errors.New("cannot resolve inline comment: gh cli and comment id are required")
+	}
+	owner, name := splitRepo(repo)
+
+	findQuery := `query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100) {
+        nodes {
+          id
+          isResolved
+          comments(first: 100) { nodes { databaseId } }
+        }
+      }
+    }
+  }
+}`
+	cmd := exec.CommandContext(ctx, ghCLI, "api", "graphql",
+		"-f", "query="+findQuery,
+		"-F", "owner="+owner,
+		"-F", "name="+name,
+		"-F", "number="+strconv.Itoa(num),
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("find review thread for comment %s: %w: %s", commentID, err, strings.TrimSpace(string(out)))
+	}
+	var resp struct {
+		Data struct {
+			Repository struct {
+				PullRequest struct {
+					ReviewThreads struct {
+						Nodes []struct {
+							ID         string `json:"id"`
+							IsResolved bool   `json:"isResolved"`
+							Comments   struct {
+								Nodes []struct {
+									DatabaseID int64 `json:"databaseId"`
+								} `json:"nodes"`
+							} `json:"comments"`
+						} `json:"nodes"`
+					} `json:"reviewThreads"`
+				} `json:"pullRequest"`
+			} `json:"repository"`
+		} `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if err := json.Unmarshal(out, &resp); err != nil {
+		return fmt.Errorf("parse review thread lookup: %w", err)
+	}
+	if len(resp.Errors) > 0 {
+		return fmt.Errorf("find review thread: %s", resp.Errors[0].Message)
+	}
+	var threadID string
+	for _, t := range resp.Data.Repository.PullRequest.ReviewThreads.Nodes {
+		if t.IsResolved {
+			continue
+		}
+		for _, c := range t.Comments.Nodes {
+			if strconv.FormatInt(c.DatabaseID, 10) == commentID {
+				threadID = t.ID
+				break
+			}
+		}
+		if threadID != "" {
+			break
+		}
+	}
+	if threadID == "" {
+		// Thread not found or already resolved; nothing to do.
+		return nil
+	}
+
+	resolveQuery := `mutation($threadId: ID!) {
+  resolveReviewThread(input: {threadId: $threadId}) {
+    thread { id isResolved }
+  }
+}`
+	cmd = exec.CommandContext(ctx, ghCLI, "api", "graphql",
+		"-f", "query="+resolveQuery,
+		"-F", "threadId="+threadID,
+	)
+	out, err = cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("resolve review thread for comment %s: %w: %s", commentID, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// splitRepo splits an "owner/name" repo string into its two parts.
+func splitRepo(repo string) (string, string) {
+	parts := strings.SplitN(repo, "/", 2)
+	if len(parts) != 2 {
+		return repo, ""
+	}
+	return parts[0], parts[1]
+}
+
+// PostPRReview submits a formal PR review via `gh api`. event is one of
+// APPROVE / REQUEST_CHANGES / COMMENT; body is the general review comment.
+func PostPRReview(ctx context.Context, ghCLI, repo string, num int, event, body string) error {
+	if ghCLI == "" {
+		return errors.New("cannot post review: gh cli required")
+	}
+	payload := map[string]any{
+		"event": event,
+		"body":  body,
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	cmd := exec.CommandContext(ctx, ghCLI, "api",
+		fmt.Sprintf("repos/%s/pulls/%d/reviews", repo, num),
+		"--method", "POST", "--input", "-",
+	)
+	cmd.Stdin = strings.NewReader(string(raw))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("post PR review %s: %w: %s", event, err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 // OpenPR is one open pull request as reported by `gh pr list`. The BaseBranch

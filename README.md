@@ -109,6 +109,7 @@ Supported text commands:
 - `/sat review <pr-url> @user` — start the review but attribute the requester to the @mentioned user (e.g. when the request came to you by DM instead of the bot). `@all` and the bot itself are ignored; for chats where the user can't be @mentioned (e.g. a p2p chat with the bot) pass the open_id instead: `/sat review <pr-url> ou_xxx`
 - `/sat review <review_id>`
 - `/sat retry <review_id>` — retry a failed review, or re-run a successful one after its PR head commit moved
+- `/sat post <review_id>` — publish a review's findings as GitHub inline comments (plus the verdict review); for reviews whose findings were never posted (feature off at the time, or a posting failure)
 - `/sat refresh <review_id|all>` — re-sync PR/task state: archive merged/closed PRs (and complete their task), restore reopened PRs, append new reviewer comments to the task
 - `/sat act <review_id> <instruction>` — resume the review's tool session to act on the PR (e.g. post inline comments for selected issues, work out concrete code for an issue); the agent output is sent back to the chat
 - `/sat threads <review_id>` — list every chat thread a review was requested in
@@ -181,6 +182,10 @@ Environment variables:
 | `SATURNUS_REVIEW_TASK_GROUP_ID` | - | pin an existing task group by guid, bypassing the name lookup/create |
 | `SATURNUS_REVIEW_LOG_DIR` | `<tmp>/saturnus-review-logs` | per-review transcript logs |
 | `SATURNUS_REVIEW_GUIDES` | - | per-repo review guide files: `owner/repo=/path/to/guide.txt,...` |
+| `SATURNUS_REVIEW_RESULT_API_URL` | - | callback the review tool POSTs the structured result to (see below); may contain `{review_id}`, e.g. `http://127.0.0.1:8787/api/reviews/{review_id}/result` |
+| `SATURNUS_REVIEW_RESULT_TOKEN` | - | optional bearer token the result endpoint requires; echoed into the tool prompt so the POST can authenticate |
+| `SATURNUS_REVIEW_POST_INLINE_COMMENTS` | 0 | post the review findings as GitHub inline comments + a formal PR review (event mapped from the verdict) once the review succeeds; requires `gh` |
+| `SATURNUS_REVIEW_POST_INLINE_MIN_SEVERITY` | P2 | lowest finding severity posted as an inline comment: `P2` = all, `P1` = only P0/P1 |
 
 While a review is running, the tool output is streamed: the accumulated text is
 flushed into `result_text` roughly every 5 seconds (poll
@@ -189,12 +194,90 @@ transcript is written to `<SATURNUS_REVIEW_LOG_DIR>/<review_id>.log`. The
 review detail (and the bot result message) includes the `log=` path.
 
 Result messages sent to the reviewer contain a concise conclusion, not the raw
-log: the tool is asked to end with a structured `REVIEW SUMMARY:` block split
-into `PR summary`, `Issues`, and `Review suggestions` (verdict: LGTM / concrete
-changes / design or refactor), and the message renders those three sections
-(falling back to a short excerpt when the tool omits them). ANSI color codes are
-stripped from `result_text` and messages; the transcript log keeps the raw
-output.
+log. When `SATURNUS_REVIEW_RESULT_API_URL` is set, the review prompt asks the
+tool to POST a machine-readable result to that endpoint (with the `{review_id}`
+placeholder substituted and the token in `Authorization: Bearer <token>`) in
+addition to printing the text `REVIEW SUMMARY:` block. The POST body is:
+
+```json
+{
+  "verdict": "lgtm" | "request_change" | "nit_comments",
+  "summary": "2-3 sentence summary of the PR and the review",
+  "findings": [
+    {
+      "id": "fnd_... (prior finding id, only for status updates)",
+      "status": "open" | "addressed" | "commented",
+      "severity": "P0" | "P1" | "P2",
+      "path": "repo-relative file path",
+      "line": 1,
+      "title": "short title",
+      "message": "why it matters",
+      "suggestion": "how to fix (optional)"
+    }
+  ]
+}
+```
+
+`verdict` is the PR opinion: `lgtm` (approve as-is), `request_change` (one or
+more blocking issues), `nit_comments` (no blockers, but P2 comments).
+`findings` grade each concrete issue: `P0` = must fix before merge
+(correctness / security / data loss), `P1` = should fix before merge
+(significant bug or design flaw), `P2` = nice-to-have or nit. The server
+validates the submission (`POST /api/reviews/{review_id}/result`, 401 without
+the token, 409 when the review is not running) and persists the verdict,
+summary and findings. The result message, the `/sat describe review` card and
+the web UI then render the verdict and the P0-P2 findings directly; without a
+submitted result the message falls back to the text `REVIEW SUMMARY:` block
+(`PR summary` / `Issues` / `Review suggestions`). ANSI color codes are stripped
+from `result_text` and messages; the transcript log keeps the raw output.
+
+### Finding status across review rounds
+
+Findings are persistent per review, not replaced on retry. When a review is
+retried/continued, the previous findings (with their ids, severity, location,
+status and message) are injected into the tool prompt; the tool references each
+one by id in the result and reports a new status instead of re-creating it:
+
+- `open` — still an issue,
+- `addressed` — the new PR head fixes it,
+- `commented` — acknowledged, no code change needed.
+
+New findings are submitted without an `id` (they default to `open`). On the
+next round a finding can also be resolved on GitHub (see below). The status is
+shown in `/sat describe review` and the web UI.
+
+### Posting findings to GitHub
+
+When `SATURNUS_REVIEW_POST_INLINE_COMMENTS=1` and a review finishes with a
+structured verdict, the server publishes the result back on the PR via `gh`
+(needs `gh` authenticated with repo scope, same host credentials as the
+existing `gh` uses):
+
+- Each finding with a concrete `path` + `line` and severity at or above
+  `SATURNUS_REVIEW_POST_INLINE_MIN_SEVERITY` is posted as an inline comment on
+  the PR head (`POST /repos/{owner}/{repo}/pulls/{n}/comments`). A finding
+  whose line is not part of the PR diff is skipped with a logged error instead
+  of failing the review. The returned GitHub comment id is stored on the
+  finding (`github_comment_id`) so a later round can resolve it.
+- A formal PR review is submitted whose event maps from the verdict —
+  `lgtm` → `APPROVE`, `request_change` → `REQUEST_CHANGES`,
+  `nit_comments` → `COMMENT` — with the summary as the review body.
+
+On retry rounds, findings that already have a recorded comment are not
+re-posted (no duplicates); instead, a finding the tool marked `addressed` has
+its inline comment thread resolved on GitHub (via the GraphQL API,
+best-effort) and its status becomes `resolved`.
+
+Posting is best-effort: failures are logged and the local review still
+succeeds. Since a re-run only happens after the PR head moves, comments are not
+duplicated by retries.
+
+The publish timestamp is stored (`comments_posted_at`, shown in `/sat review
+<id>`, `/sat describe review`, and the web UI). Findings that were never posted
+— e.g. reviews that finished before this feature was enabled, or a posting
+failure — can be published retroactively with `/sat post <review_id>` (or
+`POST /api/reviews/{review_id}/post-comments`). Re-triggering a review whose
+findings were already posted is refused, so comments are never duplicated.
 
 Repeated submissions of the same PR reuse one review record (and thread):
 an active one is reported as already in progress. Each run records the PR head

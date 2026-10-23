@@ -98,6 +98,8 @@ func run(ctx context.Context, addr, data, staticDir string) (err error) {
 	mux.HandleFunc("GET /api/reviews", s.listReviews)
 	mux.HandleFunc("GET /api/reviews/{review_id}", s.getReview)
 	mux.HandleFunc("POST /api/reviews", s.createReview)
+	mux.HandleFunc("POST /api/reviews/{review_id}/result", s.submitReviewResult)
+	mux.HandleFunc("POST /api/reviews/{review_id}/post-comments", s.postReviewComments)
 	mux.HandleFunc("GET /api/tasks", s.listTasks)
 	mux.HandleFunc("GET /api/tasks/{task_id}", s.getTask)
 	mux.HandleFunc("POST /api/tasks", s.createTask)
@@ -339,7 +341,77 @@ func (s *server) getReview(w http.ResponseWriter, r *http.Request) {
 	if err := s.reviews.ResolveRequesterName(&req); err != nil {
 		logRequesterResolveFailure(req, err)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"review": req, "runs": s.reviews.ListRuns(req.ID), "reactions": s.reviews.ListReactions(req.ID), "threads": s.reviews.ListThreads(req.ID)})
+	writeJSON(w, http.StatusOK, map[string]any{"review": req, "runs": s.reviews.ListRuns(req.ID), "reactions": s.reviews.ListReactions(req.ID), "threads": s.reviews.ListThreads(req.ID), "findings": s.reviews.ListFindings(req.ID)})
+}
+
+// submitReviewResult receives the machine-readable review result the review
+// tool POSTs while a review runs (the endpoint is advertised in the tool's
+// prompt). When SATURNUS_REVIEW_RESULT_TOKEN is set, the request must carry
+// it as "Authorization: Bearer <token>". The body is validated and persisted
+// as the review's verdict, summary and findings.
+func (s *server) submitReviewResult(w http.ResponseWriter, r *http.Request) {
+	if s.reviews == nil || !s.reviews.Enabled() {
+		writeError(w, http.StatusServiceUnavailable, errors.New("review service is disabled"))
+		return
+	}
+	if token := s.reviews.ResultToken(); token != "" {
+		if !bearerMatches(r, token) {
+			writeError(w, http.StatusUnauthorized, errors.New("invalid or missing review result token"))
+			return
+		}
+	}
+	var body struct {
+		Verdict  string           `json:"verdict"`
+		Summary  string           `json:"summary"`
+		Findings []review.Finding `json:"findings"`
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	if err := s.reviews.IngestResult(r.PathValue("review_id"), body.Verdict, body.Summary, body.Findings); err != nil {
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			writeStoreError(w, err)
+		case strings.Contains(err.Error(), "not running"), strings.Contains(err.Error(), "already has a structured result"):
+			writeError(w, http.StatusConflict, err)
+		default:
+			writeError(w, http.StatusBadRequest, err)
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// postReviewComments manually publishes a review's findings (and verdict
+// review) to the PR as GitHub inline comments. It is the recovery path for
+// reviews whose findings were never posted when they finished.
+func (s *server) postReviewComments(w http.ResponseWriter, r *http.Request) {
+	if s.reviews == nil || !s.reviews.Enabled() {
+		writeError(w, http.StatusServiceUnavailable, errors.New("review service is disabled"))
+		return
+	}
+	posted, err := s.reviews.PostComments(r.PathValue("review_id"))
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			writeStoreError(w, err)
+		case errors.Is(err, review.ErrArchived):
+			writeError(w, http.StatusConflict, err)
+		case strings.Contains(err.Error(), "already posted"):
+			writeError(w, http.StatusConflict, err)
+		default:
+			writeError(w, http.StatusBadRequest, err)
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "posted": posted})
+}
+
+// bearerMatches reports whether the request's Authorization header carries the
+// expected bearer token.
+func bearerMatches(r *http.Request, token string) bool {
+	auth := r.Header.Get("Authorization")
+	return auth == "Bearer "+token
 }
 
 func (s *server) createReview(w http.ResponseWriter, r *http.Request) {
@@ -644,7 +716,7 @@ func isReviewRequest(text string) bool {
 	fields := strings.Fields(strings.TrimSpace(text))
 	if len(fields) >= 2 && fields[0] == "/sat" {
 		switch fields[1] {
-		case "review", "retry", "refresh", "act", "threads", "describe", "reply":
+		case "review", "retry", "refresh", "act", "threads", "describe", "reply", "post":
 			return true
 		}
 	}
@@ -895,6 +967,20 @@ func statusColor(status string) string {
 
 func statusOption(status string) any {
 	return optionTag(status, statusColor(status))
+}
+
+// reviewVerdictTag renders a structured review verdict as a colored tag for
+// the describe card: lgtm green, request_change red, nit_comments grey.
+func reviewVerdictTag(verdict string) string {
+	label := map[string]string{
+		"lgtm":           "LGTM",
+		"request_change": "Request change",
+		"nit_comments":   "Nit comments",
+	}[verdict]
+	if label == "" {
+		label = verdict
+	}
+	return "`" + label + "`"
 }
 
 func riskOption(risk string) any {
@@ -1629,7 +1715,7 @@ func (s *server) describeReviewReply(id string) botReply {
 	if err := s.reviews.ResolveRequesterName(&req); err != nil {
 		logRequesterResolveFailure(req, err)
 	}
-	content := formatReviewMarkdown(req, s.reviews.Tool())
+	content := formatReviewMarkdown(req, s.reviews.Tool(), s.reviews.ListFindings(req.ID))
 	if runs := s.reviews.ListRuns(req.ID); len(runs) > 0 {
 		content += "\n\n" + formatReviewRuns(runs)
 	}
@@ -1718,7 +1804,7 @@ func markdownTableCell(s string) string {
 //     progress is visible without scrolling through the whole transcript;
 //   - for a completed review the full REVIEW SUMMARY block is shown instead
 //     (falling back to the output tail when the tool omitted the marker).
-func formatReviewMarkdown(req store.ReviewRequest, tool string) string {
+func formatReviewMarkdown(req store.ReviewRequest, tool string, findings []store.ReviewFinding) string {
 	var b strings.Builder
 	status := req.Status
 	if review.ReviewOutdated(req) {
@@ -1767,11 +1853,43 @@ func formatReviewMarkdown(req store.ReviewRequest, tool string) string {
 			fmt.Fprintf(&b, "**Task**: `%s`\n", req.TaskID)
 		}
 	}
+	if !req.CommentsPostedAt.IsZero() {
+		fmt.Fprintf(&b, "**Comments posted**: %s\n", req.CommentsPostedAt.Local().Format("2006-01-02 15:04:05"))
+	}
 	if req.SessionID != "" {
 		fmt.Fprintf(&b, "**Session**: `%s` (continue: `%s run --session %s`)\n", req.SessionID, tool, req.SessionID)
 	}
 	if req.Error != "" {
 		fmt.Fprintf(&b, "**Error**: %s\n", escapeMarkdown(req.Error))
+	}
+	if req.Verdict != "" {
+		fmt.Fprintf(&b, "**Verdict**: %s\n", reviewVerdictTag(req.Verdict))
+		if req.Summary != "" {
+			fmt.Fprintf(&b, "**Summary**: %s\n", escapeMarkdown(req.Summary))
+		}
+		if len(findings) > 0 {
+			b.WriteString("\n**Findings**:\n")
+			for _, f := range findings {
+				loc := f.Path
+				if f.Line > 0 {
+					loc = fmt.Sprintf("%s:%d", loc, f.Line)
+				}
+				if loc == "" {
+					loc = "-"
+				}
+				title := f.Title
+				if title == "" {
+					title = f.Message
+				}
+				fmt.Fprintf(&b, "- `%s` **%s** (%s)\n", f.Severity, escapeMarkdown(truncateText(title, 200)), escapeMarkdown(loc))
+				if f.Message != "" && f.Message != title {
+					fmt.Fprintf(&b, "  %s\n", escapeMarkdown(truncateText(f.Message, 600)))
+				}
+				if f.Suggestion != "" {
+					fmt.Fprintf(&b, "  Fix: %s\n", escapeMarkdown(truncateText(f.Suggestion, 300)))
+				}
+			}
+		}
 	}
 	if req.ResultText != "" {
 		b.WriteString("\n---\n\n")
@@ -1845,6 +1963,7 @@ var satCommandList = []struct {
 	{"/sat reviews all|archived", "list PR reviews including archived, or only archived"},
 	{"/sat review <pr-url|review_id> [@user]", "start a review (optionally attribute the requester to @user), or show one review by id"},
 	{"/sat retry <review_id>", "retry a failed review, or re-run after the PR head changed"},
+	{"/sat post <review_id>", "publish the review's findings as GitHub inline comments (plus the verdict review); for reviews whose findings were never posted"},
 	{"/sat refresh <review_id|all>", "sync PR/task state: archive merged/closed PRs, complete their task, append reviewer comments to the task"},
 	{"/sat act <review_id> <instruction>", "resume the review session to act on the PR (e.g. inline comments for selected issues, concrete code for an issue)"},
 	{"/sat threads <review_id>", "list all chat threads a review was requested in"},
@@ -2055,6 +2174,15 @@ func (s *server) handleBotCommand(text string, msg review.MessageContext) botRep
 			return botReply{text: "Retry failed: " + err.Error()}
 		}
 		return botReply{text: "Retry started " + req.ID + " (" + req.PRURL + ")"}
+	case "post":
+		if len(fields) < 3 {
+			return botReply{text: "Usage: /sat post <review_id>"}
+		}
+		posted, err := s.reviews.PostComments(fields[2])
+		if err != nil {
+			return botReply{text: "Post comments failed: " + err.Error()}
+		}
+		return botReply{text: fmt.Sprintf("Posted %d inline comment(s) on the PR for review %s (verdict review included).", posted, fields[2])}
 	case "act":
 		if len(fields) < 4 {
 			return botReply{text: "Usage: /sat act <review_id> <instruction>"}
@@ -2173,22 +2301,26 @@ func extractLarkMessage(payload map[string]any) review.MessageContext {
 
 func reviewConfig() review.Config {
 	return review.Config{
-		Enabled:         os.Getenv("SATURNUS_REVIEW_ENABLED") == "1",
-		AllowedUsers:    splitCSV(os.Getenv("SATURNUS_REVIEW_ALLOWED_USERS")),
-		ReviewerOpenID:  os.Getenv("SATURNUS_REVIEW_REVIEWER_OPEN_ID"),
-		ReviewerChatID:  os.Getenv("SATURNUS_REVIEW_REVIEWER_CHAT_ID"),
-		ReplyInThread:   os.Getenv("SATURNUS_REVIEW_REPLY_IN_THREAD") == "1",
-		Repos:           review.ParseRepoMap(os.Getenv("SATURNUS_REVIEW_REPOS")),
-		Guides:          review.ParseRepoMap(os.Getenv("SATURNUS_REVIEW_GUIDES")),
-		Tool:            os.Getenv("SATURNUS_REVIEW_TOOL"),
-		CommandTemplate: os.Getenv("SATURNUS_REVIEW_COMMAND_TEMPLATE"),
-		MaxConcurrent:   envInt("SATURNUS_REVIEW_MAX_CONCURRENT", 1),
-		Timeout:         envDuration("SATURNUS_REVIEW_TIMEOUT", 15*time.Minute),
-		CreateTask:      os.Getenv("SATURNUS_REVIEW_CREATE_TASK") == "1",
-		TaskDueHours:    envInt("SATURNUS_REVIEW_TASK_DUE_HOURS", 24),
-		TaskGroup:       os.Getenv("SATURNUS_REVIEW_TASK_GROUP"),
-		TaskGroupID:     os.Getenv("SATURNUS_REVIEW_TASK_GROUP_ID"),
-		LogDir:          os.Getenv("SATURNUS_REVIEW_LOG_DIR"),
+		Enabled:               os.Getenv("SATURNUS_REVIEW_ENABLED") == "1",
+		AllowedUsers:          splitCSV(os.Getenv("SATURNUS_REVIEW_ALLOWED_USERS")),
+		ReviewerOpenID:        os.Getenv("SATURNUS_REVIEW_REVIEWER_OPEN_ID"),
+		ReviewerChatID:        os.Getenv("SATURNUS_REVIEW_REVIEWER_CHAT_ID"),
+		ReplyInThread:         os.Getenv("SATURNUS_REVIEW_REPLY_IN_THREAD") == "1",
+		Repos:                 review.ParseRepoMap(os.Getenv("SATURNUS_REVIEW_REPOS")),
+		Guides:                review.ParseRepoMap(os.Getenv("SATURNUS_REVIEW_GUIDES")),
+		Tool:                  os.Getenv("SATURNUS_REVIEW_TOOL"),
+		CommandTemplate:       os.Getenv("SATURNUS_REVIEW_COMMAND_TEMPLATE"),
+		MaxConcurrent:         envInt("SATURNUS_REVIEW_MAX_CONCURRENT", 1),
+		Timeout:               envDuration("SATURNUS_REVIEW_TIMEOUT", 15*time.Minute),
+		CreateTask:            os.Getenv("SATURNUS_REVIEW_CREATE_TASK") == "1",
+		TaskDueHours:          envInt("SATURNUS_REVIEW_TASK_DUE_HOURS", 24),
+		TaskGroup:             os.Getenv("SATURNUS_REVIEW_TASK_GROUP"),
+		TaskGroupID:           os.Getenv("SATURNUS_REVIEW_TASK_GROUP_ID"),
+		LogDir:                os.Getenv("SATURNUS_REVIEW_LOG_DIR"),
+		ResultAPIURL:          os.Getenv("SATURNUS_REVIEW_RESULT_API_URL"),
+		ResultToken:           os.Getenv("SATURNUS_REVIEW_RESULT_TOKEN"),
+		PostInlineComments:    os.Getenv("SATURNUS_REVIEW_POST_INLINE_COMMENTS") == "1",
+		PostInlineMinSeverity: os.Getenv("SATURNUS_REVIEW_POST_INLINE_MIN_SEVERITY"),
 	}
 }
 

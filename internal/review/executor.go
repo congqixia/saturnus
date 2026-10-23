@@ -28,6 +28,17 @@ type ToolArgs struct {
 	// RetryNote, when set, replaces the initial review prompt with a
 	// continuation instruction; it is shellquoted into the outer prompt.
 	RetryNote string
+	// ResultAPIURL and ResultToken are the callback endpoint (and optional
+	// bearer token) the tool is asked to POST the machine-readable review
+	// result to. The URL is substituted per-review (the {review_id} placeholder
+	// is resolved before rendering).
+	ResultAPIURL string
+	ResultToken  string
+	// PriorFindings lists the findings of previous review rounds (id, severity,
+	// location, status, message). On a retry/continue the tool is expected to
+	// reference them by id and report their updated status instead of treating
+	// them as new findings.
+	PriorFindings string
 }
 
 const maxResultBytes = 512 * 1024
@@ -37,7 +48,30 @@ var DefaultCommandTemplate = `run {{if .SessionID}}--session {{.SessionID}} {{en
 REVIEW SUMMARY:
 PR summary: <what the PR does in 2-3 sentences>
 Issues: <each concrete problem with file:line references, one per line, or None>
-Review suggestions: <verdict and next steps: LGTM, or the specific changes required, or a design/refactor suggestion>"`
+Review suggestions: <verdict and next steps: LGTM, or the specific changes required, or a design/refactor suggestion>{{if .ResultAPIURL}}
+
+Additionally submit the machine-readable review result to the review service so the findings are structured. POST the JSON below to {{.ResultAPIURL}}{{if .ResultToken}} with header \"Authorization: Bearer {{.ResultToken}}\"{{end}} (Content-Type: application/json):
+
+{
+  \"verdict\": \"lgtm\" | \"request_change\" | \"nit_comments\",
+  \"summary\": \"<2-3 sentence summary of the PR and the review>\",
+  \"findings\": [
+    {
+      \"id\": \"<prior finding id, only for status updates>\",
+      \"status\": \"open\" | \"addressed\" | \"commented\",
+      \"severity\": \"P0\" | \"P1\" | \"P2\",
+      \"path\": \"<repo-relative file path>\",
+      \"line\": <1-based line number, 0 when not applicable>,
+      \"title\": \"<short title>\",
+      \"message\": \"<why it matters>\",
+      \"suggestion\": \"<how to fix, or omit>\"
+    }
+  ]
+}
+
+Severity meanings: P0 = must fix before merge (correctness/security/data loss); P1 = should fix before merge (significant bug or design flaw); P2 = nice-to-have or nit (style, refactor, minor). Verdict: lgtm = approve as-is; request_change = one or more blocking (P0/P1) issues; nit_comments = no blockers but P2 comments worth addressing. Findings may be an empty array for a clean lgtm. Submitting the result is mandatory for the server to record the verdict and findings.{{if .PriorFindings}}
+
+Previous findings from the earlier round(s) of this review are listed below. Reference each one by its id in your result and set its status: \"addressed\" if the PR head now fixes it, \"commented\" if it needs no code change, \"open\" if it still stands. Only include content fields when the finding's location or wording changed. Do not re-report addressed findings as new ones.{{.PriorFindings}}{{end}}{{end}}"`
 
 func RenderCommand(templateText string, args ToolArgs) ([]string, error) {
 	tmpl, err := template.New("review").Funcs(template.FuncMap{"shellquote": shellquote}).Parse(templateText)

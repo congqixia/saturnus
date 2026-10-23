@@ -238,6 +238,75 @@ pre {
   overflow-wrap: anywhere;
 }
 
+.review-verdict {
+  margin-top: 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.review-summary {
+  margin: 8px 0 0;
+  font-size: 13px;
+  color: #334155;
+}
+
+.review-findings {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid #e4e7ec;
+  border-radius: 6px;
+}
+
+.review-findings > strong {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+
+.review-findings ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.finding {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 0;
+  border-bottom: 1px solid #eef1f5;
+  font-size: 12px;
+}
+
+.finding:last-child {
+  border-bottom: 0;
+}
+
+.finding-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.finding-head code {
+  color: #64748b;
+  font-size: 11px;
+}
+
+.finding-msg {
+  color: #334155;
+}
+
+.finding-suggestion {
+  color: #166534;
+}
+
+.finding-comment {
+  color: #64748b;
+  font-size: 11px;
+}
+
 .review-result {
   margin-top: 12px;
   padding: 12px;

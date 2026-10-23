@@ -121,3 +121,79 @@ func TestShellquote(t *testing.T) {
 		t.Fatalf("shellquote = %q", got)
 	}
 }
+
+func TestRenderCommandWithResultAPI(t *testing.T) {
+	args := ToolArgs{
+		Repo:         "a/b",
+		PRNumber:     7,
+		PRURL:        "https://github.com/a/b/pull/7",
+		ReviewID:     "rvw_api",
+		ResultAPIURL: "http://127.0.0.1:8787/api/reviews/rvw_api/result",
+		ResultToken:  "s3cret",
+	}
+	got, err := RenderCommand(DefaultCommandTemplate, args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 4 {
+		t.Fatalf("expected 4 args, got %#v", got)
+	}
+	prompt := got[3]
+	for _, want := range []string{
+		"http://127.0.0.1:8787/api/reviews/rvw_api/result",
+		`Authorization: Bearer s3cret`,
+		"\"verdict\": \"lgtm\"",
+		"\"severity\": \"P0\"",
+		"request_change",
+		"nit_comments",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	// The prompt must not leak unescaped quotes or backslashes after splitting.
+	if strings.Contains(prompt, `\"`) || strings.Contains(prompt, `\\`) {
+		t.Fatalf("prompt still contains escape sequences: %q", prompt)
+	}
+}
+
+func TestRenderCommandWithoutResultAPIOmitsPostBlock(t *testing.T) {
+	args := ToolArgs{Repo: "a/b", PRNumber: 1, PRURL: "https://github.com/a/b/pull/1", ReviewID: "rvw_x"}
+	got, err := RenderCommand(DefaultCommandTemplate, args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prompt := got[3]
+	for _, absent := range []string{"machine-readable", "Authorization: Bearer", `\"verdict\"`, "Previous findings"} {
+		if strings.Contains(prompt, absent) {
+			t.Fatalf("prompt should not contain %q:\n%s", absent, prompt)
+		}
+	}
+}
+
+func TestRenderCommandCarriesPriorFindings(t *testing.T) {
+	args := ToolArgs{
+		Repo:          "a/b",
+		PRNumber:      3,
+		PRURL:         "https://github.com/a/b/pull/3",
+		ReviewID:      "rvw_p",
+		ResultAPIURL:  "http://127.0.0.1:8787/api/reviews/rvw_p/result",
+		PriorFindings: "- fnd_x [P0] blocking bug (a.go:1)\n  status: open\n",
+	}
+	got, err := RenderCommand(DefaultCommandTemplate, args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prompt := got[3]
+	for _, want := range []string{
+		"Previous findings from the earlier round",
+		"- fnd_x [P0] blocking bug (a.go:1)",
+		"status: open",
+		"\"id\": \"<prior finding id, only for status updates>\"",
+		"\"status\": \"open\" | \"addressed\" | \"commented\"",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}

@@ -91,6 +91,9 @@ thread row.
 | head_commit | TEXT | PR head commit (`headRefOid`) this run reviewed |
 | retry_reason | TEXT | why the run was re-queued (shown in prompts/describe, cleared after the run) |
 | result_text | TEXT | tool output |
+| verdict | TEXT | structured PR opinion of the last run: `lgtm` / `request_change` / `nit_comments` (empty until the tool POSTs a result) |
+| summary | TEXT | structured short overview of the review (empty until posted) |
+| comments_posted_at | TEXT | when the findings were last published to the PR as inline comments; reset on re-run, and `POST .../post-comments` skips a review with this set |
 | error | TEXT | failure detail |
 | archived_at | TEXT | when the review was archived (PR merged/closed); hidden from default listings |
 | refreshed_at | TEXT | last `/sat refresh` time |
@@ -110,10 +113,32 @@ the `review_requests` row:
 | retry_reason | why this run happened (empty for the first run) |
 | session_id | tool session captured for this run |
 | result_text / error | this run's outcome |
+| verdict / summary | this run's structured verdict/summary when submitted |
 | started_at / completed_at / updated_at | timing |
 
 `review_runs` is exposed in `GET /api/reviews/{id}` (`runs`) and in the
 `/sat describe review` card.
+
+### review_findings
+
+Records the concrete P0-P2 issues the review tool POSTed for the current
+result, so the verdict is actionable and machine-readable:
+
+| column | meaning |
+| --- | --- |
+| id / review_id | `fnd_...`, owning review |
+| run_id | the run that produced or last updated the finding |
+| severity | P0 (must fix) / P1 (should fix) / P2 (nit) |
+| path / line | repo-relative file and 1-based line (0 when not applicable) |
+| title / message / suggestion | short title, why it matters, how to fix |
+| status | open / addressed / commented / resolved |
+| github_comment_id | GitHub inline-comment id posted for the finding (empty until posted) |
+| created_at | timing |
+
+Findings persist across review rounds: a retry/continue result references prior
+findings by id and updates their status in place, new findings are appended.
+They are exposed in `GET /api/reviews/{id}` (`findings`) and rendered in the
+describe card and web UI.
 
 ### review_reactions
 
@@ -257,7 +282,8 @@ check out anything.
 
 - `SATURNUS_REVIEW_TOOL` — executable, default `opencode`.
 - `SATURNUS_REVIEW_COMMAND_TEMPLATE` — `text/template` over a struct with
-  `Repo`, `PRNumber`, `PRURL`, `Title`, `BaseBranch`, `Worktree`, `Guide`.
+  `Repo`, `PRNumber`, `PRURL`, `Title`, `BaseBranch`, `Worktree`, `Guide`,
+  `ResultAPIURL`, `ResultToken`.
   Default:
   `run "Review GitHub PR {{.Repo}}#{{.PRNumber}} ({{.PRURL}}). The repository
   is already checked out at {{.Worktree}}. Fetch and check out the PR head
@@ -271,6 +297,89 @@ check out anything.
   Review suggestions: <verdict and next steps: LGTM, or the specific changes required, or a design/refactor suggestion>"`
   The three-section block is parsed from the tool output and rendered as the
   result message; if the tool omits the headers the raw summary is shown.
+
+### Structured result (verdict + P0-P2 findings)
+
+`SATURNUS_REVIEW_RESULT_API_URL` (default empty) turns the review result into a
+machine-readable record. The URL may contain `{review_id}`; it is substituted
+per review and injected into the prompt, together with the JSON body format and
+(optionally) `SATURNUS_REVIEW_RESULT_TOKEN` as
+`Authorization: Bearer <token>`. The tool is instructed to POST:
+
+```json
+{
+  "verdict": "lgtm" | "request_change" | "nit_comments",
+  "summary": "<2-3 sentence summary>",
+  "findings": [
+    {"id": "<prior finding id, for status updates>", "status": "open"|"addressed"|"commented", "severity": "P0"|"P1"|"P2", "path": "<file>", "line": <int>, "title": "<short>", "message": "<detail>", "suggestion": "<fix>"}
+  ]
+}
+```
+
+- `verdict` is the PR opinion: `lgtm` (approve as-is), `request_change` (one or
+  more blocking P0/P1 issues), `nit_comments` (no blockers but P2 comments).
+- `findings` grade each concrete issue: P0 = must fix (correctness/security/data
+  loss), P1 = should fix (significant bug/design flaw), P2 = nice-to-have/nit.
+  A finding carrying an `id` references a finding from a previous round and
+  updates its status (`open` = still an issue, `addressed` = fixed in the new
+  PR head, `commented` = acknowledged without a code change); a finding without
+  an `id` is new and defaults to `open`. Findings are persisted (upserted), not
+  replaced, so prior rounds' findings are carried into the next round's prompt.
+- The endpoint `POST /api/reviews/{id}/result` validates the payload and stores
+  `verdict`/`summary` on the review (and its current run) plus the findings.
+  While the review is running submissions update the recorded result; a
+  duplicate after completion (verdict already recorded) is rejected 409, and a
+  wrong/missing token is rejected 401.
+
+On retry/continue the prompt lists the previous findings (id, severity,
+location, status, message) so the tool references them by id and reports the
+new status instead of re-reporting them as new issues.
+
+The result message, `/sat describe review` card and web UI render the verdict
+and the P0-P2 findings directly; without a submitted result they fall back to
+the text `REVIEW SUMMARY:` block. `finish` writes the review outcome with a
+targeted UPDATE (only status/result/error/completed_at), and progress flushes
+touch only `result_text`, so a POST arriving mid-run is never clobbered.
+
+### Posting findings to the PR
+
+`SATURNUS_REVIEW_POST_INLINE_COMMENTS=1` makes the server publish the
+structured result back onto the GitHub PR using the same `gh` CLI as the rest
+of the pipeline (`SATURNUS_REVIEW_TOOL` / `SATURNUS_TASKS_GH_CLI` host
+credentials):
+
+- Findings with a concrete `path` + `line` whose severity is at or above
+  `SATURNUS_REVIEW_POST_INLINE_MIN_SEVERITY` are posted as standalone inline
+  comments on the PR head via `POST /repos/{owner}/{repo}/pulls/{n}/comments`
+  (`commit_id` = `head_commit`, `side` = `RIGHT`). Each comment is independent,
+  so a finding whose line is not part of the diff (GitHub 422) is skipped with
+  a logged error instead of failing the review. The response's comment `id` is
+  stored on the finding (`github_comment_id`).
+- A formal review is submitted via `POST /repos/{owner}/{repo}/pulls/{n}/reviews`
+  with the event mapped from the verdict — `lgtm`→`APPROVE`,
+  `request_change`→`REQUEST_CHANGES`, `nit_comments`→`COMMENT` — and the
+  summary as body.
+
+On later rounds findings that already have a `github_comment_id` are not
+re-posted (no duplicates). Instead, a finding the tool marked `addressed` has
+its comment thread resolved on GitHub via the GraphQL API
+(`resolveReviewThread`, located through the comment `databaseId`) and its
+status becomes `resolved`.
+
+Posting happens in `process` after `finish` for `succeeded` reviews with a
+recorded verdict, is best-effort (errors logged, review unaffected), and is not
+duplicated across retries because a re-run requires the PR head to move.
+
+Older reviews whose findings were never posted (feature was disabled when they
+ran, or a posting failure) can be published manually:
+
+- `/sat post <review_id>` (reviewer command)
+- `POST /api/reviews/{review_id}/post-comments`
+
+`review_requests.comments_posted_at` records the last successful publish
+(shown in describe/listings); a re-trigger of an already-posted review is
+refused so comments are never duplicated, and the marker is reset when the
+review is re-run so a fresh run publishes its new findings.
 
 The `shellquote` template function escapes backslashes and double quotes so the
 guide content survives the quoted-arg parsing.
@@ -318,12 +427,18 @@ requester is DM'd the task link so they can open it directly. Requires
 | SATURNUS_REVIEW_TASK_DUE_HOURS | 24 | task due offset |
 | SATURNUS_REVIEW_LOG_DIR | `<tmp>/saturnus-review-logs` | per-review transcript logs |
 | SATURNUS_REVIEW_GUIDES | - | per-repo guide files: `owner/repo=/path/guide.txt,...` |
+| SATURNUS_REVIEW_RESULT_API_URL | - | callback URL (may contain `{review_id}`) the tool POSTs the structured result to; empty disables the result POST |
+| SATURNUS_REVIEW_RESULT_TOKEN | - | bearer token required by the result endpoint, echoed into the prompt |
+| SATURNUS_REVIEW_POST_INLINE_COMMENTS | 0 | post findings as GitHub inline comments + a formal verdict review when a review succeeds; requires `gh` |
+| SATURNUS_REVIEW_POST_INLINE_MIN_SEVERITY | P2 | lowest severity posted inline: `P2` = all, `P1` = only P0/P1 |
 
 ## API Additions
 
 - `GET /api/reviews?status=...`
-- `GET /api/reviews/{id}`
+- `GET /api/reviews/{id}` (also returns `findings`)
 - `POST /api/reviews` (JSON body, e.g. `{"pr_url": ...}`)
+- `POST /api/reviews/{id}/result` (structured verdict/summary/findings, advertised in the tool prompt)
+- `POST /api/reviews/{id}/post-comments` (publish a review's findings as GitHub inline comments + verdict review)
 
 ## Bot Commands
 

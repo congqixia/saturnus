@@ -56,6 +56,9 @@ export type Review = {
   retry_reason: string
   result_text: string
   error: string
+  verdict?: string
+  summary?: string
+  comments_posted_at?: string
   created_at: string
   updated_at: string
   completed_at?: string
@@ -72,9 +75,29 @@ export type ReviewRun = {
   result_text: string
   error: string
   tool: string
+  verdict?: string
+  summary?: string
   started_at: string
   completed_at?: string
   updated_at: string
+}
+
+// ReviewFinding is one concrete issue the review tool flagged, graded P0-P2.
+// Status tracks it across review rounds (open/addressed/commented/resolved);
+// github_comment_id links it to the inline comment posted on the PR.
+export type ReviewFinding = {
+  id: string
+  review_id: string
+  run_id?: string
+  severity: string
+  path: string
+  line: number
+  title: string
+  message: string
+  suggestion: string
+  status: string
+  github_comment_id?: string
+  created_at: string
 }
 
 export type Task = {

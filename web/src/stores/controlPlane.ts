@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { api, type Approval, type Event, type Review, type ReviewRun, type Session, type Task, type TaskDoc, type TaskPR } from '../api'
+import { api, type Approval, type Event, type Review, type ReviewFinding, type ReviewRun, type Session, type Task, type TaskDoc, type TaskPR } from '../api'
 
 type Health = {
   ok: boolean
@@ -18,6 +18,7 @@ export const useControlPlaneStore = defineStore('controlPlane', {
     selectedReviewId: '',
     selectedReview: null as Review | null,
     selectedReviewRuns: [] as ReviewRun[],
+    selectedReviewFindings: [] as ReviewFinding[],
     tasks: [] as Task[],
     selectedTaskId: '',
     selectedTask: null as Task | null,
@@ -82,9 +83,10 @@ export const useControlPlaneStore = defineStore('controlPlane', {
     },
     async selectReview(id: string, updateSelectedId = true) {
       if (updateSelectedId) this.selectedReviewId = id
-      const detail = await api<{ review: Review; runs: ReviewRun[] }>(`/api/reviews/${encodeURIComponent(id)}`)
+      const detail = await api<{ review: Review; runs: ReviewRun[]; findings: ReviewFinding[] }>(`/api/reviews/${encodeURIComponent(id)}`)
       this.selectedReview = detail.review
       this.selectedReviewRuns = detail.runs ?? []
+      this.selectedReviewFindings = detail.findings ?? []
     },
     async selectTask(id: string, updateSelectedId = true) {
       if (updateSelectedId) this.selectedTaskId = id

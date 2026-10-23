@@ -98,46 +98,62 @@ type ReviewThread struct {
 // commit it reviewed, so history can be traced after later runs overwrite the
 // review_requests row.
 type ReviewRun struct {
-	ID          string    `json:"id"`
-	ReviewID    string    `json:"review_id"`
-	Seq         int       `json:"seq"`
-	Status      string    `json:"status"`
-	HeadCommit  string    `json:"head_commit"`
-	RetryReason string    `json:"retry_reason"`
-	SessionID   string    `json:"session_id"`
-	ResultText  string    `json:"result_text"`
-	Error       string    `json:"error"`
-	Tool        string    `json:"tool"`
+	ID          string `json:"id"`
+	ReviewID    string `json:"review_id"`
+	Seq         int    `json:"seq"`
+	Status      string `json:"status"`
+	HeadCommit  string `json:"head_commit"`
+	RetryReason string `json:"retry_reason"`
+	SessionID   string `json:"session_id"`
+	ResultText  string `json:"result_text"`
+	Error       string `json:"error"`
+	Tool        string `json:"tool"`
+	// Verdict is the structured review opinion of this run (lgtm /
+	// request_change / nit_comments), and Summary is its short overview. Both
+	// are set when the tool submitted a machine-readable result for this run.
+	Verdict     string    `json:"verdict"`
+	Summary     string    `json:"summary"`
 	StartedAt   time.Time `json:"started_at"`
 	CompletedAt time.Time `json:"completed_at,omitempty"`
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 type ReviewRequest struct {
-	ID              string    `json:"id"`
-	ThreadID        string    `json:"thread_id"`
-	Status          string    `json:"status"`
-	PRURL           string    `json:"pr_url"`
-	Repo            string    `json:"repo"`
-	PRNumber        int       `json:"pr_number"`
-	Title           string    `json:"title"`
-	BaseBranch      string    `json:"base_branch"`
-	RequesterOpenID string    `json:"requester_open_id"`
-	RequesterName   string    `json:"requester_name"`
-	ChatID          string    `json:"chat_id"`
-	MessageID       string    `json:"message_id"`
-	Tool            string    `json:"tool"`
-	TaskID          string    `json:"task_id"`
-	TaskURL         string    `json:"task_url"`
-	SessionID       string    `json:"session_id"`
-	HeadCommit      string    `json:"head_commit"`
-	PrHeadCommit    string    `json:"pr_head_commit"`
-	RetryReason     string    `json:"retry_reason"`
-	ResultText      string    `json:"result_text"`
-	Error           string    `json:"error"`
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
-	CompletedAt     time.Time `json:"completed_at,omitempty"`
+	ID              string `json:"id"`
+	ThreadID        string `json:"thread_id"`
+	Status          string `json:"status"`
+	PRURL           string `json:"pr_url"`
+	Repo            string `json:"repo"`
+	PRNumber        int    `json:"pr_number"`
+	Title           string `json:"title"`
+	BaseBranch      string `json:"base_branch"`
+	RequesterOpenID string `json:"requester_open_id"`
+	RequesterName   string `json:"requester_name"`
+	ChatID          string `json:"chat_id"`
+	MessageID       string `json:"message_id"`
+	Tool            string `json:"tool"`
+	TaskID          string `json:"task_id"`
+	TaskURL         string `json:"task_url"`
+	SessionID       string `json:"session_id"`
+	HeadCommit      string `json:"head_commit"`
+	PrHeadCommit    string `json:"pr_head_commit"`
+	RetryReason     string `json:"retry_reason"`
+	ResultText      string `json:"result_text"`
+	Error           string `json:"error"`
+	// Verdict is the structured PR opinion produced by the last review run
+	// (lgtm / request_change / nit_comments), and Summary is its short
+	// overview. They are populated when the review tool POSTed a
+	// machine-readable result to the server during the run. Findings live in
+	// review_findings (see ListFindings).
+	Verdict string `json:"verdict"`
+	Summary string `json:"summary"`
+	// CommentsPostedAt records when the review's findings (and verdict review)
+	// were last published to the PR as inline comments, so manual re-triggers
+	// do not post duplicates. It is reset when the review is re-run.
+	CommentsPostedAt time.Time `json:"comments_posted_at,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
+	CompletedAt      time.Time `json:"completed_at,omitempty"`
 	// ArchivedAt is set when the review is archived because its PR was merged
 	// or closed. Archived reviews are hidden from default listings.
 	ArchivedAt time.Time `json:"archived_at,omitempty"`
@@ -168,6 +184,29 @@ type ReviewReaction struct {
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
 	CompletedAt  time.Time `json:"completed_at,omitempty"`
+}
+
+// ReviewFinding is one concrete issue the review tool identified in the PR,
+// graded by severity (P0 = must fix before merge, P1 = should fix, P2 = nit).
+// Findings belong to a review; RunID ties them to the run that produced or last
+// updated them. Status tracks the finding across review rounds: open (still an
+// issue), addressed (fixed per a later round), commented (acknowledged without
+// action), resolved (its inline comment thread was resolved on GitHub).
+// GithubCommentID is the id of the inline comment posted for this finding, so
+// a later round can resolve it.
+type ReviewFinding struct {
+	ID              string    `json:"id"`
+	ReviewID        string    `json:"review_id"`
+	RunID           string    `json:"run_id,omitempty"`
+	Severity        string    `json:"severity"`
+	Path            string    `json:"path"`
+	Line            int       `json:"line"`
+	Title           string    `json:"title"`
+	Message         string    `json:"message"`
+	Suggestion      string    `json:"suggestion"`
+	Status          string    `json:"status"`
+	GithubCommentID string    `json:"github_comment_id,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
 }
 
 // Task is a feature tracking record that binds one GitHub issue to its local
@@ -432,6 +471,9 @@ func (s *Store) migrate(ctx context.Context) error {
 			retry_reason TEXT NOT NULL DEFAULT '',
 			result_text TEXT NOT NULL DEFAULT '',
 			error TEXT NOT NULL DEFAULT '',
+			verdict TEXT NOT NULL DEFAULT '',
+			summary TEXT NOT NULL DEFAULT '',
+			comments_posted_at TEXT,
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL,
 			completed_at TEXT
@@ -478,6 +520,21 @@ func (s *Store) migrate(ctx context.Context) error {
 			linked_at TEXT NOT NULL,
 			PRIMARY KEY (review_id, thread_id)
 		)`,
+		`CREATE TABLE IF NOT EXISTS review_findings (
+			id TEXT PRIMARY KEY,
+			review_id TEXT NOT NULL REFERENCES review_requests(id) ON DELETE CASCADE,
+			run_id TEXT REFERENCES review_runs(id) ON DELETE SET NULL,
+			severity TEXT NOT NULL DEFAULT '',
+			path TEXT NOT NULL DEFAULT '',
+			line INTEGER NOT NULL DEFAULT 0,
+			title TEXT NOT NULL DEFAULT '',
+			message TEXT NOT NULL DEFAULT '',
+			suggestion TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT 'open',
+			github_comment_id TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_review_findings_review ON review_findings(review_id, created_at ASC)`,
 		`CREATE TABLE IF NOT EXISTS chat_modes (
 			chat_id TEXT PRIMARY KEY,
 			mode TEXT NOT NULL DEFAULT 'review',
@@ -556,6 +613,27 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "review_requests", "task_synced_at", "TEXT"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "review_requests", "verdict", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "review_requests", "summary", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "review_runs", "verdict", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "review_runs", "summary", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "review_requests", "comments_posted_at", "TEXT"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "review_findings", "status", "TEXT NOT NULL DEFAULT 'open'"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "review_findings", "github_comment_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
 	return nil
@@ -1092,13 +1170,13 @@ func (s *Store) CreateReview(req ReviewRequest) (ReviewRequest, error) {
 			id, thread_id, status, pr_url, repo, pr_number, title, base_branch,
 			requester_open_id, requester_name, chat_id, message_id, tool, task_id, task_url,
 			session_id, head_commit, pr_head_commit, retry_reason, result_text, error, created_at, updated_at, completed_at,
-			archived_at, refreshed_at, task_synced_at
+			archived_at, refreshed_at, task_synced_at, verdict, summary, comments_posted_at
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, req.ID, req.ThreadID, req.Status, req.PRURL, req.Repo, req.PRNumber, req.Title, req.BaseBranch,
 		req.RequesterOpenID, req.RequesterName, req.ChatID, req.MessageID, req.Tool, req.TaskID, req.TaskURL,
 		req.SessionID, req.HeadCommit, req.PrHeadCommit, req.RetryReason, req.ResultText, req.Error, timeText(req.CreatedAt), timeText(req.UpdatedAt), nullableTimeText(req.CompletedAt),
-		nullableTimeText(req.ArchivedAt), nullableTimeText(req.RefreshedAt), nullableTimeText(req.TaskSyncedAt)); err != nil {
+		nullableTimeText(req.ArchivedAt), nullableTimeText(req.RefreshedAt), nullableTimeText(req.TaskSyncedAt), req.Verdict, req.Summary, nullableTimeText(req.CommentsPostedAt)); err != nil {
 		return ReviewRequest{}, err
 	}
 	if err := audit(ctx, tx, "requester:"+req.RequesterOpenID, "review.create", req.ID, mustJSON(req)); err != nil {
@@ -1112,7 +1190,7 @@ func (s *Store) GetReview(id string) (ReviewRequest, error) {
 		SELECT id, thread_id, status, pr_url, repo, pr_number, title, base_branch,
 			requester_open_id, requester_name, chat_id, message_id, tool, task_id, task_url,
 			session_id, head_commit, pr_head_commit, retry_reason, result_text, error, created_at, updated_at, completed_at,
-			archived_at, refreshed_at, task_synced_at
+			archived_at, refreshed_at, task_synced_at, verdict, summary, comments_posted_at
 		FROM review_requests
 		WHERE id = ?
 	`, id)
@@ -1131,7 +1209,7 @@ func (s *Store) GetReviewByPR(repo string, prNumber int) (ReviewRequest, error) 
 		SELECT id, thread_id, status, pr_url, repo, pr_number, title, base_branch,
 			requester_open_id, requester_name, chat_id, message_id, tool, task_id, task_url,
 			session_id, head_commit, pr_head_commit, retry_reason, result_text, error, created_at, updated_at, completed_at,
-			archived_at, refreshed_at, task_synced_at
+			archived_at, refreshed_at, task_synced_at, verdict, summary, comments_posted_at
 		FROM review_requests
 		WHERE repo = ? AND pr_number = ?
 		ORDER BY created_at DESC
@@ -1155,7 +1233,7 @@ func (s *Store) GetLatestReviewByThread(chatID, rootMessageID string) (ReviewReq
 		SELECT r.id, r.thread_id, r.status, r.pr_url, r.repo, r.pr_number, r.title, r.base_branch,
 			r.requester_open_id, r.requester_name, r.chat_id, r.message_id, r.tool, r.task_id, r.task_url,
 			r.session_id, r.head_commit, r.pr_head_commit, r.retry_reason, r.result_text, r.error, r.created_at, r.updated_at, r.completed_at,
-			r.archived_at, r.refreshed_at, r.task_synced_at
+			r.archived_at, r.refreshed_at, r.task_synced_at, r.verdict, r.summary, r.comments_posted_at
 		FROM review_requests r
 		JOIN review_threads t ON t.id = r.thread_id
 		WHERE t.chat_id = ? AND t.root_message_id = ? AND r.status != 'archived'
@@ -1181,7 +1259,7 @@ func (s *Store) ListReviews(status string, includeArchived bool) []ReviewRequest
 		SELECT id, thread_id, status, pr_url, repo, pr_number, title, base_branch,
 			requester_open_id, requester_name, chat_id, message_id, tool, task_id, task_url,
 			session_id, head_commit, pr_head_commit, retry_reason, result_text, error, created_at, updated_at, completed_at,
-			archived_at, refreshed_at, task_synced_at
+			archived_at, refreshed_at, task_synced_at, verdict, summary, comments_posted_at
 		FROM review_requests
 	`
 	var conds []string
@@ -1227,12 +1305,12 @@ func (s *Store) UpdateReview(req ReviewRequest) (ReviewRequest, error) {
 		SET status = ?, pr_url = ?, repo = ?, pr_number = ?, title = ?, base_branch = ?,
 			requester_open_id = ?, requester_name = ?, chat_id = ?, message_id = ?, tool = ?,
 			task_id = ?, task_url = ?, session_id = ?, head_commit = ?, pr_head_commit = ?, retry_reason = ?, result_text = ?, error = ?, updated_at = ?, completed_at = ?,
-			archived_at = ?, refreshed_at = ?, task_synced_at = ?
+			archived_at = ?, refreshed_at = ?, task_synced_at = ?, verdict = ?, summary = ?, comments_posted_at = ?
 		WHERE id = ?
 	`, req.Status, req.PRURL, req.Repo, req.PRNumber, req.Title, req.BaseBranch,
 		req.RequesterOpenID, req.RequesterName, req.ChatID, req.MessageID, req.Tool,
 		req.TaskID, req.TaskURL, req.SessionID, req.HeadCommit, req.PrHeadCommit, req.RetryReason, req.ResultText, req.Error, timeText(req.UpdatedAt), nullableTimeText(req.CompletedAt),
-		nullableTimeText(req.ArchivedAt), nullableTimeText(req.RefreshedAt), nullableTimeText(req.TaskSyncedAt),
+		nullableTimeText(req.ArchivedAt), nullableTimeText(req.RefreshedAt), nullableTimeText(req.TaskSyncedAt), req.Verdict, req.Summary, nullableTimeText(req.CommentsPostedAt),
 		req.ID); err != nil {
 		return ReviewRequest{}, err
 	}
@@ -1240,6 +1318,204 @@ func (s *Store) UpdateReview(req ReviewRequest) (ReviewRequest, error) {
 		return ReviewRequest{}, err
 	}
 	return req, tx.Commit()
+}
+
+// SetReviewResult persists the structured verdict and summary the review tool
+// POSTed while the review is running. It touches only those two columns so a
+// concurrent progress flush from the worker cannot clobber them.
+func (s *Store) SetReviewResult(reviewID, verdict, summary string) error {
+	ctx := context.Background()
+	now := time.Now().UTC()
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE review_requests
+		SET verdict = ?, summary = ?, updated_at = ?
+		WHERE id = ?
+	`, verdict, summary, timeText(now), reviewID)
+	return err
+}
+
+// SetCommentsPosted records when a review's findings were published to the PR
+// as inline comments, so manual re-triggers skip already-posted reviews.
+func (s *Store) SetCommentsPosted(reviewID string, t time.Time) error {
+	ctx := context.Background()
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE review_requests
+		SET comments_posted_at = ?, updated_at = ?
+		WHERE id = ?
+	`, nullableTimeText(t), timeText(time.Now().UTC()), reviewID)
+	return err
+}
+
+// UpdateReviewProgress persists only the streaming result_text of an in-flight
+// review. It deliberately avoids touching the whole row so verdict/summary
+// written by SetReviewResult are preserved.
+func (s *Store) UpdateReviewProgress(reviewID, resultText string) error {
+	ctx := context.Background()
+	now := time.Now().UTC()
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE review_requests
+		SET result_text = ?, updated_at = ?
+		WHERE id = ?
+	`, resultText, timeText(now), reviewID)
+	return err
+}
+
+// UpdateReviewOutcome persists the terminal status of a review run without
+// overwriting verdict/summary that the tool already posted.
+func (s *Store) UpdateReviewOutcome(reviewID, status, resultText, errorText string, completedAt time.Time) error {
+	ctx := context.Background()
+	now := time.Now().UTC()
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE review_requests
+		SET status = ?, result_text = ?, error = ?, completed_at = ?, updated_at = ?
+		WHERE id = ?
+	`, status, resultText, errorText, nullableTimeText(completedAt), timeText(now), reviewID)
+	return err
+}
+
+// SaveFindings persists a review result's findings without discarding the
+// findings of previous rounds: entries carrying a finding ID update that
+// finding in place (status, content and the run that updated it), entries
+// without an ID insert a new finding (status defaults to "open"). This is what
+// lets a retry/continue review reference prior findings by id and update their
+// status (addressed / commented / ...) instead of re-creating them.
+func (s *Store) SaveFindings(reviewID, runIDParam string, findings []ReviewFinding) error {
+	ctx := context.Background()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer rollback(tx)
+	for _, f := range findings {
+		var runID any
+		if runIDParam != "" {
+			runID = runIDParam
+		} else {
+			runID = nil
+		}
+		if f.ID != "" {
+			// Existing finding: merge the incoming fields onto the stored row
+			// (the tool may send only id + status on a status update) and move
+			// run_id to the run that touched it. The id must belong to this
+			// review, otherwise the row is not found and we reject.
+			existing, err := getFindingTx(ctx, tx, f.ID, reviewID)
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("finding %s does not belong to review %s", f.ID, reviewID)
+			}
+			if err != nil {
+				return err
+			}
+			merged := existing
+			if f.Severity != "" {
+				merged.Severity = f.Severity
+			}
+			if f.Path != "" {
+				merged.Path = f.Path
+			}
+			if f.Line != 0 {
+				merged.Line = f.Line
+			}
+			if f.Title != "" {
+				merged.Title = f.Title
+			}
+			if f.Message != "" {
+				merged.Message = f.Message
+			}
+			if f.Suggestion != "" {
+				merged.Suggestion = f.Suggestion
+			}
+			if f.Status != "" {
+				merged.Status = f.Status
+			}
+			var mergedRunID any
+			if runIDParam != "" {
+				mergedRunID = runIDParam
+			} else {
+				mergedRunID = nil
+			}
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE review_findings
+				SET run_id = ?, severity = ?, path = ?, line = ?, title = ?, message = ?, suggestion = ?, status = ?
+				WHERE id = ? AND review_id = ?
+			`, mergedRunID, merged.Severity, merged.Path, merged.Line, merged.Title, merged.Message, merged.Suggestion, merged.Status, f.ID, reviewID); err != nil {
+				return err
+			}
+			continue
+		}
+		if f.ID == "" {
+			f.ID = "fnd_" + newID()
+		}
+		if f.Status == "" {
+			f.Status = "open"
+		}
+		if f.CreatedAt.IsZero() {
+			f.CreatedAt = time.Now().UTC()
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO review_findings (id, review_id, run_id, severity, path, line, title, message, suggestion, status, github_comment_id, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?)
+		`, f.ID, reviewID, runID, f.Severity, f.Path, f.Line, f.Title, f.Message, f.Suggestion, f.Status, timeText(f.CreatedAt)); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// getFindingTx returns one finding of a review inside a transaction.
+func getFindingTx(ctx context.Context, tx *sql.Tx, id, reviewID string) (ReviewFinding, error) {
+	row := tx.QueryRowContext(ctx, `
+		SELECT id, review_id, run_id, severity, path, line, title, message, suggestion, status, github_comment_id, created_at
+		FROM review_findings
+		WHERE id = ? AND review_id = ?
+	`, id, reviewID)
+	return scanReviewFinding(row)
+}
+
+// SetFindingCommentID records the GitHub inline comment id posted for a
+// finding, so a later round can resolve that thread.
+func (s *Store) SetFindingCommentID(findingID, commentID string) error {
+	ctx := context.Background()
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE review_findings
+		SET github_comment_id = ?
+		WHERE id = ?
+	`, commentID, findingID)
+	return err
+}
+
+// UpdateFindingStatus changes a finding's status (open / addressed / commented
+// / resolved).
+func (s *Store) UpdateFindingStatus(findingID, status string) error {
+	ctx := context.Background()
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE review_findings
+		SET status = ?
+		WHERE id = ?
+	`, status, findingID)
+	return err
+}
+
+// ListFindings returns every finding of a review in submission order.
+func (s *Store) ListFindings(reviewID string) []ReviewFinding {
+	rows, err := s.db.Query(`
+		SELECT id, review_id, run_id, severity, path, line, title, message, suggestion, status, github_comment_id, created_at
+		FROM review_findings
+		WHERE review_id = ?
+		ORDER BY created_at ASC
+	`, reviewID)
+	if err != nil {
+		return []ReviewFinding{}
+	}
+	defer rows.Close()
+
+	out := []ReviewFinding{}
+	for rows.Next() {
+		f, err := scanReviewFinding(rows)
+		if err == nil {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 func (s *Store) FailInterruptedReviews() ([]string, error) {
@@ -1298,10 +1574,10 @@ func (s *Store) CreateReviewRun(run ReviewRun) (ReviewRun, error) {
 	run.Seq = int(maxSeq.Int64) + 1
 
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO review_runs (id, review_id, seq, status, head_commit, retry_reason, session_id, result_text, error, tool, started_at, completed_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO review_runs (id, review_id, seq, status, head_commit, retry_reason, session_id, result_text, error, tool, verdict, summary, started_at, completed_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, run.ID, run.ReviewID, run.Seq, run.Status, run.HeadCommit, run.RetryReason, run.SessionID, run.ResultText, run.Error, run.Tool,
-		timeText(run.StartedAt), nullableTimeText(run.CompletedAt), timeText(run.UpdatedAt)); err != nil {
+		run.Verdict, run.Summary, timeText(run.StartedAt), nullableTimeText(run.CompletedAt), timeText(run.UpdatedAt)); err != nil {
 		return ReviewRun{}, err
 	}
 	return run, tx.Commit()
@@ -1314,17 +1590,17 @@ func (s *Store) UpdateReviewRun(run ReviewRun) error {
 	run.UpdatedAt = time.Now().UTC()
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE review_runs
-		SET status = ?, head_commit = ?, retry_reason = ?, session_id = ?, result_text = ?, error = ?, completed_at = ?, updated_at = ?
+		SET status = ?, head_commit = ?, retry_reason = ?, session_id = ?, result_text = ?, error = ?, verdict = ?, summary = ?, completed_at = ?, updated_at = ?
 		WHERE id = ?
 	`, run.Status, run.HeadCommit, run.RetryReason, run.SessionID, run.ResultText, run.Error,
-		nullableTimeText(run.CompletedAt), timeText(run.UpdatedAt), run.ID)
+		run.Verdict, run.Summary, nullableTimeText(run.CompletedAt), timeText(run.UpdatedAt), run.ID)
 	return err
 }
 
 // CurrentRun returns the in-flight run for a review (status 'running'), if any.
 func (s *Store) CurrentRun(reviewID string) (ReviewRun, error) {
 	row := s.db.QueryRow(`
-		SELECT id, review_id, seq, status, head_commit, retry_reason, session_id, result_text, error, tool, started_at, completed_at, updated_at
+		SELECT id, review_id, seq, status, head_commit, retry_reason, session_id, result_text, error, tool, verdict, summary, started_at, completed_at, updated_at
 		FROM review_runs
 		WHERE review_id = ? AND status = 'running'
 		ORDER BY seq DESC
@@ -1343,7 +1619,7 @@ func (s *Store) CurrentRun(reviewID string) (ReviewRun, error) {
 // ListRuns returns every run of a review in execution order (oldest first).
 func (s *Store) ListRuns(reviewID string) []ReviewRun {
 	rows, err := s.db.Query(`
-		SELECT id, review_id, seq, status, head_commit, retry_reason, session_id, result_text, error, tool, started_at, completed_at, updated_at
+		SELECT id, review_id, seq, status, head_commit, retry_reason, session_id, result_text, error, tool, verdict, summary, started_at, completed_at, updated_at
 		FROM review_runs
 		WHERE review_id = ?
 		ORDER BY seq ASC
@@ -1817,6 +2093,10 @@ type reviewReactionScanner interface {
 	Scan(dest ...any) error
 }
 
+type reviewFindingScanner interface {
+	Scan(dest ...any) error
+}
+
 type taskScanner interface {
 	Scan(dest ...any) error
 }
@@ -1934,7 +2214,7 @@ func getReviewTx(ctx context.Context, tx *sql.Tx, id string) (ReviewRequest, err
 		SELECT id, thread_id, status, pr_url, repo, pr_number, title, base_branch,
 			requester_open_id, requester_name, chat_id, message_id, tool, task_id, task_url,
 			session_id, head_commit, pr_head_commit, retry_reason, result_text, error, created_at, updated_at, completed_at,
-			archived_at, refreshed_at, task_synced_at
+			archived_at, refreshed_at, task_synced_at, verdict, summary, comments_posted_at
 		FROM review_requests
 		WHERE id = ?
 	`, id)
@@ -1963,11 +2243,12 @@ func scanReviewRequest(row reviewRequestScanner) (ReviewRequest, error) {
 	var archivedAt sql.NullString
 	var refreshedAt sql.NullString
 	var taskSyncedAt sql.NullString
+	var commentsPostedAt sql.NullString
 	if err := row.Scan(
 		&req.ID, &req.ThreadID, &req.Status, &req.PRURL, &req.Repo, &req.PRNumber, &req.Title, &req.BaseBranch,
 		&req.RequesterOpenID, &req.RequesterName, &req.ChatID, &req.MessageID, &req.Tool, &req.TaskID, &req.TaskURL,
 		&req.SessionID, &req.HeadCommit, &req.PrHeadCommit, &req.RetryReason, &req.ResultText, &req.Error, &createdAt, &updatedAt, &completedAt,
-		&archivedAt, &refreshedAt, &taskSyncedAt,
+		&archivedAt, &refreshedAt, &taskSyncedAt, &req.Verdict, &req.Summary, &commentsPostedAt,
 	); err != nil {
 		return ReviewRequest{}, err
 	}
@@ -1977,6 +2258,7 @@ func scanReviewRequest(row reviewRequestScanner) (ReviewRequest, error) {
 	req.ArchivedAt, _ = parseNullTime(archivedAt)
 	req.RefreshedAt, _ = parseNullTime(refreshedAt)
 	req.TaskSyncedAt, _ = parseNullTime(taskSyncedAt)
+	req.CommentsPostedAt, _ = parseNullTime(commentsPostedAt)
 	return req, nil
 }
 
@@ -1987,7 +2269,7 @@ func scanReviewRun(row reviewRunScanner) (ReviewRun, error) {
 	var completedAt sql.NullString
 	if err := row.Scan(
 		&run.ID, &run.ReviewID, &run.Seq, &run.Status, &run.HeadCommit, &run.RetryReason, &run.SessionID,
-		&run.ResultText, &run.Error, &run.Tool, &startedAt, &completedAt, &updatedAt,
+		&run.ResultText, &run.Error, &run.Tool, &run.Verdict, &run.Summary, &startedAt, &completedAt, &updatedAt,
 	); err != nil {
 		return ReviewRun{}, err
 	}
@@ -2013,6 +2295,20 @@ func scanReviewReaction(row reviewReactionScanner) (ReviewReaction, error) {
 	reac.UpdatedAt, _ = parseTime(updatedAt)
 	reac.CompletedAt, _ = parseNullTime(completedAt)
 	return reac, nil
+}
+
+func scanReviewFinding(row reviewFindingScanner) (ReviewFinding, error) {
+	var f ReviewFinding
+	var createdAt string
+	var runID sql.NullString
+	if err := row.Scan(
+		&f.ID, &f.ReviewID, &runID, &f.Severity, &f.Path, &f.Line, &f.Title, &f.Message, &f.Suggestion, &f.Status, &f.GithubCommentID, &createdAt,
+	); err != nil {
+		return ReviewFinding{}, err
+	}
+	f.RunID = runID.String
+	f.CreatedAt, _ = parseTime(createdAt)
+	return f, nil
 }
 
 func scanTask(row taskScanner) (Task, error) {

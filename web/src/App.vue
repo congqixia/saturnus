@@ -19,7 +19,7 @@ import {
   type DataTableColumns
 } from 'naive-ui'
 import { Check, RefreshCw, X, Zap, ZapOff } from 'lucide-vue-next'
-import { formatTime, pretty, type Approval, type Event, type Review, type Session, type Task, type TaskPR } from './api'
+import { formatTime, pretty, type Approval, type Event, type Review, type ReviewFinding, type Session, type Task, type TaskPR } from './api'
 import { useControlPlaneStore } from './stores/controlPlane'
 
 const store = useControlPlaneStore()
@@ -173,6 +173,55 @@ function reviewTagType(status: string): 'success' | 'error' | 'warning' | 'defau
     case 'reviewing':
     case 'pending':
       return 'warning'
+    default:
+      return 'default'
+  }
+}
+
+function verdictLabel(verdict: string): string {
+  switch (verdict) {
+    case 'lgtm':
+      return 'LGTM'
+    case 'request_change':
+      return 'Request change'
+    case 'nit_comments':
+      return 'Nit comments'
+    default:
+      return verdict
+  }
+}
+
+function verdictTagType(verdict: string): 'success' | 'error' | 'default' {
+  switch (verdict) {
+    case 'lgtm':
+      return 'success'
+    case 'request_change':
+      return 'error'
+    default:
+      return 'default'
+  }
+}
+
+function severityTagType(severity: string): 'error' | 'warning' | 'info' | 'default' {
+  switch (severity) {
+    case 'P0':
+      return 'error'
+    case 'P1':
+      return 'warning'
+    case 'P2':
+      return 'info'
+    default:
+      return 'default'
+  }
+}
+
+function statusTagType(status: string): 'success' | 'info' | 'warning' | 'default' {
+  switch (status) {
+    case 'resolved':
+    case 'addressed':
+      return 'success'
+    case 'commented':
+      return 'info'
     default:
       return 'default'
   }
@@ -450,10 +499,44 @@ import { h } from 'vue'
                   <NDescriptionsItem label="Updated">
                     {{ formatTime(store.selectedReview.updated_at) }}
                   </NDescriptionsItem>
+                  <NDescriptionsItem label="Comments posted">
+                    {{ store.selectedReview.comments_posted_at ? formatTime(store.selectedReview.comments_posted_at) : 'not yet' }}
+                  </NDescriptionsItem>
                 </NDescriptions>
                 <div v-if="store.selectedReview.error" class="review-error">
                   {{ store.selectedReview.error }}
                 </div>
+                <template v-if="store.selectedReview.verdict">
+                  <div class="review-verdict">
+                    <strong>Verdict:</strong>
+                    <NTag :size="'small'" :type="verdictTagType(store.selectedReview.verdict)" round>
+                      {{ verdictLabel(store.selectedReview.verdict) }}
+                    </NTag>
+                  </div>
+                  <p v-if="store.selectedReview.summary" class="review-summary">
+                    {{ store.selectedReview.summary }}
+                  </p>
+                  <div v-if="store.selectedReviewFindings.length" class="review-findings">
+                    <strong>Findings</strong>
+                    <ul>
+                      <li v-for="f in store.selectedReviewFindings" :key="f.id" class="finding">
+                        <span class="finding-head">
+                          <NTag :size="'tiny'" :type="severityTagType(f.severity)" round>
+                            {{ f.severity }}
+                          </NTag>
+                          <NTag v-if="f.status && f.status !== 'open'" :size="'tiny'" :type="statusTagType(f.status)" round>
+                            {{ f.status }}
+                          </NTag>
+                          <strong>{{ f.title || f.message }}</strong>
+                          <code v-if="f.path">{{ f.path }}{{ f.line > 0 ? ':' + f.line : '' }}</code>
+                        </span>
+                        <span v-if="f.github_comment_id" class="finding-comment">gh comment #{{ f.github_comment_id }}</span>
+                        <span v-if="f.message && f.message !== f.title" class="finding-msg">{{ f.message }}</span>
+                        <span v-if="f.suggestion" class="finding-suggestion">Fix: {{ f.suggestion }}</span>
+                      </li>
+                    </ul>
+                  </div>
+                </template>
                 <pre v-if="store.selectedReview.result_text" class="review-result">{{ store.selectedReview.result_text }}</pre>
               </template>
             </section>

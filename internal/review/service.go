@@ -36,6 +36,21 @@ type Config struct {
 	GHCli       string
 	LogDir      string
 	Guides      map[string]string
+	// ResultAPIURL is the callback the review tool is instructed to POST the
+	// machine-readable review result to. It may contain the placeholder
+	// {review_id}, substituted per review. Empty disables the structured-result
+	// prompt block (the tool falls back to the text REVIEW SUMMARY block).
+	ResultAPIURL string
+	// ResultToken is an optional bearer token required by ResultAPIURL; when
+	// set it is echoed into the prompt so the tool can authenticate.
+	ResultToken string
+	// PostInlineComments, when enabled, makes the server post the review's
+	// findings as GitHub inline comments (and a formal PR review mapped from
+	// the verdict) once the review succeeds with a structured verdict.
+	PostInlineComments bool
+	// PostInlineMinSeverity is the minimum finding severity posted as an
+	// inline comment: P2 (default) posts everything, P1 posts only P0/P1.
+	PostInlineMinSeverity string
 }
 
 var ErrAlreadyPending = errors.New("review already in progress")
@@ -47,6 +62,30 @@ var ErrReviewUnchanged = errors.New("review is already up to date")
 // ErrArchived is returned when a review was archived (its PR was merged or
 // closed) and a re-run is attempted.
 var ErrArchived = errors.New("review is archived")
+
+// Finding is one concrete issue identified by the review tool, graded by
+// severity (P0 = must fix, P1 = should fix, P2 = nit). It is the wire format
+// the tool POSTs and the row stored in review_findings. On a retry/continue
+// round the tool references prior findings by their id and reports a new
+// Status (open / addressed / commented) instead of re-creating them.
+type Finding struct {
+	ID         string `json:"id"`
+	Status     string `json:"status"`
+	Severity   string `json:"severity"`
+	Path       string `json:"path"`
+	Line       int    `json:"line"`
+	Title      string `json:"title"`
+	Message    string `json:"message"`
+	Suggestion string `json:"suggestion"`
+}
+
+// validVerdicts, validSeverities and validFindingStatuses are the accepted
+// verdicts, severities and finding statuses.
+var (
+	validVerdicts        = map[string]bool{"lgtm": true, "request_change": true, "nit_comments": true}
+	validSeverities      = map[string]bool{"P0": true, "P1": true, "P2": true}
+	validFindingStatuses = map[string]bool{"open": true, "addressed": true, "commented": true}
+)
 
 type MessageContext struct {
 	Text          string
@@ -140,6 +179,9 @@ func New(st *store.Store, lk larkClient, cfg Config) *Service {
 	if cfg.GHCli == "" {
 		cfg.GHCli = "gh"
 	}
+	if cfg.PostInlineMinSeverity == "" {
+		cfg.PostInlineMinSeverity = "P2"
+	}
 	if cfg.LogDir == "" {
 		cfg.LogDir = os.TempDir() + "/saturnus-review-logs"
 	}
@@ -187,6 +229,12 @@ func (s *Service) Tool() string {
 // GHCli returns the configured GitHub CLI executable (default "gh").
 func (s *Service) GHCli() string {
 	return s.cfg.GHCli
+}
+
+// ResultToken returns the configured bearer token required to submit a
+// structured review result (empty when the endpoint is unauthenticated).
+func (s *Service) ResultToken() string {
+	return s.cfg.ResultToken
 }
 
 // RepoList returns the whitelisted repo names (owner/name), one per configured
@@ -251,6 +299,106 @@ func (s *Service) enqueue(kind, id string) {
 	default:
 		go func() { s.jobs <- j }()
 	}
+}
+
+// IngestResult stores a machine-readable review result POSTed by the review
+// tool while a review is running. It validates the verdict and findings,
+// records the verdict/summary on the review (and, via finish, on its run) and
+// persists the findings. Findings carrying an id reference a finding from a
+// previous round and update its status/content in place; findings without an
+// id are new. The tool is expected to POST once per run; a second submission
+// against an already-recorded result is rejected.
+func (s *Service) IngestResult(reviewID, verdict, summary string, findings []Finding) error {
+	if !s.cfg.Enabled {
+		return errors.New("PR review is disabled")
+	}
+	if reviewID == "" {
+		return errors.New("empty review id")
+	}
+	req, err := s.store.GetReview(reviewID)
+	if err != nil {
+		return err
+	}
+	switch req.Status {
+	case "reviewing":
+		// The worker is executing the tool; this is the normal submission point.
+	case "succeeded":
+		// Covers the race where the tool POSTs just as the worker marks the run
+		// finished. Only accept while no structured result is recorded yet, so a
+		// late duplicate cannot clobber an existing one.
+		if req.Verdict != "" {
+			return fmt.Errorf("review %s already has a structured result", reviewID)
+		}
+	default:
+		return fmt.Errorf("review %s is not running (status=%s); results can only be submitted while a review run is in progress", reviewID, req.Status)
+	}
+
+	verdict = strings.ToLower(strings.TrimSpace(verdict))
+	if !validVerdicts[verdict] {
+		return fmt.Errorf("invalid verdict %q; must be one of lgtm, request_change, nit_comments", verdict)
+	}
+	summary = strings.TrimSpace(summary)
+	if summary == "" {
+		return errors.New("summary is required")
+	}
+	existing := map[string]bool{}
+	for _, f := range s.store.ListFindings(reviewID) {
+		existing[f.ID] = true
+	}
+	for i := range findings {
+		f := &findings[i]
+		f.ID = strings.TrimSpace(f.ID)
+		f.Status = strings.ToLower(strings.TrimSpace(f.Status))
+		if f.ID != "" {
+			// Status update for a prior finding.
+			if !existing[f.ID] {
+				return fmt.Errorf("finding #%d references unknown id %q (not part of this review)", i+1, f.ID)
+			}
+			if f.Status != "" && !validFindingStatuses[f.Status] {
+				return fmt.Errorf("finding #%d has invalid status %q; must be open, addressed or commented", i+1, f.Status)
+			}
+			continue
+		}
+		// New finding.
+		f.Severity = strings.ToUpper(strings.TrimSpace(f.Severity))
+		if !validSeverities[f.Severity] {
+			return fmt.Errorf("finding #%d has invalid severity %q; must be P0, P1 or P2", i+1, f.Severity)
+		}
+		if strings.TrimSpace(f.Path) == "" {
+			return fmt.Errorf("finding #%d has an empty path", i+1)
+		}
+		if strings.TrimSpace(f.Message) == "" {
+			return fmt.Errorf("finding #%d has an empty message", i+1)
+		}
+		if f.Status != "" && !validFindingStatuses[f.Status] {
+			return fmt.Errorf("finding #%d has invalid status %q; must be open, addressed or commented", i+1, f.Status)
+		}
+	}
+	runID := ""
+	if run, err := s.store.CurrentRun(reviewID); err == nil {
+		runID = run.ID
+	}
+	if err := s.store.SetReviewResult(reviewID, verdict, summary); err != nil {
+		return err
+	}
+	storeFindings := make([]store.ReviewFinding, 0, len(findings))
+	for _, f := range findings {
+		storeFindings = append(storeFindings, store.ReviewFinding{
+			ID:         f.ID,
+			Status:     f.Status,
+			Severity:   f.Severity,
+			Path:       f.Path,
+			Line:       f.Line,
+			Title:      f.Title,
+			Message:    f.Message,
+			Suggestion: f.Suggestion,
+		})
+	}
+	if err := s.store.SaveFindings(reviewID, runID, storeFindings); err != nil {
+		return err
+	}
+	logf("ingested structured review result for %s: verdict=%s findings=%d", reviewID, verdict, len(findings))
+	return nil
 }
 
 func (s *Service) Submit(ctx MessageContext) (store.ReviewRequest, error) {
@@ -476,7 +624,9 @@ func requesterDisplayName(req store.ReviewRequest) string {
 func (s *Service) retryFinished(existing *store.ReviewRequest, ctx MessageContext, reason string) (store.ReviewRequest, error) {
 	existing.Status = "pending"
 	existing.ResultText, existing.Error = "", ""
+	existing.Verdict, existing.Summary = "", ""
 	existing.CompletedAt = time.Time{}
+	existing.CommentsPostedAt = time.Time{}
 	existing.RetryReason = reason
 	if isPlaceholderRequester(existing.RequesterOpenID) {
 		existing.RequesterOpenID = ctx.EffectiveRequesterOpenID()
@@ -914,6 +1064,12 @@ func (s *Service) FormatOne(req store.ReviewRequest) string {
 	if req.Error != "" {
 		fmt.Fprintf(&b, "\nerror=%s", req.Error)
 	}
+	if req.Verdict != "" {
+		fmt.Fprintf(&b, "\nverdict=%s", req.Verdict)
+	}
+	if !req.CommentsPostedAt.IsZero() {
+		fmt.Fprintf(&b, "\ncomments_posted_at=%s", req.CommentsPostedAt.Format(time.RFC3339))
+	}
 	if req.ResultText != "" {
 		fmt.Fprintf(&b, "\n\n%s", truncate(stripANSI(req.ResultText), 3000))
 	}
@@ -1263,18 +1419,25 @@ func (s *Service) process(id string) {
 		}
 	}
 
+	resultAPIURL := ""
+	if s.cfg.ResultAPIURL != "" {
+		resultAPIURL = strings.ReplaceAll(s.cfg.ResultAPIURL, "{review_id}", req.ID)
+	}
 	args, err := RenderCommand(s.cfg.CommandTemplate, ToolArgs{
-		Repo:       req.Repo,
-		PRNumber:   req.PRNumber,
-		PRURL:      req.PRURL,
-		Title:      req.Title,
-		BaseBranch: req.BaseBranch,
-		Worktree:   repoRoot,
-		Guide:      guide,
-		ReviewID:   req.ID,
-		HeadCommit: req.HeadCommit,
-		SessionID:  req.SessionID,
-		RetryNote:  retryNote,
+		Repo:          req.Repo,
+		PRNumber:      req.PRNumber,
+		PRURL:         req.PRURL,
+		Title:         req.Title,
+		BaseBranch:    req.BaseBranch,
+		Worktree:      repoRoot,
+		Guide:         guide,
+		ReviewID:      req.ID,
+		HeadCommit:    req.HeadCommit,
+		SessionID:     req.SessionID,
+		RetryNote:     retryNote,
+		ResultAPIURL:  resultAPIURL,
+		ResultToken:   s.cfg.ResultToken,
+		PriorFindings: formatPriorFindings(s.store.ListFindings(req.ID)),
 	})
 	if err != nil {
 		s.finish(&req, "failed", "", "render command: "+err.Error())
@@ -1314,7 +1477,7 @@ func (s *Service) process(id string) {
 			snapshot := progress
 			mu.Unlock()
 			req.ResultText = snapshot
-			if _, err := s.store.UpdateReview(req); err != nil {
+			if err := s.store.UpdateReviewProgress(req.ID, snapshot); err != nil {
 				logf("flush review progress: %v", err)
 			}
 		}
@@ -1326,10 +1489,32 @@ func (s *Service) process(id string) {
 	}
 	clean := stripANSI(output)
 	req.RetryReason = ""
+	// Merge any structured result the tool POSTed to the server while this run
+	// was executing (the POST handler writes verdict/summary onto the review
+	// row, so the run record below can preserve them alongside the text).
+	if fresh, err := s.store.GetReview(req.ID); err == nil {
+		req.Verdict = fresh.Verdict
+		req.Summary = fresh.Summary
+	}
 	if runErr != nil {
 		s.finish(&req, "failed", clean, runErr.Error())
 	} else {
 		s.finish(&req, "succeeded", clean, "")
+	}
+	// When enabled and the run produced a structured verdict, publish the
+	// findings as GitHub inline comments (plus the verdict review). The marker
+	// is set only on full success so a partial failure can be re-triggered.
+	if req.Status == "succeeded" && s.cfg.PostInlineComments && req.Verdict != "" && req.CommentsPostedAt.IsZero() {
+		if posted, perr := s.PostPRInlineComments(req); perr != nil {
+			logf("post inline comments for %s: %v", req.ID, perr)
+		} else {
+			if posted > 0 {
+				logf("posted %d inline comment(s) for %s", posted, req.ID)
+			}
+			if err := s.store.SetCommentsPosted(req.ID, time.Now().UTC()); err != nil {
+				logf("mark comments posted for %s: %v", req.ID, err)
+			}
+		}
 	}
 	s.notifyReviewer(req)
 }
@@ -1352,17 +1537,22 @@ func (s *Service) finish(req *store.ReviewRequest, status, result, errText strin
 	req.ResultText = result
 	req.Error = errText
 	req.CompletedAt = time.Now().UTC()
-	if _, err := s.store.UpdateReview(*req); err != nil {
+	// Update only the outcome columns so verdict/summary written by
+	// SetReviewResult (the tool's POST) are never clobbered here.
+	if err := s.store.UpdateReviewOutcome(req.ID, status, result, errText, req.CompletedAt); err != nil {
 		logf("update status %s: %v", status, err)
 	}
 	// Record the terminal outcome on the in-flight run (head commit, session,
-	// result/error) so each run's history is preserved for traceability.
+	// verdict/summary, result/error) so each run's history is preserved for
+	// traceability.
 	if run, err := s.store.CurrentRun(req.ID); err == nil {
 		run.Status = status
 		run.HeadCommit = req.HeadCommit
 		run.SessionID = req.SessionID
 		run.ResultText = result
 		run.Error = errText
+		run.Verdict = req.Verdict
+		run.Summary = req.Summary
 		run.CompletedAt = req.CompletedAt
 		if err := s.store.UpdateReviewRun(run); err != nil {
 			logf("update review run %s: %v", run.ID, err)
@@ -1397,6 +1587,23 @@ func (s *Service) FormatResult(req store.ReviewRequest) string {
 	if req.Error != "" {
 		fmt.Fprintf(&b, "\nerror=%s", req.Error)
 	}
+	if req.Verdict != "" {
+		// A machine-readable result was submitted: it is the authoritative
+		// outcome, so render it instead of the raw text summary below.
+		fmt.Fprintf(&b, "\n\nVerdict: %s", verdictLabel(req.Verdict))
+		if req.Summary != "" {
+			fmt.Fprintf(&b, "\nSummary: %s", truncate(req.Summary, 1000))
+		}
+		if s.store != nil {
+			if rendered := FormatFindings(s.store.ListFindings(req.ID)); rendered != "" {
+				fmt.Fprintf(&b, "\n\n%s", rendered)
+			}
+		}
+		if s.cfg.LogDir != "" {
+			fmt.Fprintf(&b, "\n\nlog=%s", filepath.Join(s.cfg.LogDir, req.ID+".log"))
+		}
+		return b.String()
+	}
 	clean := stripANSI(req.ResultText)
 	if summary := ExtractSummary(clean); summary != "" {
 		if secs := parseReviewSections(summary); !secs.empty() {
@@ -1411,6 +1618,238 @@ func (s *Service) FormatResult(req store.ReviewRequest) string {
 		fmt.Fprintf(&b, "\n\nlog=%s", filepath.Join(s.cfg.LogDir, req.ID+".log"))
 	}
 	return b.String()
+}
+
+// verdictLabel maps a stored verdict to a human-friendly display label.
+func verdictLabel(v string) string {
+	switch v {
+	case "lgtm":
+		return "LGTM"
+	case "request_change":
+		return "Request change"
+	case "nit_comments":
+		return "Nit comments"
+	default:
+		return v
+	}
+}
+
+// ListFindings returns every structured finding of a review.
+func (s *Service) ListFindings(reviewID string) []store.ReviewFinding {
+	if s.store == nil {
+		return nil
+	}
+	return s.store.ListFindings(reviewID)
+}
+
+// severityRank orders severities so min-severity filters work: P0 > P1 > P2.
+var severityRank = map[string]int{"P0": 3, "P1": 2, "P2": 1}
+
+func severityAtLeast(sev, min string) bool {
+	if min == "" {
+		return true
+	}
+	return severityRank[sev] >= severityRank[min]
+}
+
+// verdictEvent maps a stored verdict to the GitHub review event it produces:
+// lgtm approves, request_change requests changes, nit_comments comments.
+func verdictEvent(v string) string {
+	switch v {
+	case "lgtm":
+		return "APPROVE"
+	case "request_change":
+		return "REQUEST_CHANGES"
+	default:
+		return "COMMENT"
+	}
+}
+
+// PostPRInlineComments publishes the review's structured findings on the
+// GitHub PR and records each inline comment's id on the finding:
+//   - new findings (no recorded comment id) with a concrete path+line and
+//     severity at or above PostInlineMinSeverity are posted as inline comments;
+//   - findings the tool marked "addressed" have their existing comment thread
+//     resolved on GitHub (best-effort) and become status "resolved";
+//   - a formal review with the event mapped from the verdict carries the summary.
+//
+// Posting is best-effort and per-finding: a finding whose line is not part of
+// the diff is skipped with a logged error instead of failing the review. The
+// method reports how many inline comments were posted. Whether to post at all
+// is decided by the callers: the worker's auto path gates on PostInlineComments,
+// while the explicit /sat post trigger always posts.
+func (s *Service) PostPRInlineComments(req store.ReviewRequest) (int, error) {
+	if req.Verdict == "" {
+		return 0, nil
+	}
+	if s.cfg.GHCli == "" {
+		return 0, errors.New("gh cli is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	posted := 0
+	var errs []string
+	for _, f := range s.store.ListFindings(req.ID) {
+		if f.GithubCommentID == "" {
+			// Not yet posted: post an inline comment when the finding is
+			// concrete enough and severe enough.
+			if !severityAtLeast(f.Severity, s.cfg.PostInlineMinSeverity) {
+				continue
+			}
+			if strings.TrimSpace(f.Path) == "" || f.Line <= 0 {
+				continue
+			}
+			body := f.Message
+			if body == "" {
+				body = f.Title
+			}
+			if f.Suggestion != "" {
+				body += "\n\n**suggestion:** " + f.Suggestion
+			}
+			body += fmt.Sprintf("\n\n_(saturnus review %s, %s)_", req.ID, f.Severity)
+			commentID, err := PostInlineComment(ctx, s.cfg.GHCli, req.Repo, req.PRNumber, req.HeadCommit, InlineComment{
+				Path: f.Path, Line: f.Line, Body: body,
+			})
+			if err != nil {
+				errs = append(errs, err.Error())
+				continue
+			}
+			if err := s.store.SetFindingCommentID(f.ID, commentID); err != nil {
+				errs = append(errs, err.Error())
+			} else {
+				posted++
+			}
+			continue
+		}
+		// Already posted: resolve the thread when the tool reported the finding
+		// as addressed and it is not resolved yet.
+		if f.Status == "addressed" && f.Status != "resolved" {
+			if err := ResolveInlineComment(ctx, s.cfg.GHCli, req.Repo, req.PRNumber, f.GithubCommentID); err != nil {
+				errs = append(errs, err.Error())
+			} else if err := s.store.UpdateFindingStatus(f.ID, "resolved"); err != nil {
+				errs = append(errs, err.Error())
+			}
+		}
+	}
+
+	// The formal review carries the verdict so the PR's review state matches
+	// the structured opinion (approve / request changes / comment).
+	body := strings.TrimSpace(req.Summary)
+	if body == "" {
+		body = "Automated review by Saturnus."
+	}
+	body += fmt.Sprintf("\n\n_(saturnus review %s, verdict: %s)_", req.ID, verdictLabel(req.Verdict))
+	if err := PostPRReview(ctx, s.cfg.GHCli, req.Repo, req.PRNumber, verdictEvent(req.Verdict), body); err != nil {
+		errs = append(errs, err.Error())
+	}
+	if len(errs) > 0 {
+		return posted, fmt.Errorf("post inline comments: %s", strings.Join(errs, "; "))
+	}
+	return posted, nil
+}
+
+// formatPriorFindings renders the previous rounds' findings for the retry
+// prompt so the tool can reference them by id and update their status.
+func formatPriorFindings(findings []store.ReviewFinding) string {
+	if len(findings) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, f := range findings {
+		loc := strings.TrimSpace(f.Path)
+		if f.Line > 0 {
+			loc = fmt.Sprintf("%s:%d", loc, f.Line)
+		}
+		if loc == "" {
+			loc = "-"
+		}
+		status := f.Status
+		if status == "" {
+			status = "open"
+		}
+		title := strings.TrimSpace(f.Title)
+		if title == "" {
+			title = strings.TrimSpace(f.Message)
+		}
+		fmt.Fprintf(&b, "- %s [%s] %s (%s)\n", f.ID, f.Severity, truncate(title, 200), loc)
+		if msg := strings.TrimSpace(f.Message); msg != "" && msg != title {
+			fmt.Fprintf(&b, "  %s\n", truncate(msg, 400))
+		}
+		fmt.Fprintf(&b, "  status: %s\n", status)
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// PostComments manually publishes a finished review's findings as GitHub
+// inline comments (plus the verdict review). It is the path for reviews whose
+// findings were never posted — the feature was off when they ran, or posting
+// failed then. Posting is skipped when the findings were already published
+// (CommentsPostedAt set) so a repeat trigger does not duplicate comments; a
+// review without a structured verdict cannot be posted.
+func (s *Service) PostComments(id string) (int, error) {
+	if !s.cfg.Enabled {
+		return 0, errors.New("PR review is disabled")
+	}
+	req, err := s.store.GetReview(id)
+	if err != nil {
+		return 0, err
+	}
+	if req.Status == "archived" {
+		return 0, ErrArchived
+	}
+	if req.Verdict == "" {
+		return 0, errors.New("review has no structured verdict; run the review first")
+	}
+	if !req.CommentsPostedAt.IsZero() {
+		return 0, errors.New("review findings were already posted to the PR")
+	}
+	posted, err := s.PostPRInlineComments(req)
+	if err != nil {
+		return posted, err
+	}
+	// Mark published only when the whole attempt succeeded, so a partial
+	// failure can be re-triggered to fill the gaps.
+	if err := s.store.SetCommentsPosted(req.ID, time.Now().UTC()); err != nil {
+		return posted, err
+	}
+	return posted, nil
+}
+
+// FormatFindings renders structured review findings as a bulleted list, one
+// bullet per finding with its severity tag and file:line location, so the
+// machine-readable result is readable in chat and the web UI alike.
+func FormatFindings(findings []store.ReviewFinding) string {
+	if len(findings) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("Findings:\n")
+	for _, f := range findings {
+		loc := strings.TrimSpace(f.Path)
+		if f.Line > 0 {
+			loc = fmt.Sprintf("%s:%d", loc, f.Line)
+		}
+		if loc == "" {
+			loc = "-"
+		}
+		title := strings.TrimSpace(f.Title)
+		if title == "" {
+			title = strings.TrimSpace(f.Message)
+		}
+		fmt.Fprintf(&b, "- [%s] %s (%s)", f.Severity, truncate(title, 300), loc)
+		if f.Status != "" && f.Status != "open" {
+			fmt.Fprintf(&b, " [%s]", f.Status)
+		}
+		b.WriteString("\n")
+		if msg := strings.TrimSpace(f.Message); msg != "" && msg != title {
+			fmt.Fprintf(&b, "  %s\n", truncate(msg, 600))
+		}
+		if sug := strings.TrimSpace(f.Suggestion); sug != "" {
+			fmt.Fprintf(&b, "  Fix: %s\n", truncate(sug, 400))
+		}
+	}
+	return strings.TrimSpace(b.String())
 }
 
 // requesterNameBackoff stops repeated contact-API lookups for an open_id whose

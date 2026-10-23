@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -375,7 +376,7 @@ func TestFormatReviewMarkdown(t *testing.T) {
 		Error:         "timeout [repo#1]",
 		ResultText:    "found an issue\n- line 1",
 	}
-	md := formatReviewMarkdown(req, "opencode")
+	md := formatReviewMarkdown(req, "opencode", nil)
 	for _, want := range []string{
 		"**Status**: `failed`",
 		"[owner/repo#42](https://github.com/owner/repo/pull/42)",
@@ -505,7 +506,7 @@ func TestFormatReviewMarkdownCompletedShowsFullSummary(t *testing.T) {
 		PRNumber:   1,
 		ResultText: "line1\nline2\n...\nREVIEW SUMMARY:\nPR summary: fix the race\nIssues:\n- shared err\nReview suggestions: LGTM after fix",
 	}
-	md := formatReviewMarkdown(req, "opencode")
+	md := formatReviewMarkdown(req, "opencode", nil)
 	for _, want := range []string{"PR summary: fix the race", "shared err", "Review suggestions: LGTM after fix"} {
 		if !strings.Contains(md, want) {
 			t.Fatalf("completed markdown missing summary %q:\n%s", want, md)
@@ -526,7 +527,7 @@ func TestFormatReviewMarkdownRunningShowsTail(t *testing.T) {
 		PRNumber:   1,
 		ResultText: head + "\nlatest progress here",
 	}
-	md := formatReviewMarkdown(req, "opencode")
+	md := formatReviewMarkdown(req, "opencode", nil)
 	if !strings.Contains(md, "[earlier output omitted]") {
 		t.Fatalf("expected tail marker for running review:\n%s", md)
 	}
@@ -1133,4 +1134,213 @@ func (s *fakeHTTPServer) Close() error {
 	close(s.closeCalled)
 	s.stopOnce.Do(func() { close(s.stopped) })
 	return nil
+}
+
+func newReviewingReviewForResult(t *testing.T, st *store.Store, id string) {
+	t.Helper()
+	thread, err := st.GetOrCreateReviewThread("oc_chat", "om_root", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateReview(store.ReviewRequest{
+		ID: id, ThreadID: thread.ID, Status: "reviewing",
+		PRURL: "https://github.com/a/b/pull/1", Repo: "a/b", PRNumber: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSubmitReviewResultHandler(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	newReviewingReviewForResult(t, st, "rvw_http")
+
+	svc := review.New(st, lark.New(lark.Config{}), review.Config{
+		Enabled:     true,
+		ResultToken: "s3cret",
+	})
+	s := &server{store: st, reviews: svc}
+
+	body := `{"verdict":"request_change","summary":"Fixes the restore race.","findings":[{"severity":"P0","path":"internal/etcd_restore.go","line":40,"title":"data race","message":"shared err var","suggestion":"use a channel"}]}`
+	req, err := http.NewRequest("POST", "/api/reviews/rvw_http/result", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.SetPathValue("review_id", "rvw_http")
+	req.Header.Set("Authorization", "Bearer s3cret")
+	rr := httptest.NewRecorder()
+	s.submitReviewResult(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	got, err := svc.Get("rvw_http")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Verdict != "request_change" || got.Summary != "Fixes the restore race." {
+		t.Fatalf("verdict/summary not stored: %#v", got)
+	}
+	if findings := svc.ListFindings("rvw_http"); len(findings) != 1 || findings[0].Severity != "P0" {
+		t.Fatalf("findings not stored: %#v", findings)
+	}
+}
+
+func TestSubmitReviewResultHandlerAuthAndValidation(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	newReviewingReviewForResult(t, st, "rvw_auth")
+
+	svc := review.New(st, lark.New(lark.Config{}), review.Config{
+		Enabled:     true,
+		ResultToken: "s3cret",
+	})
+	s := &server{store: st, reviews: svc}
+
+	good := `{"verdict":"lgtm","summary":"ok","findings":[]}`
+	post := func(auth, body string) *httptest.ResponseRecorder {
+		req, err := http.NewRequest("POST", "/api/reviews/rvw_auth/result", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+		req.SetPathValue("review_id", "rvw_auth")
+		rr := httptest.NewRecorder()
+		s.submitReviewResult(rr, req)
+		return rr
+	}
+
+	if rr := post("", good); rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without token, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if rr := post("Bearer wrong", good); rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with wrong token, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if rr := post("Bearer s3cret", `{"verdict":"approve","summary":"ok"}`); rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid verdict, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if rr := post("Bearer s3cret", good); rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 for valid submission, got %d: %s", rr.Code, rr.Body.String())
+	}
+	// A duplicate while the review is still running is an idempotent replace.
+	if rr := post("Bearer s3cret", good); rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 for in-progress duplicate submission, got %d: %s", rr.Code, rr.Body.String())
+	}
+	// Once the run has finished with a recorded result, a late duplicate is
+	// rejected so it cannot clobber the outcome.
+	req, err := st.GetReview("rvw_auth")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Status = "succeeded"
+	if _, err := st.UpdateReview(req); err != nil {
+		t.Fatal(err)
+	}
+	if rr := post("Bearer s3cret", good); rr.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for duplicate submission after completion, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestSubmitReviewResultHandlerRejectsNotRunning(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	thread, err := st.GetOrCreateReviewThread("oc_chat", "om_root", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateReview(store.ReviewRequest{
+		ID: "rvw_pending", ThreadID: thread.ID, Status: "pending",
+		PRURL: "https://github.com/a/b/pull/1", Repo: "a/b", PRNumber: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	svc := review.New(st, lark.New(lark.Config{}), review.Config{Enabled: true})
+	s := &server{store: st, reviews: svc}
+	req, err := http.NewRequest("POST", "/api/reviews/rvw_pending/result", strings.NewReader(`{"verdict":"lgtm","summary":"ok"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.SetPathValue("review_id", "rvw_pending")
+	rr := httptest.NewRecorder()
+	s.submitReviewResult(rr, req)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for non-running review, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestPostReviewCommentsHandler(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	newReviewingReviewForResult(t, st, "rvw_posthttp")
+
+	svc := review.New(st, lark.New(lark.Config{}), review.Config{Enabled: true})
+	if err := svc.IngestResult("rvw_posthttp", "lgtm", "ok", []review.Finding{
+		{Severity: "P2", Path: "a.go", Line: 2, Title: "nit", Message: "reorder"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req, err := svc.Get("rvw_posthttp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Status = "succeeded"
+	if _, err := st.UpdateReview(req); err != nil {
+		t.Fatal(err)
+	}
+
+	// No gh stub configured -> posting surfaces the gh failure, still a
+	// non-2xx but not a crash.
+	s := &server{store: st, reviews: svc}
+	httpReq, err := http.NewRequest("POST", "/api/reviews/rvw_posthttp/post-comments", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpReq.SetPathValue("review_id", "rvw_posthttp")
+	rr := httptest.NewRecorder()
+	s.postReviewComments(rr, httpReq)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 without gh, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// Missing review -> 404.
+	httpReq2, _ := http.NewRequest("POST", "/api/reviews/rvw_nope/post-comments", nil)
+	httpReq2.SetPathValue("review_id", "rvw_nope")
+	rr2 := httptest.NewRecorder()
+	s.postReviewComments(rr2, httpReq2)
+	if rr2.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for missing review, got %d: %s", rr2.Code, rr2.Body.String())
+	}
+}
+
+func TestPostBotCommandRejectsInvalid(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	srv := &server{store: st, reviews: review.New(st, lark.New(lark.Config{}), review.Config{Enabled: true})}
+
+	reply := srv.handleBotCommand("/sat post", review.MessageContext{SenderOpenID: "ou_x"})
+	if !strings.Contains(reply.text, "Usage: /sat post") {
+		t.Fatalf("expected usage reply, got %q", reply.text)
+	}
+	reply = srv.handleBotCommand("/sat post rvw_missing", review.MessageContext{SenderOpenID: "ou_x"})
+	if !strings.Contains(reply.text, "Post comments failed") {
+		t.Fatalf("expected failure reply, got %q", reply.text)
+	}
 }

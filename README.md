@@ -186,6 +186,7 @@ Environment variables:
 | `SATURNUS_REVIEW_RESULT_TOKEN` | - | optional bearer token the result endpoint requires; echoed into the tool prompt so the POST can authenticate |
 | `SATURNUS_REVIEW_POST_INLINE_COMMENTS` | 0 | post the review findings as GitHub inline comments + a formal PR review (event mapped from the verdict) once the review succeeds; requires `gh` |
 | `SATURNUS_REVIEW_POST_INLINE_MIN_SEVERITY` | P2 | lowest finding severity posted as an inline comment: `P2` = all, `P1` = only P0/P1 |
+| `SATURNUS_REVIEW_NOTIFY_REQUESTER` | 0 | DM the requester a short result once the review succeeds: verdict, finding counts (P0/P1/P2), and how many inline comments were posted to the PR |
 
 While a review is running, the tool output is streamed: the accumulated text is
 flushed into `result_text` roughly every 5 seconds (poll
@@ -278,6 +279,24 @@ The publish timestamp is stored (`comments_posted_at`, shown in `/sat review
 failure — can be published retroactively with `/sat post <review_id>` (or
 `POST /api/reviews/{review_id}/post-comments`). Re-triggering a review whose
 findings were already posted is refused, so comments are never duplicated.
+
+### Notifying the requester
+
+By default only the reviewer receives the full result. With
+`SATURNUS_REVIEW_NOTIFY_REQUESTER=1` the requester is additionally DM'd a short
+summary once a review succeeds with a structured verdict:
+
+```
+PR 评审完成：owner/repo#42
+https://github.com/owner/repo/pull/42
+Verdict: Request change
+Findings: 3 项 (P0: 1, P1: 1, P2: 1)
+已发布 2 条 inline comment 到 PR
+review: rvw_xxx
+```
+
+The count of posted comments reflects findings whose inline comment was
+recorded (`github_comment_id`). The full detail still goes to the reviewer.
 
 Repeated submissions of the same PR reuse one review record (and thread):
 an active one is reported as already in progress. Each run records the PR head

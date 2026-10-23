@@ -2321,6 +2321,7 @@ func reviewConfig() review.Config {
 		ResultToken:           os.Getenv("SATURNUS_REVIEW_RESULT_TOKEN"),
 		PostInlineComments:    os.Getenv("SATURNUS_REVIEW_POST_INLINE_COMMENTS") == "1",
 		PostInlineMinSeverity: os.Getenv("SATURNUS_REVIEW_POST_INLINE_MIN_SEVERITY"),
+		NotifyRequester:       os.Getenv("SATURNUS_REVIEW_NOTIFY_REQUESTER") == "1",
 	}
 }
 

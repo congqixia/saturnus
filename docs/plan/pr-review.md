@@ -370,6 +370,11 @@ Posting happens in `process` after `finish` for `succeeded` reviews with a
 recorded verdict, is best-effort (errors logged, review unaffected), and is not
 duplicated across retries because a re-run requires the PR head to move.
 
+With `SATURNUS_REVIEW_NOTIFY_REQUESTER=1` the requester is DM'd a short result
+once a review succeeds with a verdict: the verdict, the finding count by
+severity, and how many inline comments were already posted to the PR (from
+`github_comment_id`). The full detail stays with the reviewer.
+
 Older reviews whose findings were never posted (feature was disabled when they
 ran, or a posting failure) can be published manually:
 
@@ -431,6 +436,7 @@ requester is DM'd the task link so they can open it directly. Requires
 | SATURNUS_REVIEW_RESULT_TOKEN | - | bearer token required by the result endpoint, echoed into the prompt |
 | SATURNUS_REVIEW_POST_INLINE_COMMENTS | 0 | post findings as GitHub inline comments + a formal verdict review when a review succeeds; requires `gh` |
 | SATURNUS_REVIEW_POST_INLINE_MIN_SEVERITY | P2 | lowest severity posted inline: `P2` = all, `P1` = only P0/P1 |
+| SATURNUS_REVIEW_NOTIFY_REQUESTER | 0 | DM the requester a short result summary (verdict, finding counts, comments posted) when a review succeeds |
 
 ## API Additions
 

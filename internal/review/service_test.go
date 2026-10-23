@@ -2448,3 +2448,97 @@ func TestPostPRInlineCommentsRecordsIDsAndResolvesAddressed(t *testing.T) {
 		t.Fatalf("new finding should have its comment id recorded: %#v", newF)
 	}
 }
+
+func TestNotifyRequesterResult(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	newReviewingReview(t, st, "rvw_reqnotify")
+
+	svc := New(st, &fakeLark{enabled: true}, Config{Enabled: true, NotifyRequester: true})
+	if err := svc.IngestResult("rvw_reqnotify", "request_change", "needs work", []Finding{
+		{Severity: "P0", Path: "a.go", Line: 1, Message: "blocking"},
+		{Severity: "P1", Path: "b.go", Line: 2, Message: "should fix"},
+		{Severity: "P2", Path: "c.go", Line: 3, Message: "nit"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req, err := svc.Get("rvw_reqnotify")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Status = "succeeded"
+	req.RequesterOpenID = "ou_requester"
+	req.PRURL = "https://github.com/a/b/pull/1"
+	if _, err := st.UpdateReview(req); err != nil {
+		t.Fatal(err)
+	}
+	// Two of the three findings already posted as inline comments.
+	findings := svc.ListFindings("rvw_reqnotify")
+	if err := st.SetFindingCommentID(findings[0].ID, "100"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetFindingCommentID(findings[1].ID, "101"); err != nil {
+		t.Fatal(err)
+	}
+	fake := svc.lark.(*fakeLark)
+	fake.sent = nil
+
+	svc.notifyRequesterResult(req)
+
+	if len(fake.sent) != 1 {
+		t.Fatalf("expected 1 requester DM, got %#v", fake.sent)
+	}
+	msg := fake.sent[0]
+	for _, want := range []string{
+		"ou_requester", "PR 评审完成", "a/b#1", "Verdict: Request change",
+		"Findings: 3 项 (P0: 1, P1: 1, P2: 1)", "已发布 2 条 inline comment 到 PR",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("requester message missing %q: %s", want, msg)
+		}
+	}
+}
+
+func TestNotifyRequesterResultGating(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	newReviewingReview(t, st, "rvw_reqgate")
+
+	req, err := st.GetReview("rvw_reqgate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Status = "succeeded"
+	req.Verdict = "lgtm"
+	req.RequesterOpenID = "ou_requester"
+
+	// Disabled -> no message.
+	svc := New(st, &fakeLark{enabled: true}, Config{Enabled: true})
+	fake := svc.lark.(*fakeLark)
+	svc.notifyRequesterResult(req)
+	if len(fake.sent) != 0 {
+		t.Fatalf("expected no message when NotifyRequester off, got %#v", fake.sent)
+	}
+
+	// Enabled but no requester -> no message.
+	svc.cfg.NotifyRequester = true
+	req.RequesterOpenID = ""
+	svc.notifyRequesterResult(req)
+	if len(fake.sent) != 0 {
+		t.Fatalf("expected no message without requester, got %#v", fake.sent)
+	}
+
+	// Enabled but not succeeded -> no message.
+	req.RequesterOpenID = "ou_requester"
+	req.Status = "reviewing"
+	svc.notifyRequesterResult(req)
+	if len(fake.sent) != 0 {
+		t.Fatalf("expected no message while reviewing, got %#v", fake.sent)
+	}
+}

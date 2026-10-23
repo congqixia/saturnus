@@ -51,6 +51,10 @@ type Config struct {
 	// PostInlineMinSeverity is the minimum finding severity posted as an
 	// inline comment: P2 (default) posts everything, P1 posts only P0/P1.
 	PostInlineMinSeverity string
+	// NotifyRequester, when enabled, DMs the requester a short summary once a
+	// review succeeds with a structured verdict: verdict, finding counts and
+	// how many inline comments were posted to the PR.
+	NotifyRequester bool
 }
 
 var ErrAlreadyPending = errors.New("review already in progress")
@@ -1932,6 +1936,38 @@ func (s *Service) notifyReviewer(req store.ReviewRequest) {
 		if err := s.lark.ReplyMessage(req.MessageID, text); err != nil {
 			logf("reply in thread: %v", err)
 		}
+	}
+	s.notifyRequesterResult(req)
+}
+
+// notifyRequesterResult DMs the requester a short summary once a review
+// succeeds with a structured verdict: the verdict, the finding count by
+// severity, and how many findings were already posted as inline comments on
+// the PR (per SATURNUS_REVIEW_POST_INLINE_COMMENTS). Deliberately minimal so
+// the full detail stays with the reviewer.
+func (s *Service) notifyRequesterResult(req store.ReviewRequest) {
+	if !s.cfg.NotifyRequester || req.RequesterOpenID == "" || req.Status != "succeeded" || req.Verdict == "" || !s.lark.Enabled() {
+		return
+	}
+	counts := map[string]int{}
+	total, posted := 0, 0
+	for _, f := range s.store.ListFindings(req.ID) {
+		counts[f.Severity]++
+		total++
+		if f.GithubCommentID != "" {
+			posted++
+		}
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "PR 评审完成：%s#%d\n%s\n", req.Repo, req.PRNumber, req.PRURL)
+	fmt.Fprintf(&b, "Verdict: %s\n", verdictLabel(req.Verdict))
+	fmt.Fprintf(&b, "Findings: %d 项 (P0: %d, P1: %d, P2: %d)\n", total, counts["P0"], counts["P1"], counts["P2"])
+	if posted > 0 {
+		fmt.Fprintf(&b, "已发布 %d 条 inline comment 到 PR\n", posted)
+	}
+	fmt.Fprintf(&b, "review: %s", req.ID)
+	if err := s.lark.SendTextToUser(req.RequesterOpenID, b.String()); err != nil {
+		logf("notify requester of result: %v", err)
 	}
 }
 

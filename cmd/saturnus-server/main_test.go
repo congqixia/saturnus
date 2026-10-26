@@ -1030,6 +1030,9 @@ func TestTaskCommandCreateAndDetail(t *testing.T) {
 	if !strings.Contains(detail.text, "a/b#9") {
 		t.Fatalf("unexpected detail reply: %q", detail.text)
 	}
+	if detail.md == nil || !strings.Contains(detail.md.Content, "a/b#9") {
+		t.Fatalf("expected a markdown detail card with the issue, got %#v", detail.md)
+	}
 	missing := srv.taskCommand([]string{"/sat", "task", "tsk_missing"}, "/sat task tsk_missing")
 	if !strings.Contains(missing.text, "Task not found") {
 		t.Fatalf("expected not-found reply, got %q", missing.text)
@@ -1067,6 +1070,14 @@ func TestTaskCommandAddDocAndPR(t *testing.T) {
 	if !strings.Contains(detail.text, "docs:") || !strings.Contains(detail.text, "a/b:docs/x.md") || !strings.Contains(detail.text, "a/b#1") {
 		t.Fatalf("detail missing docs/prs:\n%s", detail.text)
 	}
+	if detail.md == nil {
+		t.Fatal("expected a markdown detail card")
+	}
+	for _, want := range []string{"**Status**", "**Issue**", "**Docs**", "a/b:docs/x.md", "**PRs**", "a/b#1"} {
+		if !strings.Contains(detail.md.Content, want) {
+			t.Fatalf("detail card missing %q:\n%s", want, detail.md.Content)
+		}
+	}
 
 	// Archived tasks reject new PRs.
 	if _, err := st.CloseTask(task.ID); err != nil {
@@ -1090,6 +1101,14 @@ func TestTaskRefreshReply(t *testing.T) {
 	reply := srv.taskRefreshReply(task.ID)
 	if !strings.Contains(reply.text, "Refreshed") || !strings.Contains(reply.text, "prs=1") {
 		t.Fatalf("unexpected refresh reply: %q", reply.text)
+	}
+	if reply.md == nil {
+		t.Fatal("expected a markdown refresh card")
+	}
+	for _, want := range []string{"**Status**", "**Issue**", "**PRs**", "a/b#1"} {
+		if !strings.Contains(reply.md.Content, want) {
+			t.Fatalf("refresh card missing %q:\n%s", want, reply.md.Content)
+		}
 	}
 	all := srv.taskRefreshReply("all")
 	if !strings.Contains(all.text, "Refreshed") {

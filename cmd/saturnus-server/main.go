@@ -1386,7 +1386,115 @@ func (s *server) taskCommand(fields []string, text string) botReply {
 func (s *server) taskDetailReply(task store.Task) botReply {
 	docs := s.tasks.Docs(task.ID)
 	prs := s.tasks.PRs(task.ID)
-	return botReply{text: s.tasks.FormatOne(task, docs, prs)}
+	return botReply{
+		text: s.tasks.FormatOne(task, docs, prs),
+		md: &lark.MarkdownCard{
+			Title:   "Task " + task.ID,
+			Content: formatTaskMarkdown(task, docs, prs),
+		},
+	}
+}
+
+// formatTaskMarkdown renders a single task as markdown for a card, mirroring
+// the review describe view: metadata, bound issue, docs, and per-PR progress.
+// Metadata values are escaped so they cannot break the markdown.
+func formatTaskMarkdown(task store.Task, docs []store.TaskDoc, prs []store.TaskPR) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "**Status**: `%s`\n", task.Status)
+	if task.IssueURL != "" {
+		label := issueRef(task)
+		if label == "-" {
+			label = task.IssueURL
+		}
+		fmt.Fprintf(&b, "**Issue**: [%s](%s)", escapeMarkdown(label), task.IssueURL)
+		if task.IssueState != "" {
+			fmt.Fprintf(&b, " (%s)", task.IssueState)
+		}
+		b.WriteString("\n")
+	}
+	if !task.CreatedAt.IsZero() {
+		fmt.Fprintf(&b, "**Created**: %s\n", task.CreatedAt.Local().Format("2006-01-02 15:04:05"))
+	}
+	if !task.UpdatedAt.IsZero() {
+		fmt.Fprintf(&b, "**Updated**: %s\n", task.UpdatedAt.Local().Format("2006-01-02 15:04:05"))
+	}
+	if !task.ArchivedAt.IsZero() {
+		fmt.Fprintf(&b, "**Archived**: %s\n", task.ArchivedAt.Local().Format("2006-01-02 15:04:05"))
+	}
+	if len(docs) > 0 {
+		b.WriteString("\n**Docs**:\n")
+		for _, doc := range docs {
+			fmt.Fprintf(&b, "- `%s` %s\n", doc.ID, escapeMarkdown(tasks.FormatRepoPath(doc.Repo, doc.Path)))
+		}
+	}
+	if len(prs) > 0 {
+		b.WriteString("\n**PRs**:\n")
+		b.WriteString(formatTaskPRTable(prs))
+	}
+	if task.Description != "" {
+		fmt.Fprintf(&b, "\n**Description**: %s\n", escapeMarkdown(truncateText(task.Description, maxSummaryChars)))
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// formatTaskPRTable renders the per-PR progress of a task as a markdown table.
+// PR and Feishu-task references become links; values are escaped so they cannot
+// break the table.
+func formatTaskPRTable(prs []store.TaskPR) string {
+	var b strings.Builder
+	b.WriteString("| PR | Title | State | Review | Task |\n")
+	b.WriteString("| -- | ----- | ----- | ------ | ---- |\n")
+	for _, pr := range prs {
+		label := fmt.Sprintf("%s#%d", pr.Repo, pr.PRNumber)
+		state := pr.PRState
+		if state == "" {
+			state = "unknown"
+		}
+		review := pr.ReviewStatus
+		if review == "" {
+			review = "none"
+		}
+		taskRef := "-"
+		if pr.FsTaskURL != "" {
+			taskRef = fmt.Sprintf("[%s](%s)", markdownTableCell(pr.FsTaskID), pr.FsTaskURL)
+		} else if pr.FsTaskID != "" {
+			taskRef = pr.FsTaskID
+		}
+		fmt.Fprintf(&b, "| [%s](%s) | %s | %s | %s | %s |\n",
+			markdownTableCell(label), pr.PRURL,
+			markdownTableCell(escapeMarkdown(truncateText(pr.PRTitle, 200))),
+			markdownTableCell(state), markdownTableCell(review), markdownTableCell(taskRef))
+	}
+	return b.String()
+}
+
+// formatTaskRefreshMarkdown renders the outcome of refreshing one task as
+// markdown for a card: the refreshed issue state, the per-PR progress, and any
+// close suggestion.
+func formatTaskRefreshMarkdown(task store.Task, prs []store.TaskPR, suggestion string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "**Status**: `%s`\n", task.Status)
+	if task.IssueURL != "" {
+		label := issueRef(task)
+		if label == "-" {
+			label = task.IssueURL
+		}
+		fmt.Fprintf(&b, "**Issue**: [%s](%s)", escapeMarkdown(label), task.IssueURL)
+		if task.IssueState != "" {
+			fmt.Fprintf(&b, " (%s)", task.IssueState)
+		}
+		b.WriteString("\n")
+	}
+	if len(prs) > 0 {
+		b.WriteString("\n**PRs**:\n")
+		b.WriteString(formatTaskPRTable(prs))
+	} else {
+		b.WriteString("\nNo linked PRs.\n")
+	}
+	if suggestion != "" {
+		fmt.Fprintf(&b, "\n**Suggestion**: %s\n", escapeMarkdown(suggestion))
+	}
+	return strings.TrimSpace(b.String())
 }
 
 // taskRefreshReply refreshes one task (or all non-archived tasks) and reports
@@ -1403,7 +1511,13 @@ func (s *server) taskRefreshReply(target string) botReply {
 	if err != nil {
 		return botReply{text: "Refresh failed: " + err.Error()}
 	}
-	return botReply{text: s.tasks.FormatRefreshResult(task, prs, suggestion)}
+	return botReply{
+		text: s.tasks.FormatRefreshResult(task, prs, suggestion),
+		md: &lark.MarkdownCard{
+			Title:   "Refreshed " + task.ID,
+			Content: formatTaskRefreshMarkdown(task, prs, suggestion),
+		},
+	}
 }
 
 // reviewStatusCell renders a review's status as a colored tag, appending an

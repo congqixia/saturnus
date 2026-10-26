@@ -1,8 +1,11 @@
 package tasks
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -62,6 +65,76 @@ func ResolvePRInfo(ctx context.Context, ghCLI, repo string, num int) PRInfo {
 		return PRInfo{}
 	}
 	return info
+}
+
+// LinkedPR is a pull request discovered from an issue's timeline.
+type LinkedPR struct {
+	Number int
+	URL    string
+}
+
+// timelineEvent is one item of the GitHub issue timeline REST response. Only
+// the fields needed to identify a cross-referenced PR are kept.
+type timelineEvent struct {
+	Event  string `json:"event"`
+	Source *struct {
+		Issue *struct {
+			Number        int                        `json:"number"`
+			RepositoryURL string                     `json:"repository_url"`
+			PullRequest   map[string]json.RawMessage `json:"pull_request"`
+		} `json:"issue"`
+	} `json:"source"`
+}
+
+// ResolveLinkedPRs discovers PRs linked to a GitHub issue by scanning the
+// issue timeline for cross-referenced events. In the timeline payload a PR is
+// a PR-as-issue, so an event whose source issue carries a pull_request field is
+// a PR; plain issue mentions and references from forks or other repositories
+// (bots, dependency repos) are filtered out. The result is deduped by PR
+// number and returned in timeline order. It returns nil when gh is unavailable
+// or the lookup fails.
+func ResolveLinkedPRs(ctx context.Context, ghCLI, repo string, issueNum int) []LinkedPR {
+	if ghCLI == "" {
+		return nil
+	}
+	cmd := exec.CommandContext(ctx, ghCLI, "api",
+		fmt.Sprintf("repos/%s/issues/%d/timeline?per_page=100", repo, issueNum), "--paginate")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	seen := map[int]bool{}
+	var prs []LinkedPR
+	dec := json.NewDecoder(bytes.NewReader(out))
+	for {
+		var events []timelineEvent
+		if err := dec.Decode(&events); err == io.EOF {
+			break
+		} else if err != nil {
+			return nil
+		}
+		for _, ev := range events {
+			if ev.Event != "cross-referenced" || ev.Source == nil || ev.Source.Issue == nil {
+				continue
+			}
+			iss := ev.Source.Issue
+			if iss.PullRequest == nil || !sameRepo(iss.RepositoryURL, repo) {
+				continue
+			}
+			if seen[iss.Number] {
+				continue
+			}
+			seen[iss.Number] = true
+			prs = append(prs, LinkedPR{Number: iss.Number, URL: fmt.Sprintf("https://github.com/%s/pull/%d", repo, iss.Number)})
+		}
+	}
+	return prs
+}
+
+// sameRepo reports whether an API repository URL points at the given
+// owner/repo, ignoring case.
+func sameRepo(apiURL, repo string) bool {
+	return strings.HasSuffix(strings.ToLower(strings.TrimRight(apiURL, "/")), strings.ToLower("/repos/"+repo))
 }
 
 // IsGitDir reports whether path is a git checkout root.

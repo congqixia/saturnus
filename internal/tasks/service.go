@@ -282,6 +282,27 @@ func (s *Service) Refresh(id string) (store.Task, []store.TaskPR, string, error)
 		}
 	}
 
+	// Auto-link PRs that reference this issue on GitHub. The issue timeline
+	// records every cross-referenced PR (closing keywords, prose mentions,
+	// manual Development-panel links), so this removes the manual add-pr step.
+	// AddPR is idempotent (deduped by task_id+repo+pr_number); failures are
+	// skipped so a later refresh retries them.
+	if task.IssueRepo != "" && task.IssueNumber > 0 {
+		prs := s.store.ListTaskPRs(task.ID)
+		linked := map[int]bool{}
+		for _, p := range prs {
+			linked[p.PRNumber] = true
+		}
+		for _, lp := range ResolveLinkedPRs(ctx, s.cfg.GHCli, task.IssueRepo, task.IssueNumber) {
+			if linked[lp.Number] {
+				continue
+			}
+			if _, err := s.AddPR(task.ID, lp.URL); err == nil {
+				linked[lp.Number] = true
+			}
+		}
+	}
+
 	prs := s.store.ListTaskPRs(task.ID)
 	now := time.Now().UTC()
 	allMerged := len(prs) > 0

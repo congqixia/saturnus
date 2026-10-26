@@ -180,6 +180,88 @@ func TestServiceAddPRSnapshotsReviewAndState(t *testing.T) {
 	}
 }
 
+// fakeGHAutoLink writes an executable "gh" stub for the task refresh flow:
+// it answers `issue view`, `pr view` and the timeline `api` call so a task
+// can auto-discover its linked PR.
+func fakeGHAutoLink(t *testing.T) string {
+	t.Helper()
+	script := filepath.Join(t.TempDir(), "gh")
+	content := `#!/bin/sh
+if [ "$1" = "issue" ] && [ "$3" = "10" ]; then
+  printf '%s\n' '{"number":10,"title":"Tracked issue","state":"open","url":"https://github.com/a/b/issues/10"}'
+  exit 0
+fi
+if [ "$1" = "api" ] && [ "$2" = "repos/a/b/issues/10/timeline?per_page=100" ]; then
+  printf '%s\n' '[{"event":"cross-referenced","source":{"type":"issue","issue":{"number":7,"repository_url":"https://api.github.com/repos/a/b","pull_request":{"url":"https://api.github.com/repos/a/b/pulls/7"}}}}]'
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$3" = "7" ]; then
+  printf '%s\n' '{"number":7,"title":"Implement it","state":"OPEN","url":"https://github.com/a/b/pull/7","baseRefName":"main"}'
+  exit 0
+fi
+echo "unexpected gh call: $*" >&2
+exit 1
+`
+	if err := os.WriteFile(script, []byte(content), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return script
+}
+
+func TestServiceRefreshAutoLinksLinkedPRs(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	svc := New(st, Config{Enabled: true, GHCli: fakeGHAutoLink(t), Repos: map[string]string{"a/b": "/tmp/a"}})
+	task, err := svc.Create("https://github.com/a/b/issues/10")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, prs, _, err := svc.Refresh(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prs) != 1 || prs[0].PRNumber != 7 || prs[0].PRTitle != "Implement it" || prs[0].PRState != "OPEN" {
+		t.Fatalf("expected auto-linked PR 7, got %#v", prs)
+	}
+
+	// A second refresh must not duplicate the already-linked PR.
+	_, prs, _, err = svc.Refresh(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prs) != 1 || prs[0].PRNumber != 7 {
+		t.Fatalf("expected the linked PR to stay deduped, got %#v", prs)
+	}
+}
+
+func TestServiceRefreshAutoLinkSkipsExistingPRs(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	svc := New(st, Config{Enabled: true, GHCli: fakeGHAutoLink(t), Repos: map[string]string{"a/b": "/tmp/a"}})
+	task, err := svc.Create("https://github.com/a/b/issues/10")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.AddPR(task.ID, "https://github.com/a/b/pull/7"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, prs, _, err := svc.Refresh(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prs) != 1 || prs[0].PRNumber != 7 {
+		t.Fatalf("expected the manually linked PR 7, got %#v", prs)
+	}
+}
+
 func TestServiceRefreshUpdatesSnapshotsAndSuggestsClose(t *testing.T) {
 	st, err := store.Open(t.TempDir() + "/saturnus.db")
 	if err != nil {

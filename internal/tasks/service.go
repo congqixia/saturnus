@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"saturnus/internal/keylock"
 	"saturnus/internal/store"
 )
 
@@ -17,8 +18,14 @@ import (
 // review module: only repos mapped to a local checkout can host issues, docs
 // and PRs.
 type Config struct {
-	Enabled bool
-	GHCli   string
+	// Context cancels manual and scheduled refreshes when the server stops.
+	Context         context.Context
+	Enabled         bool
+	GHCli           string
+	RefreshInterval time.Duration
+	RefreshTimeout  time.Duration
+	// SyncReview receives previously fetched metadata and never starts a review.
+	SyncReview func(context.Context, string, int, PRInfo) error
 	// Repos maps owner/repo -> local checkout path (see SATURNUS_REVIEW_REPOS).
 	Repos map[string]string
 }
@@ -32,11 +39,18 @@ var ErrDisabled = errors.New("tasks module is disabled")
 type Service struct {
 	store *store.Store
 	cfg   Config
+	locks keylock.Map
 }
 
 func New(st *store.Store, cfg Config) *Service {
 	if cfg.GHCli == "" {
 		cfg.GHCli = "gh"
+	}
+	if cfg.Context == nil {
+		cfg.Context = context.Background()
+	}
+	if cfg.RefreshTimeout <= 0 {
+		cfg.RefreshTimeout = time.Minute
 	}
 	return &Service{store: st, cfg: cfg}
 }
@@ -195,6 +209,16 @@ func (s *Service) AddPR(taskID, prURL string) (store.TaskPR, error) {
 	if !s.cfg.Enabled {
 		return store.TaskPR{}, ErrDisabled
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.RefreshTimeout)
+	defer cancel()
+	stop := context.AfterFunc(s.cfg.Context, cancel)
+	defer stop()
+	unlock, err := s.locks.Lock(ctx, "task:"+taskID)
+	if err != nil {
+		return store.TaskPR{}, err
+	}
+	defer unlock()
+
 	task, err := s.store.GetTask(taskID)
 	if err != nil {
 		return store.TaskPR{}, err
@@ -209,9 +233,7 @@ func (s *Service) AddPR(taskID, prURL string) (store.TaskPR, error) {
 	if _, ok := s.cfg.Repos[req.Repo]; !ok {
 		return store.TaskPR{}, fmt.Errorf("repo is not in the task whitelist: %s", req.Repo)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	info := ResolvePRInfo(ctx, s.cfg.GHCli, req.Repo, req.PRNumber)
+	info, lookupErr := FetchPRInfo(ctx, s.cfg.GHCli, req.Repo, req.PRNumber)
 	pr := store.TaskPR{
 		TaskID:   taskID,
 		Repo:     req.Repo,
@@ -223,26 +245,48 @@ func (s *Service) AddPR(taskID, prURL string) (store.TaskPR, error) {
 	if info.BaseBranch != "" {
 		pr.BaseBranch = info.BaseBranch
 	}
-	pr.SyncedAt = time.Now().UTC()
-	s.snapshotReview(&pr, req.Repo, req.PRNumber)
-	return s.store.AddTaskPR(pr)
+	if lookupErr != nil {
+		existing, err := s.store.TaskPRsForRefresh(ctx, taskID)
+		if err != nil {
+			return store.TaskPR{}, err
+		}
+		for _, old := range existing {
+			if old.Repo == req.Repo && old.PRNumber == req.PRNumber {
+				pr.PRTitle, pr.PRState, pr.BaseBranch, pr.SyncedAt = old.PRTitle, old.PRState, old.BaseBranch, old.SyncedAt
+			}
+		}
+	}
+	pr.SyncAttemptedAt = time.Now().UTC()
+	if lookupErr == nil {
+		pr.SyncedAt = pr.SyncAttemptedAt
+	} else {
+		pr.SyncError = lookupErr.Error()
+	}
+	if err := s.snapshotReview(&pr, req.Repo, req.PRNumber); err != nil {
+		return store.TaskPR{}, err
+	}
+	return s.store.AddTaskPRContext(ctx, pr, false)
 }
 
 // snapshotReview copies the linked review's status and Feishu task references
 // into a TaskPR snapshot.
-func (s *Service) snapshotReview(pr *store.TaskPR, repo string, num int) {
+func (s *Service) snapshotReview(pr *store.TaskPR, repo string, num int) error {
 	review, err := s.store.GetReviewByPR(repo, num)
 	if err != nil {
+		if !errors.Is(err, store.ErrNotFound) {
+			return err
+		}
 		pr.ReviewID = ""
 		pr.ReviewStatus = "none"
 		pr.FsTaskID = ""
 		pr.FsTaskURL = ""
-		return
+		return nil
 	}
 	pr.ReviewID = review.ID
 	pr.ReviewStatus = review.Status
 	pr.FsTaskID = review.TaskID
 	pr.FsTaskURL = review.TaskURL
+	return nil
 }
 
 func (s *Service) RemovePR(id string) error {
@@ -252,117 +296,34 @@ func (s *Service) RemovePR(id string) error {
 	return s.store.RemoveTaskPR(id)
 }
 
-// Refresh re-syncs a task with its issue and every linked PR, updating the
-// per-PR snapshots (PR state, review status, Feishu task). It never archives
-// the task itself; the returned suggestion hints whether to close it.
+// Refresh is the compatibility wrapper for bot callers.
 func (s *Service) Refresh(id string) (store.Task, []store.TaskPR, string, error) {
-	if !s.cfg.Enabled {
-		return store.Task{}, nil, "", ErrDisabled
-	}
-	task, err := s.store.GetTask(id)
-	if err != nil {
-		return store.Task{}, nil, "", err
-	}
-	if task.Status == store.TaskStatusArchived {
-		return store.Task{}, nil, "", ErrArchived
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	if task.IssueRepo != "" && task.IssueNumber > 0 {
-		info := ResolveIssueInfo(ctx, s.cfg.GHCli, task.IssueRepo, task.IssueNumber)
-		if info.Title != "" {
-			task.IssueTitle = info.Title
-		}
-		if info.State != "" {
-			task.IssueState = info.State
-		}
-		if info.URL != "" {
-			task.IssueURL = info.URL
-		}
-	}
-
-	// Auto-link PRs that reference this issue on GitHub. The issue timeline
-	// records every cross-referenced PR (closing keywords, prose mentions,
-	// manual Development-panel links), so this removes the manual add-pr step.
-	// AddPR is idempotent (deduped by task_id+repo+pr_number); failures are
-	// skipped so a later refresh retries them.
-	if task.IssueRepo != "" && task.IssueNumber > 0 {
-		prs := s.store.ListTaskPRs(task.ID)
-		linked := map[int]bool{}
-		for _, p := range prs {
-			linked[p.PRNumber] = true
-		}
-		for _, lp := range ResolveLinkedPRs(ctx, s.cfg.GHCli, task.IssueRepo, task.IssueNumber) {
-			if linked[lp.Number] {
-				continue
-			}
-			if _, err := s.AddPR(task.ID, lp.URL); err == nil {
-				linked[lp.Number] = true
-			}
-		}
-	}
-
-	prs := s.store.ListTaskPRs(task.ID)
-	now := time.Now().UTC()
-	allMerged := len(prs) > 0
-	for i := range prs {
-		info := ResolvePRInfo(ctx, s.cfg.GHCli, prs[i].Repo, prs[i].PRNumber)
-		if info.Title != "" {
-			prs[i].PRTitle = info.Title
-		}
-		if info.State != "" {
-			prs[i].PRState = info.State
-		}
-		if info.BaseBranch != "" {
-			prs[i].BaseBranch = info.BaseBranch
-		}
-		prs[i].SyncedAt = now
-		s.snapshotReview(&prs[i], prs[i].Repo, prs[i].PRNumber)
-		if _, err := s.store.UpdateTaskPR(prs[i]); err != nil {
-			return store.Task{}, nil, "", err
-		}
-		if prs[i].PRState != "MERGED" {
-			allMerged = false
-		}
-	}
-
-	suggestion := ""
-	if task.IssueState == "CLOSED" {
-		suggestion = "issue is CLOSED"
-	} else if allMerged && len(prs) > 0 {
-		suggestion = "all PRs merged"
-	}
-	if suggestion != "" {
-		suggestion = "Consider /sat task close " + id + " (" + suggestion + ")."
-	}
-
-	task.UpdatedAt = time.Now().UTC()
-	if _, err := s.store.UpdateTask(task); err != nil {
-		return store.Task{}, nil, "", err
-	}
-	return task, prs, suggestion, nil
+	result, err := s.RefreshContext(context.Background(), id)
+	return result.Task, result.PRs, result.Suggestion, err
 }
 
-// RefreshAll refreshes every non-archived task. Per-task failures are reported
-// in the returned map instead of aborting the sweep.
+// RefreshAll preserves the manual non-archived scope, including done tasks.
 func (s *Service) RefreshAll() ([]store.Task, map[string]string, error) {
-	if !s.cfg.Enabled {
-		return nil, nil, ErrDisabled
+	results, err := s.Sweep(context.Background(), false)
+	if err != nil {
+		return nil, nil, err
 	}
-	tasks := s.store.ListTasks("", false)
-	errs := map[string]string{}
-	var out []store.Task
-	for _, task := range tasks {
-		refreshed, _, suggestion, err := s.Refresh(task.ID)
-		if err != nil {
-			errs[task.ID] = err.Error()
-			continue
+	out := []store.Task{}
+	notes := map[string]string{}
+	for _, result := range results {
+		if result.Task.ID != "" {
+			out = append(out, result.Task)
 		}
-		out = append(out, refreshed)
-		if suggestion != "" {
-			errs[task.ID] = suggestion
+		note := strings.Join(result.Errors, "; ")
+		if result.Suggestion != "" {
+			if note != "" {
+				note += "; "
+			}
+			note += result.Suggestion
+		}
+		if note != "" {
+			notes[result.TaskID] = note
 		}
 	}
-	return out, errs, nil
+	return out, notes, nil
 }

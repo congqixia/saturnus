@@ -1,5 +1,9 @@
 # Tasks Module Plan
 
+For the background refresh extension, see
+[Task Background Refresh](task-auto-refresh.md). That design supersedes the
+original request-scoped refresh assumption below.
+
 ## Goal
 
 Add a `Tasks` module to Saturnus that tracks a feature/effort end to end by

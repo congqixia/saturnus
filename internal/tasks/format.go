@@ -37,6 +37,17 @@ func (s *Service) FormatOne(task store.Task, docs []store.TaskDoc, prs []store.T
 	if !task.ArchivedAt.IsZero() {
 		fmt.Fprintf(&b, "\narchived_at=%s", task.ArchivedAt.Format(time.RFC3339))
 	}
+	if task.RefreshedAt.IsZero() {
+		b.WriteString("\nlast_successful_refresh=never")
+	} else {
+		fmt.Fprintf(&b, "\nlast_successful_refresh=%s", task.RefreshedAt.Format(time.RFC3339))
+	}
+	if task.RefreshError != "" {
+		fmt.Fprintf(&b, "\nrefresh_error=%s", task.RefreshError)
+	}
+	if suggestion := CloseSuggestion(task, prs); suggestion != "" {
+		fmt.Fprintf(&b, "\n%s", suggestion)
+	}
 	if len(docs) > 0 {
 		fmt.Fprintf(&b, "\ndocs:")
 		for _, doc := range docs {
@@ -77,6 +88,9 @@ func (s *Service) FormatRefreshResult(task store.Task, prs []store.TaskPR, sugge
 	}
 	if suggestion != "" {
 		fmt.Fprintf(&b, "\n%s", suggestion)
+	}
+	if task.RefreshError != "" {
+		fmt.Fprintf(&b, "\nrefresh_error=%s", task.RefreshError)
 	}
 	return b.String()
 }

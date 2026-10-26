@@ -54,6 +54,10 @@ func main() {
 }
 
 func run(ctx context.Context, addr, data, staticDir string) (err error) {
+	taskCfg, err := tasksConfig()
+	if err != nil {
+		return err
+	}
 	st, err := store.Open(data)
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
@@ -75,13 +79,19 @@ func run(ctx context.Context, addr, data, staticDir string) (err error) {
 		store:     st,
 		lark:      larkClient,
 		reviews:   review.New(st, larkClient, reviewConfig()),
-		tasks:     tasks.New(st, tasksConfig()),
 		cloudops:  cloudopsClient,
 		botUsers:  splitCSV(os.Getenv("SATURNUS_COMMAND_ALLOWED_USERS")),
 		botOpenID: resolveBotOpenID(larkClient),
 	}
+	taskCfg.Context = ctx
+	taskCfg.SyncReview = func(ctx context.Context, repo string, num int, info tasks.PRInfo) error {
+		return s.reviews.SyncPR(ctx, repo, num, review.PRInfo{Title: info.Title, BaseBranch: info.BaseBranch, HeadCommit: info.HeadCommit, State: info.State})
+	}
+	s.tasks = tasks.New(st, taskCfg)
 	s.reviews.Start()
 	defer s.reviews.Stop()
+	stopRefresh := s.tasks.Start(ctx)
+	defer stopRefresh()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", s.health)
@@ -502,9 +512,6 @@ func (s *server) updateTask(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if req.Title != nil {
-		task.Title = *req.Title
-	}
 	if req.Status != nil {
 		if *req.Status == store.TaskStatusArchived {
 			updated, err := s.tasks.Close(task.ID)
@@ -515,12 +522,8 @@ func (s *server) updateTask(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, map[string]any{"task": updated})
 			return
 		}
-		task.Status = *req.Status
 	}
-	if req.Description != nil {
-		task.Description = *req.Description
-	}
-	updated, err := s.store.UpdateTask(task)
+	updated, err := s.store.PatchTask(task.ID, req.Title, req.Status, req.Description)
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -584,12 +587,12 @@ func (s *server) removeTaskPR(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) refreshTask(w http.ResponseWriter, r *http.Request) {
-	task, prs, suggestion, err := s.tasks.Refresh(r.PathValue("task_id"))
+	result, err := s.tasks.RefreshContext(r.Context(), r.PathValue("task_id"))
 	if err != nil {
 		writeStoreError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"task": task, "prs": prs, "suggestion": suggestion})
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *server) larkEvents(w http.ResponseWriter, r *http.Request) {
@@ -1418,6 +1421,10 @@ func formatTaskMarkdown(task store.Task, docs []store.TaskDoc, prs []store.TaskP
 	if !task.UpdatedAt.IsZero() {
 		fmt.Fprintf(&b, "**Updated**: %s\n", task.UpdatedAt.Local().Format("2006-01-02 15:04:05"))
 	}
+	b.WriteString(formatTaskFreshness(task))
+	if suggestion := tasks.CloseSuggestion(task, prs); suggestion != "" {
+		fmt.Fprintf(&b, "%s\n", escapeMarkdown(suggestion))
+	}
 	if !task.ArchivedAt.IsZero() {
 		fmt.Fprintf(&b, "**Archived**: %s\n", task.ArchivedAt.Local().Format("2006-01-02 15:04:05"))
 	}
@@ -1435,6 +1442,19 @@ func formatTaskMarkdown(task store.Task, docs []store.TaskDoc, prs []store.TaskP
 		fmt.Fprintf(&b, "\n**Description**: %s\n", escapeMarkdown(truncateText(task.Description, maxSummaryChars)))
 	}
 	return strings.TrimSpace(b.String())
+}
+
+func formatTaskFreshness(task store.Task) string {
+	var b strings.Builder
+	if task.RefreshedAt.IsZero() {
+		b.WriteString("**Last successful refresh**: never\n")
+	} else {
+		fmt.Fprintf(&b, "**Last successful refresh**: %s\n", task.RefreshedAt.Local().Format("2006-01-02 15:04:05"))
+	}
+	if task.RefreshError != "" {
+		fmt.Fprintf(&b, "**Refresh error**: %s\n", escapeMarkdown(task.RefreshError))
+	}
+	return b.String()
 }
 
 // formatTaskPRTable renders the per-PR progress of a task as a markdown table.
@@ -1485,6 +1505,7 @@ func formatTaskRefreshMarkdown(task store.Task, prs []store.TaskPR, suggestion s
 		}
 		b.WriteString("\n")
 	}
+	b.WriteString(formatTaskFreshness(task))
 	if len(prs) > 0 {
 		b.WriteString("\n**PRs**:\n")
 		b.WriteString(formatTaskPRTable(prs))
@@ -2441,12 +2462,33 @@ func reviewConfig() review.Config {
 
 // tasksConfig loads the Tasks module config. The repo whitelist is shared with
 // the review module (SATURNUS_REVIEW_REPOS).
-func tasksConfig() tasks.Config {
-	return tasks.Config{
-		Enabled: os.Getenv("SATURNUS_TASKS_ENABLED") == "1",
-		GHCli:   os.Getenv("SATURNUS_TASKS_GH_CLI"),
-		Repos:   review.ParseRepoMap(os.Getenv("SATURNUS_REVIEW_REPOS")),
+func tasksConfig() (tasks.Config, error) {
+	interval, err := strictDuration("SATURNUS_TASKS_REFRESH_INTERVAL", 5*time.Minute, true)
+	if err != nil {
+		return tasks.Config{}, err
 	}
+	timeout, err := strictDuration("SATURNUS_TASKS_REFRESH_TIMEOUT", time.Minute, false)
+	if err != nil {
+		return tasks.Config{}, err
+	}
+	return tasks.Config{
+		Enabled:         os.Getenv("SATURNUS_TASKS_ENABLED") == "1",
+		GHCli:           os.Getenv("SATURNUS_TASKS_GH_CLI"),
+		Repos:           review.ParseRepoMap(os.Getenv("SATURNUS_REVIEW_REPOS")),
+		RefreshInterval: interval, RefreshTimeout: timeout,
+	}, nil
+}
+
+func strictDuration(name string, fallback time.Duration, allowZero bool) (time.Duration, error) {
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback, nil
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil || duration < 0 || (!allowZero && duration == 0) {
+		return 0, fmt.Errorf("invalid %s: %q", name, value)
+	}
+	return duration, nil
 }
 
 // cloudopsFromEnv loads the cloud-ops client config from

@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"saturnus/internal/keylock"
 	"saturnus/internal/lark"
 	"saturnus/internal/store"
 )
@@ -129,6 +130,8 @@ type larkClient interface {
 	SendTextToUser(openID, text string) error
 	CreateTask(input lark.CreateTaskInput) (lark.Task, error)
 	GetTask(taskGUID string) (lark.Task, error)
+	GetTaskContext(context.Context, string) (lark.Task, error)
+	UpdateTaskContext(context.Context, string, lark.UpdateTaskInput) error
 	UpdateTask(taskGUID string, input lark.UpdateTaskInput) error
 	ReplyMessage(messageID, text string) error
 	EnsureTaskList(name string) (lark.TaskList, error)
@@ -143,13 +146,14 @@ type job struct {
 }
 
 type Service struct {
-	store  *store.Store
-	lark   larkClient
-	cfg    Config
-	jobs   chan job
-	wg     sync.WaitGroup
-	ctx    context.Context
-	cancel context.CancelFunc
+	syncLocks keylock.Map
+	store     *store.Store
+	lark      larkClient
+	cfg       Config
+	jobs      chan job
+	wg        sync.WaitGroup
+	ctx       context.Context
+	cancel    context.CancelFunc
 
 	// nameFailures tracks recent requester-name resolution failures by open_id
 	// so repeated lookups (e.g. web UI polling) do not hammer the contact API
@@ -626,6 +630,27 @@ func requesterDisplayName(req store.ReviewRequest) string {
 // chat/message/thread context is still updated so the latest request is
 // recorded in the review thread.
 func (s *Service) retryFinished(existing *store.ReviewRequest, ctx MessageContext, reason string) (store.ReviewRequest, error) {
+	lockCtx := s.ctx
+	if lockCtx == nil {
+		lockCtx = context.Background()
+	}
+	unlock, err := s.syncLocks.Lock(lockCtx, existing.ID)
+	if err != nil {
+		return store.ReviewRequest{}, err
+	}
+	defer unlock()
+	fresh, err := s.store.GetReview(existing.ID)
+	if err != nil {
+		return store.ReviewRequest{}, err
+	}
+	if fresh.Status == "pending" || fresh.Status == "reviewing" {
+		return fresh, ErrAlreadyPending
+	}
+	if fresh.Status == "archived" {
+		return fresh, ErrArchived
+	}
+	*existing = fresh
+
 	existing.Status = "pending"
 	existing.ResultText, existing.Error = "", ""
 	existing.Verdict, existing.Summary = "", ""
@@ -677,72 +702,22 @@ type RefreshResult struct {
 	Error         string
 }
 
-// Refresh re-syncs a review with its PR and Feishu task:
-//   - if the PR was merged or closed the review is archived (hidden from
-//     default listings) and its tracking task is completed;
-//   - if a previously archived PR was reopened the review is restored;
-//   - any new reviewer reviews on the PR are appended to the task description
-//     (tracked via TaskSyncedAt so each comment is synced once).
-func (s *Service) Refresh(id string, ctx MessageContext) (store.ReviewRequest, RefreshResult, error) {
-	var res RefreshResult
+// Refresh keeps sender authorization at the manual entry point.
+func (s *Service) Refresh(id string, message MessageContext) (store.ReviewRequest, RefreshResult, error) {
 	if !s.cfg.Enabled {
-		return store.ReviewRequest{}, res, errors.New("PR review is disabled")
+		return store.ReviewRequest{}, RefreshResult{}, errors.New("PR review is disabled")
 	}
-	if !s.allowed(ctx.SenderOpenID) {
-		return store.ReviewRequest{}, res, errors.New("sender not allowed to refresh a review")
+	if !s.allowed(message.SenderOpenID) {
+		return store.ReviewRequest{}, RefreshResult{}, errors.New("sender not allowed to refresh a review")
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
 	req, err := s.store.GetReview(id)
 	if err != nil {
-		return store.ReviewRequest{}, res, err
+		return req, RefreshResult{}, err
 	}
-
-	ctx2, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	info := ResolvePRInfo(ctx2, s.cfg.GHCli, req.Repo, req.PRNumber)
-	res.PRState = info.State
-	if res.PRState == "" {
-		res.Error = "cannot resolve PR state (is gh configured?)"
-	}
-	// Record the PR's current head commit so listings can flag reviews whose
-	// last run predates the latest commit (OUTDATED).
-	if info.HeadCommit != "" {
-		req.PrHeadCommit = info.HeadCommit
-	}
-
-	now := time.Now().UTC()
-	req.RefreshedAt = now
-
-	switch res.PRState {
-	case "MERGED", "CLOSED":
-		if req.Status != "archived" {
-			req.Status = "archived"
-			req.ArchivedAt = now
-			res.Archived = true
-		}
-		// Complete the task only on the archive transition: the task API
-		// rejects completing an already-completed task.
-		if res.Archived && req.TaskID != "" && s.lark.Enabled() {
-			if err := s.lark.UpdateTask(req.TaskID, lark.UpdateTaskInput{Completed: boolPtr(true)}); err != nil {
-				res.Error = joinErrors(res.Error, "complete task: "+err.Error())
-			} else {
-				res.TaskCompleted = true
-			}
-		}
-	case "OPEN":
-		if req.Status == "archived" {
-			req.Status = "succeeded"
-			req.ArchivedAt = time.Time{}
-			res.Unarchived = true
-		}
-		if req.TaskID != "" && s.lark.Enabled() {
-			s.syncReviewsToTask(&req, &res, ctx2)
-		}
-	}
-
-	if _, err := s.store.UpdateReview(req); err != nil {
-		return store.ReviewRequest{}, res, err
-	}
-	return req, res, nil
+	info := ResolvePRInfo(ctx, s.cfg.GHCli, req.Repo, req.PRNumber)
+	return s.syncReview(ctx, id, info)
 }
 
 // RefreshAll refreshes every non-archived review and returns one result per
@@ -760,46 +735,6 @@ func (s *Service) RefreshAll(ctx MessageContext) ([]store.ReviewRequest, []Refre
 		results = append(results, res)
 	}
 	return out, results, nil
-}
-
-// syncReviewsToTask appends reviewer reviews newer than TaskSyncedAt onto the
-// review's Feishu task description and advances the sync marker.
-func (s *Service) syncReviewsToTask(req *store.ReviewRequest, res *RefreshResult, ctx context.Context) {
-	reviews := ResolvePRReviews(ctx, s.cfg.GHCli, req.Repo, req.PRNumber)
-	var newOnes []PRReview
-	var newest time.Time
-	for _, r := range reviews {
-		t, err := time.Parse(time.RFC3339, r.SubmittedAt)
-		if err != nil {
-			continue
-		}
-		if t.After(req.TaskSyncedAt) {
-			newOnes = append(newOnes, r)
-			if t.After(newest) {
-				newest = t
-			}
-		}
-	}
-	if len(newOnes) == 0 {
-		return
-	}
-	task, err := s.lark.GetTask(req.TaskID)
-	if err != nil {
-		res.Error = joinErrors(res.Error, "load task: "+err.Error())
-		return
-	}
-	desc := task.Description
-	for _, r := range newOnes {
-		desc += fmt.Sprintf("\n\n[review] %s (%s) %s\n%s", r.User, r.State, r.SubmittedAt, truncate(strings.TrimSpace(r.Body), 500))
-	}
-	desc = strings.TrimSpace(desc)
-	if err := s.lark.UpdateTask(req.TaskID, lark.UpdateTaskInput{Description: &desc}); err != nil {
-		res.Error = joinErrors(res.Error, "update task: "+err.Error())
-		return
-	}
-	res.NewReviews = len(newOnes)
-	res.TaskUpdated = true
-	req.TaskSyncedAt = newest
 }
 
 // FormatRefreshResult renders the outcome of a refresh for the command reply.
@@ -921,7 +856,7 @@ func (s *Service) maybeCreateTask(req *store.ReviewRequest) {
 	}
 	req.TaskID = task.GUID
 	req.TaskURL = task.URL
-	if _, err := s.store.UpdateReview(*req); err != nil {
+	if err := s.store.SetReviewTask(req.ID, req.TaskID, req.TaskURL); err != nil {
 		logf("store task id: %v", err)
 	}
 	s.notifyRequesterTaskCreated(*req)
@@ -982,7 +917,7 @@ func (s *Service) SetRequester(id, openID, name string) (store.ReviewRequest, er
 		}
 	}
 	req.RequesterName = name
-	if _, err := s.store.UpdateReview(req); err != nil {
+	if err := s.store.SetReviewRequester(req.ID, req.RequesterOpenID, req.RequesterName); err != nil {
 		return store.ReviewRequest{}, err
 	}
 	return req, nil
@@ -1889,7 +1824,7 @@ func (s *Service) resolveRequesterName(req *store.ReviewRequest) error {
 	}
 	s.clearNameFailure(req.RequesterOpenID)
 	req.RequesterName = name
-	if _, err := s.store.UpdateReview(*req); err != nil {
+	if err := s.store.SetReviewRequesterName(req.ID, req.RequesterOpenID, req.RequesterName); err != nil {
 		return fmt.Errorf("store requester name for %s: %w", req.ID, err)
 	}
 	return nil

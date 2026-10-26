@@ -1,15 +1,18 @@
 package review
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type PRInfo struct {
@@ -39,6 +42,7 @@ func ResolvePRInfo(ctx context.Context, ghCLI, repo string, num int) PRInfo {
 // PRReview is one submitted GitHub review (APPROVED / CHANGES_REQUESTED /
 // COMMENTED). Pending reviews are filtered out.
 type PRReview struct {
+	ID          int64  `json:"id"`
 	User        string `json:"user"`
 	State       string `json:"state"`
 	Body        string `json:"body"`
@@ -47,22 +51,49 @@ type PRReview struct {
 
 // ResolvePRReviews returns the submitted reviews of a PR, oldest first.
 func ResolvePRReviews(ctx context.Context, ghCLI, repo string, num int) []PRReview {
-	if ghCLI == "" {
-		return nil
-	}
-	cmd := exec.CommandContext(ctx, ghCLI, "api",
-		fmt.Sprintf("repos/%s/pulls/%d/reviews", repo, num),
-		"--jq", `[.[] | select(.state != "PENDING") | {user: .user.login, state: .state, body: .body, submitted_at: .submitted_at}]`,
-	)
-	out, err := cmd.Output()
-	if err != nil {
-		return nil
-	}
-	var reviews []PRReview
-	if err := json.Unmarshal(out, &reviews); err != nil {
-		return nil
-	}
+	reviews, _ := FetchPRReviews(ctx, ghCLI, repo, num)
 	return reviews
+}
+
+// FetchPRReviews decodes every paginated array and never hides a later-page error.
+func FetchPRReviews(ctx context.Context, ghCLI, repo string, num int) ([]PRReview, error) {
+	if ghCLI == "" {
+		return nil, fmt.Errorf("GitHub CLI is not configured")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, ghCLI, "api", fmt.Sprintf("repos/%s/pulls/%d/reviews", repo, num), "--paginate",
+		"--jq", `[.[] | select(.state != "PENDING") | {id: .id, user: .user.login, state: .state, body: .body, submitted_at: .submitted_at}]`)
+	cmd.WaitDelay = time.Second
+	out, err := cmd.Output()
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(bytes.TrimSpace(out)) == 0 || bytes.TrimSpace(out)[0] != '[' {
+		return nil, fmt.Errorf("invalid PR reviews payload")
+	}
+	dec := json.NewDecoder(bytes.NewReader(out))
+	reviews := []PRReview{}
+	for {
+		var page []PRReview
+		if err := dec.Decode(&page); err == io.EOF {
+			break
+		} else if err != nil {
+			return nil, err
+		}
+		if page == nil {
+			return nil, fmt.Errorf("invalid PR reviews page")
+		}
+		for _, r := range page {
+			if r.State != "PENDING" {
+				reviews = append(reviews, r)
+			}
+		}
+	}
+	return reviews, nil
 }
 
 func IsGitDir(path string) bool {

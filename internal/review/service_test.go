@@ -1,6 +1,7 @@
 package review
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -530,14 +531,28 @@ func (f *fakeLark) CreateTask(lark.CreateTaskInput) (lark.Task, error) {
 func (f *fakeLark) GetTask(taskGUID string) (lark.Task, error) {
 	return f.task, nil
 }
+func (f *fakeLark) GetTaskContext(ctx context.Context, id string) (lark.Task, error) {
+	if err := ctx.Err(); err != nil {
+		return lark.Task{}, err
+	}
+	return f.GetTask(id)
+}
+func (f *fakeLark) UpdateTaskContext(ctx context.Context, id string, input lark.UpdateTaskInput) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return f.UpdateTask(id, input)
+}
 func (f *fakeLark) UpdateTask(taskGUID string, input lark.UpdateTaskInput) error {
 	desc := ""
 	if input.Description != nil {
 		desc = *input.Description
+		f.task.Description = desc
 	}
 	completed := false
 	if input.Completed != nil {
 		completed = *input.Completed
+		f.task.Completed = completed
 	}
 	f.taskUpdates = append(f.taskUpdates, fmt.Sprintf("%s|completed=%v|%s", taskGUID, completed, desc))
 	return nil
@@ -863,6 +878,7 @@ func newReviewForRetry(t *testing.T, st *store.Store, id, status, head, session,
 
 func retryService(t *testing.T, st *store.Store, gh string) *Service {
 	return &Service{
+		ctx:   context.Background(),
 		store: st,
 		lark:  &fakeLark{enabled: true},
 		cfg: Config{

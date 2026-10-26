@@ -101,6 +101,9 @@ export type ReviewFinding = {
 }
 
 export type Task = {
+ refresh_attempted_at?: string
+ refreshed_at?: string
+ refresh_error: string
   id: string
   title: string
   status: string
@@ -125,6 +128,8 @@ export type TaskDoc = {
 }
 
 export type TaskPR = {
+ sync_attempted_at?: string
+ sync_error: string
   id: string
   task_id: string
   repo: string

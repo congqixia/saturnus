@@ -293,7 +293,7 @@ func TestServiceRefreshUpdatesSnapshotsAndSuggestsClose(t *testing.T) {
 	if suggestion == "" {
 		t.Fatal("expected close suggestion for closed issue")
 	}
-	if prs[0].SyncedAt.IsZero() {
-		t.Fatal("expected synced_at to be set after refresh")
+	if !prs[0].SyncedAt.IsZero() || prs[0].SyncError == "" || refreshed.RefreshError == "" || !refreshed.RefreshedAt.IsZero() {
+		t.Fatalf("failed lookups must retain freshness and expose errors: task=%+v pr=%+v", refreshed, prs[0])
 	}
 }

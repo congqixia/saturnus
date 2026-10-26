@@ -214,7 +214,10 @@ type ReviewFinding struct {
 // review pipeline creates; Feishu task references on linked PRs are stored as
 // fs_task_id/fs_task_url.
 type Task struct {
-	ID string `json:"id"`
+	RefreshAttemptedAt time.Time `json:"refresh_attempted_at,omitempty"`
+	RefreshedAt        time.Time `json:"refreshed_at,omitempty"`
+	RefreshError       string    `json:"refresh_error"`
+	ID                 string    `json:"id"`
 	// Title is the human-readable task title.
 	Title string `json:"title"`
 	// Status is open / in_progress / done / archived.
@@ -252,9 +255,11 @@ type TaskDoc struct {
 // (via ReviewID) on attach and refresh, so the row is self-contained and does
 // not depend on live review lookups to render.
 type TaskPR struct {
-	ID     string `json:"id"`
-	TaskID string `json:"task_id"`
-	Repo   string `json:"repo"`
+	SyncAttemptedAt time.Time `json:"sync_attempted_at,omitempty"`
+	SyncError       string    `json:"sync_error"`
+	ID              string    `json:"id"`
+	TaskID          string    `json:"task_id"`
+	Repo            string    `json:"repo"`
 	// PRNumber and PRURL identify the PR.
 	PRNumber int    `json:"pr_number"`
 	PRURL    string `json:"pr_url"`
@@ -635,6 +640,17 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	if err := s.ensureColumn(ctx, "review_findings", "github_comment_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
+	}
+	for _, col := range []struct{ table, name, definition string }{
+		{"tasks", "refresh_attempted_at", "TEXT"},
+		{"tasks", "refreshed_at", "TEXT"},
+		{"tasks", "refresh_error", "TEXT NOT NULL DEFAULT ''"},
+		{"task_prs", "sync_attempted_at", "TEXT"},
+		{"task_prs", "sync_error", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := s.ensureColumn(ctx, col.table, col.name, col.definition); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -1833,7 +1849,7 @@ func (s *Store) CreateTask(task Task) (Task, error) {
 func (s *Store) GetTask(id string) (Task, error) {
 	row := s.db.QueryRow(`
 		SELECT id, title, status, issue_repo, issue_number, issue_title, issue_state, issue_url,
-			description, archived_at, created_at, updated_at
+			description, archived_at, created_at, updated_at, refresh_attempted_at, refreshed_at, refresh_error
 		FROM tasks
 		WHERE id = ?
 	`, id)
@@ -1853,7 +1869,7 @@ func (s *Store) GetTask(id string) (Task, error) {
 func (s *Store) ListTasks(status string, includeArchived bool) []Task {
 	query := `
 		SELECT id, title, status, issue_repo, issue_number, issue_title, issue_state, issue_url,
-			description, archived_at, created_at, updated_at
+			description, archived_at, created_at, updated_at, refresh_attempted_at, refreshed_at, refresh_error
 		FROM tasks
 	`
 	var conds []string
@@ -1910,16 +1926,29 @@ func (s *Store) UpdateTask(task Task) (Task, error) {
 
 // CloseTask archives a task: sets status archived and records archived_at.
 func (s *Store) CloseTask(id string) (Task, error) {
-	task, err := s.GetTask(id)
+	ctx := context.Background()
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Task{}, err
 	}
-	if task.Status == TaskStatusArchived {
-		return task, nil
+	defer rollback(tx)
+	result, err := tx.ExecContext(ctx, `UPDATE tasks SET status='archived', archived_at=?, updated_at=? WHERE id=? AND status!='archived'`, timeText(time.Now().UTC()), timeText(time.Now().UTC()), id)
+	if err != nil {
+		return Task{}, err
 	}
-	task.Status = TaskStatusArchived
-	task.ArchivedAt = time.Now().UTC()
-	return s.UpdateTask(task)
+	n, err := result.RowsAffected()
+	if err != nil {
+		return Task{}, err
+	}
+	if n > 0 {
+		if err := audit(ctx, tx, "system", "task.update", id, mustJSON(map[string]string{"status": "archived"})); err != nil {
+			return Task{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return Task{}, err
+	}
+	return s.GetTask(id)
 }
 
 func (s *Store) AddTaskDoc(doc TaskDoc) (TaskDoc, error) {
@@ -1974,10 +2003,10 @@ func (s *Store) RemoveTaskDoc(id string) error {
 // AddTaskPR inserts or upserts a linked PR (deduped by task_id+repo+pr_number).
 // On conflict the PR fields and review snapshot are refreshed.
 func (s *Store) AddTaskPR(pr TaskPR) (TaskPR, error) {
-	ctx := context.Background()
-	if _, err := s.GetTask(pr.TaskID); err != nil {
-		return TaskPR{}, err
-	}
+	return s.AddTaskPRContext(context.Background(), pr, false)
+}
+
+func (s *Store) AddTaskPRContext(ctx context.Context, pr TaskPR, activeOnly bool) (TaskPR, error) {
 	if pr.ID == "" {
 		pr.ID = "tpr_" + newID()
 	}
@@ -1988,29 +2017,41 @@ func (s *Store) AddTaskPR(pr TaskPR) (TaskPR, error) {
 		pr.CreatedAt = time.Now().UTC()
 	}
 	pr.UpdatedAt = time.Now().UTC()
-	_, err := s.db.ExecContext(ctx, `
+	result, err := s.db.ExecContext(ctx, `
 		INSERT INTO task_prs (id, task_id, repo, pr_number, pr_url, pr_title, pr_state, base_branch,
-			review_id, review_status, fs_task_id, fs_task_url, synced_at, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			review_id, review_status, fs_task_id, fs_task_url, synced_at, created_at, updated_at, sync_attempted_at, sync_error)
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+ FROM tasks WHERE id = ? AND status != 'archived' AND (? = 0 OR status IN ('open', 'in_progress'))
 		ON CONFLICT(task_id, repo, pr_number) DO UPDATE SET
 			pr_url = excluded.pr_url, pr_title = excluded.pr_title, pr_state = excluded.pr_state,
 			base_branch = excluded.base_branch, review_id = excluded.review_id,
 			review_status = excluded.review_status,
 			fs_task_id = COALESCE(NULLIF(excluded.fs_task_id, ''), fs_task_id),
 			fs_task_url = COALESCE(NULLIF(excluded.fs_task_url, ''), fs_task_url),
-			synced_at = COALESCE(excluded.synced_at, synced_at), updated_at = excluded.updated_at
+			synced_at = COALESCE(excluded.synced_at, synced_at), updated_at = excluded.updated_at, sync_attempted_at=excluded.sync_attempted_at, sync_error=excluded.sync_error
 	`, pr.ID, pr.TaskID, pr.Repo, pr.PRNumber, pr.PRURL, pr.PRTitle, pr.PRState, pr.BaseBranch,
-		pr.ReviewID, pr.ReviewStatus, pr.FsTaskID, pr.FsTaskURL, nullableTimeText(pr.SyncedAt), timeText(pr.CreatedAt), timeText(pr.UpdatedAt))
+		pr.ReviewID, pr.ReviewStatus, pr.FsTaskID, pr.FsTaskURL, nullableTimeText(pr.SyncedAt), timeText(pr.CreatedAt), timeText(pr.UpdatedAt), nullableTimeText(pr.SyncAttemptedAt), pr.SyncError, pr.TaskID, activeOnly)
 	if err != nil {
 		return TaskPR{}, err
 	}
-	return pr, nil
+	n, err := result.RowsAffected()
+	if err != nil {
+		return TaskPR{}, err
+	}
+	if n == 0 {
+		return TaskPR{}, ErrNotFound
+	}
+	var id string
+	if err := s.db.QueryRowContext(ctx, `SELECT id FROM task_prs WHERE task_id=? AND repo=? AND pr_number=?`, pr.TaskID, pr.Repo, pr.PRNumber).Scan(&id); err != nil {
+		return TaskPR{}, err
+	}
+	return s.GetTaskPR(id)
 }
 
 func (s *Store) GetTaskPR(id string) (TaskPR, error) {
 	row := s.db.QueryRow(`
 		SELECT id, task_id, repo, pr_number, pr_url, pr_title, pr_state, base_branch,
-			review_id, review_status, fs_task_id, fs_task_url, synced_at, created_at, updated_at
+			review_id, review_status, fs_task_id, fs_task_url, synced_at, created_at, updated_at, sync_attempted_at, sync_error
 		FROM task_prs
 		WHERE id = ?
 	`, id)
@@ -2027,7 +2068,7 @@ func (s *Store) GetTaskPR(id string) (TaskPR, error) {
 func (s *Store) ListTaskPRs(taskID string) []TaskPR {
 	rows, err := s.db.Query(`
 		SELECT id, task_id, repo, pr_number, pr_url, pr_title, pr_state, base_branch,
-			review_id, review_status, fs_task_id, fs_task_url, synced_at, created_at, updated_at
+			review_id, review_status, fs_task_id, fs_task_url, synced_at, created_at, updated_at, sync_attempted_at, sync_error
 		FROM task_prs
 		WHERE task_id = ?
 		ORDER BY created_at ASC
@@ -2048,16 +2089,26 @@ func (s *Store) ListTaskPRs(taskID string) []TaskPR {
 }
 
 func (s *Store) UpdateTaskPR(pr TaskPR) (TaskPR, error) {
-	ctx := context.Background()
+	return s.UpdateTaskPRContext(context.Background(), pr, false)
+}
+
+func (s *Store) UpdateTaskPRContext(ctx context.Context, pr TaskPR, activeOnly bool) (TaskPR, error) {
 	pr.UpdatedAt = time.Now().UTC()
-	_, err := s.db.ExecContext(ctx, `
-		UPDATE task_prs
-		SET pr_url = ?, pr_title = ?, pr_state = ?, base_branch = ?, review_id = ?,
-			review_status = ?, fs_task_id = ?, fs_task_url = ?, synced_at = ?, updated_at = ?
-		WHERE id = ?
-	`, pr.PRURL, pr.PRTitle, pr.PRState, pr.BaseBranch, pr.ReviewID,
-		pr.ReviewStatus, pr.FsTaskID, pr.FsTaskURL, nullableTimeText(pr.SyncedAt), timeText(pr.UpdatedAt), pr.ID)
-	return pr, err
+	result, err := s.db.ExecContext(ctx, `UPDATE task_prs
+ SET pr_url=?, pr_title=?, pr_state=?, base_branch=?, review_id=?, review_status=?, fs_task_id=?, fs_task_url=?, synced_at=?, updated_at=?, sync_attempted_at=?, sync_error=?
+ WHERE id=? AND EXISTS (SELECT 1 FROM tasks WHERE id=task_prs.task_id AND status != 'archived' AND (?=0 OR status IN ('open','in_progress')))`,
+		pr.PRURL, pr.PRTitle, pr.PRState, pr.BaseBranch, pr.ReviewID, pr.ReviewStatus, pr.FsTaskID, pr.FsTaskURL, nullableTimeText(pr.SyncedAt), timeText(pr.UpdatedAt), nullableTimeText(pr.SyncAttemptedAt), pr.SyncError, pr.ID, activeOnly)
+	if err != nil {
+		return TaskPR{}, err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return TaskPR{}, err
+	}
+	if n == 0 {
+		return TaskPR{}, ErrNotFound
+	}
+	return pr, nil
 }
 
 func (s *Store) RemoveTaskPR(id string) error {
@@ -2313,15 +2364,17 @@ func scanReviewFinding(row reviewFindingScanner) (ReviewFinding, error) {
 
 func scanTask(row taskScanner) (Task, error) {
 	var task Task
-	var archivedAt sql.NullString
+	var archivedAt, attemptedAt, refreshedAt sql.NullString
 	var createdAt string
 	var updatedAt string
 	if err := row.Scan(
 		&task.ID, &task.Title, &task.Status, &task.IssueRepo, &task.IssueNumber, &task.IssueTitle,
-		&task.IssueState, &task.IssueURL, &task.Description, &archivedAt, &createdAt, &updatedAt,
+		&task.IssueState, &task.IssueURL, &task.Description, &archivedAt, &createdAt, &updatedAt, &attemptedAt, &refreshedAt, &task.RefreshError,
 	); err != nil {
 		return Task{}, err
 	}
+	task.RefreshAttemptedAt, _ = parseNullTime(attemptedAt)
+	task.RefreshedAt, _ = parseNullTime(refreshedAt)
 	task.ArchivedAt, _ = parseNullTime(archivedAt)
 	task.CreatedAt, _ = parseTime(createdAt)
 	task.UpdatedAt, _ = parseTime(updatedAt)
@@ -2340,15 +2393,16 @@ func scanTaskDoc(row taskDocScanner) (TaskDoc, error) {
 
 func scanTaskPR(row taskPRScanner) (TaskPR, error) {
 	var pr TaskPR
-	var syncedAt sql.NullString
+	var syncedAt, attemptedAt sql.NullString
 	var createdAt string
 	var updatedAt string
 	if err := row.Scan(
 		&pr.ID, &pr.TaskID, &pr.Repo, &pr.PRNumber, &pr.PRURL, &pr.PRTitle, &pr.PRState, &pr.BaseBranch,
-		&pr.ReviewID, &pr.ReviewStatus, &pr.FsTaskID, &pr.FsTaskURL, &syncedAt, &createdAt, &updatedAt,
+		&pr.ReviewID, &pr.ReviewStatus, &pr.FsTaskID, &pr.FsTaskURL, &syncedAt, &createdAt, &updatedAt, &attemptedAt, &pr.SyncError,
 	); err != nil {
 		return TaskPR{}, err
 	}
+	pr.SyncAttemptedAt, _ = parseNullTime(attemptedAt)
 	pr.SyncedAt, _ = parseNullTime(syncedAt)
 	pr.CreatedAt, _ = parseTime(createdAt)
 	pr.UpdatedAt, _ = parseTime(updatedAt)

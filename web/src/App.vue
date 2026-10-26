@@ -285,6 +285,8 @@ const taskColumns = computed<DataTableColumns<Task>>(() => [
 ])
 
 const taskPrColumns = computed<DataTableColumns<TaskPR>>(() => [
+ { title: 'Last synced', key: 'synced_at', render: (row) => row.synced_at && !row.synced_at.startsWith('0001-') ? formatTime(row.synced_at) : 'Never' },
+ { title: 'Sync error', key: 'sync_error', render: (row) => row.sync_error || '-' },
   {
     title: 'PR',
     key: 'pr',
@@ -327,6 +329,13 @@ const taskPrColumns = computed<DataTableColumns<TaskPR>>(() => [
     }
   }
 ])
+
+function taskArchiveSuggestion(task: Task, prs: TaskPR[]): string {
+ if (task.status === 'archived') return '-'
+ if (task.issue_state === 'CLOSED') return 'Consider archiving: issue is closed'
+ if (prs.length > 0 && prs.every((pr) => pr.pr_state === 'MERGED')) return 'Consider archiving: all PRs merged'
+ return '-'
+}
 
 function prStateTagType(state: string): 'success' | 'error' | 'warning' | 'default' {
   switch (state) {
@@ -576,6 +585,15 @@ import { h } from 'vue'
                   </NDescriptionsItem>
                   <NDescriptionsItem label="Updated">
                     {{ formatTime(store.selectedTask.updated_at) }}
+                  </NDescriptionsItem>
+                  <NDescriptionsItem label="Last successful refresh">
+                    {{ store.selectedTask.refreshed_at && !store.selectedTask.refreshed_at.startsWith('0001-') ? formatTime(store.selectedTask.refreshed_at) : 'Never' }}
+                  </NDescriptionsItem>
+                  <NDescriptionsItem label="Refresh error">
+                    {{ store.selectedTask.refresh_error || '-' }}
+                  </NDescriptionsItem>
+                  <NDescriptionsItem label="Suggested action">
+                    {{ taskArchiveSuggestion(store.selectedTask, store.selectedTaskPrs) }}
                   </NDescriptionsItem>
                 </NDescriptions>
                 <div v-if="store.selectedTaskDocs.length" class="task-docs">

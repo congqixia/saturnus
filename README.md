@@ -674,3 +674,26 @@ scripts/saturnus-codex-hook.sh
 ```
 
 See `docs/plan/codex-integration.md` for the full setup and behavior guide.
+
+## Task background refresh
+
+When `SATURNUS_TASKS_ENABLED=1`, the server immediately scans `open` and
+`in_progress` tasks in the background, then waits five minutes after each scan.
+It refreshes issues, discovers linked PRs, updates PR metadata, synchronizes
+existing reviews when enabled, and snapshots their resulting state. Closed PRs
+are checked too, so reopening can be detected. It never starts reviews or
+archives feature tasks automatically.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `SATURNUS_TASKS_REFRESH_INTERVAL` | `5m` | Delay after a completed scan; `0` disables automatic refresh |
+| `SATURNUS_TASKS_REFRESH_TIMEOUT` | `60s` | Per-task refresh timeout; must be positive |
+
+Invalid durations fail server startup. Manual refresh retains its existing
+non-archived scope, including `done` tasks. Automatic refresh runs independently
+of Web polling and preserves successful snapshots when a remote query fails.
+Task and PR details expose the latest successful refresh and stage errors.
+With review/Lark enabled, existing review refresh effects also apply, including
+Feishu task completion and incremental submitted-review descriptions. The
+scheduler is cancelled and joined before SQLite closes during server shutdown.
+See [Task Background Refresh](docs/plan/task-auto-refresh.md) for design details.

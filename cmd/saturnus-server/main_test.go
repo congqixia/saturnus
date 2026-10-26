@@ -554,6 +554,12 @@ type fakeLarkName struct {
 	name string
 }
 
+func (f *fakeLarkName) GetTaskContext(ctx context.Context, id string) (lark.Task, error) {
+	return f.GetTask(id)
+}
+func (f *fakeLarkName) UpdateTaskContext(ctx context.Context, id string, input lark.UpdateTaskInput) error {
+	return f.UpdateTask(id, input)
+}
 func (f *fakeLarkName) Enabled() bool                      { return true }
 func (f *fakeLarkName) GetUserName(string) (string, error) { return f.name, nil }
 func (f *fakeLarkName) SendText(_, _, _ string) error      { return nil }
@@ -1361,5 +1367,32 @@ func TestPostBotCommandRejectsInvalid(t *testing.T) {
 	reply = srv.handleBotCommand("/sat post rvw_missing", review.MessageContext{SenderOpenID: "ou_x"})
 	if !strings.Contains(reply.text, "Post comments failed") {
 		t.Fatalf("expected failure reply, got %q", reply.text)
+	}
+}
+
+func TestTasksRefreshConfig(t *testing.T) {
+	t.Setenv("SATURNUS_TASKS_REFRESH_INTERVAL", "")
+	t.Setenv("SATURNUS_TASKS_REFRESH_TIMEOUT", "")
+	cfg, err := tasksConfig()
+	if err != nil || cfg.RefreshInterval != 5*time.Minute || cfg.RefreshTimeout != time.Minute {
+		t.Fatalf("cfg=%+v err=%v", cfg, err)
+	}
+	t.Setenv("SATURNUS_TASKS_REFRESH_INTERVAL", "0")
+	cfg, err = tasksConfig()
+	if err != nil || cfg.RefreshInterval != 0 {
+		t.Fatalf("cannot disable: %+v %v", cfg, err)
+	}
+	for _, value := range []string{"-1s", "invalid"} {
+		t.Setenv("SATURNUS_TASKS_REFRESH_INTERVAL", value)
+		if _, err := tasksConfig(); err == nil {
+			t.Fatalf("accepted interval %q", value)
+		}
+	}
+	t.Setenv("SATURNUS_TASKS_REFRESH_INTERVAL", "1m")
+	for _, value := range []string{"0", "-1s", "invalid"} {
+		t.Setenv("SATURNUS_TASKS_REFRESH_TIMEOUT", value)
+		if _, err := tasksConfig(); err == nil {
+			t.Fatalf("accepted timeout %q", value)
+		}
 	}
 }

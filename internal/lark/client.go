@@ -2,6 +2,7 @@ package lark
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -23,6 +25,7 @@ type Config struct {
 type Client struct {
 	cfg        Config
 	httpClient *http.Client
+	tokenMu    sync.Mutex
 	token      string
 	tokenExp   time.Time
 }
@@ -192,12 +195,16 @@ func (c *Client) sendJSON(method, url string, payload any) error {
 // non-nil, decodes the response body into it. Empty payloads are allowed (e.g.
 // a PATCH with an empty object).
 func (c *Client) sendJSONDecode(method, url string, payload any, out any) error {
-	token, err := c.tenantToken()
+	return c.sendJSONDecodeContext(context.Background(), method, url, payload, out)
+}
+
+func (c *Client) sendJSONDecodeContext(ctx context.Context, method, url string, payload any, out any) error {
+	token, err := c.tenantTokenContext(ctx)
 	if err != nil {
 		return err
 	}
 	body, _ := json.Marshal(payload)
-	req, err := http.NewRequest(method, url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -208,9 +215,22 @@ func (c *Client) sendJSONDecode(method, url string, payload any, out any) error 
 		return err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
 	if resp.StatusCode >= 300 {
 		return fmt.Errorf("lark api failed: %s (%s)", resp.Status, larkErrorDetail(raw))
+	}
+	var envelope struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return err
+	}
+	if envelope.Code != 0 {
+		return fmt.Errorf("lark api failed: code=%d msg=%s", envelope.Code, envelope.Msg)
 	}
 	if out != nil {
 		if err := json.Unmarshal(raw, out); err != nil {
@@ -396,17 +416,21 @@ type Task struct {
 
 // GetTask fetches a Feishu task by guid.
 func (c *Client) GetTask(taskGUID string) (Task, error) {
+	return c.GetTaskContext(context.Background(), taskGUID)
+}
+
+func (c *Client) GetTaskContext(ctx context.Context, taskGUID string) (Task, error) {
 	if !c.Enabled() {
 		return Task{}, errors.New("lark client disabled")
 	}
 	if taskGUID == "" {
 		return Task{}, errors.New("empty task guid")
 	}
-	token, err := c.tenantToken()
+	token, err := c.tenantTokenContext(ctx)
 	if err != nil {
 		return Task{}, err
 	}
-	req, err := http.NewRequest(http.MethodGet, "https://open.feishu.cn/open-apis/task/v2/tasks/"+url.PathEscape(taskGUID), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://open.feishu.cn/open-apis/task/v2/tasks/"+url.PathEscape(taskGUID), nil)
 	if err != nil {
 		return Task{}, err
 	}
@@ -416,7 +440,10 @@ func (c *Client) GetTask(taskGUID string) (Task, error) {
 		return Task{}, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return Task{}, err
+	}
 	if resp.StatusCode >= 300 {
 		return Task{}, fmt.Errorf("lark get task failed: %s (%s)", resp.Status, larkErrorDetail(raw))
 	}
@@ -430,6 +457,7 @@ func (c *Client) GetTask(taskGUID string) (Task, error) {
 				Summary     string `json:"summary"`
 				Description string `json:"description"`
 				Completed   bool   `json:"completed"`
+				CompletedAt string `json:"completed_at"`
 			} `json:"task"`
 		} `json:"data"`
 	}
@@ -444,7 +472,7 @@ func (c *Client) GetTask(taskGUID string) (Task, error) {
 		URL:         out.Data.Task.URL,
 		Summary:     out.Data.Task.Summary,
 		Description: out.Data.Task.Description,
-		Completed:   out.Data.Task.Completed,
+		Completed:   out.Data.Task.Completed || (out.Data.Task.CompletedAt != "" && out.Data.Task.CompletedAt != "0"),
 	}, nil
 }
 
@@ -466,6 +494,10 @@ const taskDescriptionMaxRunes = 3000
 // expressed via `completed_at` (ms timestamp, or "0" to reopen). Requires the
 // task:task write scope.
 func (c *Client) UpdateTask(taskGUID string, input UpdateTaskInput) error {
+	return c.UpdateTaskContext(context.Background(), taskGUID, input)
+}
+
+func (c *Client) UpdateTaskContext(ctx context.Context, taskGUID string, input UpdateTaskInput) error {
 	if !c.Enabled() {
 		return nil
 	}
@@ -476,7 +508,7 @@ func (c *Client) UpdateTask(taskGUID string, input UpdateTaskInput) error {
 	if !ok {
 		return nil
 	}
-	return c.sendJSON(http.MethodPatch, "https://open.feishu.cn/open-apis/task/v2/tasks/"+url.PathEscape(taskGUID), payload)
+	return c.sendJSONDecodeContext(ctx, http.MethodPatch, "https://open.feishu.cn/open-apis/task/v2/tasks/"+url.PathEscape(taskGUID), payload, nil)
 }
 
 // buildTaskUpdate renders the task v2 PATCH request body: the fields to change
@@ -893,12 +925,20 @@ func isAllDigits(value string) bool {
 }
 
 func (c *Client) tenantToken() (string, error) {
+	return c.tenantTokenContext(context.Background())
+}
+
+func (c *Client) tenantTokenContext(ctx context.Context) (string, error) {
+	c.tokenMu.Lock()
 	if c.token != "" && time.Now().Before(c.tokenExp.Add(-time.Minute)) {
-		return c.token, nil
+		token := c.token
+		c.tokenMu.Unlock()
+		return token, nil
 	}
+	c.tokenMu.Unlock()
 	payload := map[string]string{"app_id": c.cfg.AppID, "app_secret": c.cfg.AppSecret}
 	body, _ := json.Marshal(payload)
-	req, err := http.NewRequest(http.MethodPost, "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal", bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
@@ -920,6 +960,8 @@ func (c *Client) tenantToken() (string, error) {
 	if out.Code != 0 {
 		return "", fmt.Errorf("lark tenant token failed: %s", out.Msg)
 	}
+	c.tokenMu.Lock()
+	defer c.tokenMu.Unlock()
 	c.token = out.TenantAccessToken
 	c.tokenExp = time.Now().Add(time.Duration(out.Expire) * time.Second)
 	return c.token, nil

@@ -110,7 +110,7 @@ Supported text commands:
 - `/sat review <review_id>`
 - `/sat retry <review_id>` — retry a failed review, or re-run a successful one after its PR head commit moved
 - `/sat post <review_id>` — publish a review's findings as GitHub inline comments (plus the verdict review); for reviews whose findings were never posted (feature off at the time, or a posting failure)
-- `/sat refresh <review_id|all>` — re-sync PR/task state: archive merged/closed PRs (and complete their task), restore reopened PRs, append new reviewer comments to the task
+- `/sat refresh <review_id|all>` — re-sync PR/task state: archive merged/closed PRs (and complete their task), restore reopened PRs, sync new reviewer comments to the task
 - `/sat act <review_id> <instruction>` — resume the review's tool session to act on the PR (e.g. post inline comments for selected issues, work out concrete code for an issue); the agent output is sent back to the chat
 - `/sat threads <review_id>` — list every chat thread a review was requested in
 - `/sat describe review <review_id>` — show full details of one review (as a card), including the run history
@@ -454,9 +454,13 @@ review) re-syncs a review with its PR and Feishu task:
   from default listings) and its Feishu task is marked completed.
 - If a previously archived PR was reopened, the review is restored to
   `succeeded`.
-- If the reviewer submitted new reviews/comments on the PR, they are appended to
-  the task description (tracked by `task_synced_at`, so each comment is synced
-  once). This requires `gh` and the `task:task` write scope.
+- If the reviewer submitted new reviews/comments on the PR, every comment is
+  durably stored (the `review_comments` table is the source of truth) and the
+  task description is rebuilt as a bounded, rotating summary of the newest ones
+  (tracked by `task_synced_at`, so each comment is synced once). When the
+  description hits the 3000-char limit, the oldest entries rotate out of the
+  description but stay in the store, so a full description never blocks sync.
+  This requires `gh` and the `task:task` write scope.
 - The PR's current head commit is recorded as `pr_head_commit` (separate from
   `head_commit`, the last reviewed head), so listings can flag stale results.
 

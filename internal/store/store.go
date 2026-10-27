@@ -18,20 +18,20 @@ import (
 )
 
 type Agent struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Type      string    `json:"type"`
-	Host      string    `json:"host"`
-	Version   string    `json:"version"`
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Type    string `json:"type"`
+	Host    string `json:"host"`
+	Version string `json:"version"`
 	// Role discriminates what the agent does: "review-worker" runs remote
 	// reviews for the scheduler, "codex" (or empty) is a coding/approval agent.
 	Role string `json:"role,omitempty"`
 	// Capabilities is the JSON-encoded WorkerCapabilities for review workers.
 	Capabilities string `json:"capabilities,omitempty"`
 	// WorkerToken authenticates a review worker's WebSocket control channel.
-	WorkerToken string `json:"worker_token,omitempty"`
-	LastSeen  time.Time `json:"last_seen"`
-	CreatedAt time.Time `json:"created_at"`
+	WorkerToken string    `json:"worker_token,omitempty"`
+	LastSeen    time.Time `json:"last_seen"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 type Session struct {
@@ -144,15 +144,15 @@ type ReviewRequest struct {
 	Tool            string `json:"tool"`
 	// WorkerID is the review worker currently assigned to run this review
 	// (empty when pending, or when a local in-process worker runs it).
-	WorkerID  string `json:"worker_id,omitempty"`
-	TaskID    string `json:"task_id"`
-	TaskURL   string `json:"task_url"`
-	SessionID string `json:"session_id"`
-	HeadCommit      string `json:"head_commit"`
-	PrHeadCommit    string `json:"pr_head_commit"`
-	RetryReason     string `json:"retry_reason"`
-	ResultText      string `json:"result_text"`
-	Error           string `json:"error"`
+	WorkerID     string `json:"worker_id,omitempty"`
+	TaskID       string `json:"task_id"`
+	TaskURL      string `json:"task_url"`
+	SessionID    string `json:"session_id"`
+	HeadCommit   string `json:"head_commit"`
+	PrHeadCommit string `json:"pr_head_commit"`
+	RetryReason  string `json:"retry_reason"`
+	ResultText   string `json:"result_text"`
+	Error        string `json:"error"`
 	// Verdict is the structured PR opinion produced by the last review run
 	// (lgtm / request_change / nit_comments), and Summary is its short
 	// overview. They are populated when the review tool POSTed a
@@ -173,7 +173,8 @@ type ReviewRequest struct {
 	// RefreshedAt records the last /sat refresh of this review.
 	RefreshedAt time.Time `json:"refreshed_at,omitempty"`
 	// TaskSyncedAt is the submitted_at of the newest PR review already synced
-	// to the Feishu task, so later refreshes only append new reviewer comments.
+	// to the Feishu task, so later refreshes only pick up new reviewer comments.
+	// The full review log is kept in review_comments (see ReviewComment).
 	TaskSyncedAt time.Time `json:"task_synced_at,omitempty"`
 }
 
@@ -183,22 +184,22 @@ type ReviewRequest struct {
 // analogous to review_runs but tied to reviewer instructions rather than review
 // executions.
 type ReviewReaction struct {
-	ID           string    `json:"id"`
-	ReviewID     string    `json:"review_id"`
-	Instruction  string    `json:"instruction"`
-	Status       string    `json:"status"`
-	ChatID       string    `json:"chat_id"`
-	MessageID    string    `json:"message_id"`
-	SenderOpenID string    `json:"sender_open_id"`
-	SenderName   string    `json:"sender_name"`
-	SessionID    string    `json:"session_id"`
+	ID           string `json:"id"`
+	ReviewID     string `json:"review_id"`
+	Instruction  string `json:"instruction"`
+	Status       string `json:"status"`
+	ChatID       string `json:"chat_id"`
+	MessageID    string `json:"message_id"`
+	SenderOpenID string `json:"sender_open_id"`
+	SenderName   string `json:"sender_name"`
+	SessionID    string `json:"session_id"`
 	// WorkerID is the review worker that executed this reaction (empty for a
 	// local in-process run).
-	WorkerID   string    `json:"worker_id,omitempty"`
-	ResultText string    `json:"result_text"`
-	Error      string    `json:"error"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	WorkerID    string    `json:"worker_id,omitempty"`
+	ResultText  string    `json:"result_text"`
+	Error       string    `json:"error"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 	CompletedAt time.Time `json:"completed_at,omitempty"`
 }
 
@@ -223,6 +224,25 @@ type ReviewFinding struct {
 	Status          string    `json:"status"`
 	GithubCommentID string    `json:"github_comment_id,omitempty"`
 	CreatedAt       time.Time `json:"created_at"`
+}
+
+// ReviewComment is one PR review comment already synced from GitHub into the
+// durable local store. It is the source of truth for the review log: the
+// Feishu task description only holds a bounded, rotating summary of the newest
+// comments, so a full description never loses history.
+type ReviewComment struct {
+	ID       string `json:"id"`
+	ReviewID string `json:"review_id"`
+	// Key is the dedupe marker (the GitHub review id, or a content digest for
+	// legacy payloads without ids); UNIQUE(review_id, key) makes saves
+	// idempotent across a remote-success/local-save-failure retry.
+	Key            string    `json:"key"`
+	GithubReviewID int64     `json:"github_review_id"`
+	User           string    `json:"user"`
+	State          string    `json:"state"`
+	Body           string    `json:"body"`
+	SubmittedAt    time.Time `json:"submitted_at"`
+	SyncedAt       time.Time `json:"synced_at"`
 }
 
 // Task is a feature tracking record that binds one GitHub issue to its local
@@ -559,6 +579,19 @@ func (s *Store) migrate(ctx context.Context) error {
 			created_at TEXT NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_review_findings_review ON review_findings(review_id, created_at ASC)`,
+		`CREATE TABLE IF NOT EXISTS review_comments (
+			id TEXT PRIMARY KEY,
+			review_id TEXT NOT NULL REFERENCES review_requests(id) ON DELETE CASCADE,
+			key TEXT NOT NULL,
+			github_review_id INTEGER NOT NULL DEFAULT 0,
+			user TEXT NOT NULL DEFAULT '',
+			state TEXT NOT NULL DEFAULT '',
+			body TEXT NOT NULL DEFAULT '',
+			submitted_at TEXT NOT NULL,
+			synced_at TEXT NOT NULL,
+			UNIQUE(review_id, key)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_review_comments_review ON review_comments(review_id, submitted_at ASC)`,
 		`CREATE TABLE IF NOT EXISTS chat_modes (
 			chat_id TEXT PRIMARY KEY,
 			mode TEXT NOT NULL DEFAULT 'review',
@@ -1574,6 +1607,87 @@ func (s *Store) ListFindings(reviewID string) []ReviewFinding {
 	return out
 }
 
+// SaveReviewComments durably persists the given PR review comments for a
+// review. Comments whose key is already present (UNIQUE(review_id, key)) are
+// skipped, so a retry after a remote-success/local-save-failure never
+// duplicates. It returns the number of comments newly inserted.
+func (s *Store) SaveReviewComments(ctx context.Context, reviewID string, comments []ReviewComment) (int, error) {
+	if len(comments) == 0 {
+		return 0, nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer rollback(tx)
+	inserted := 0
+	for _, c := range comments {
+		if c.ID == "" {
+			c.ID = "rc_" + newID()
+		}
+		if c.SyncedAt.IsZero() {
+			c.SyncedAt = time.Now().UTC()
+		}
+		res, err := tx.ExecContext(ctx, `
+			INSERT OR IGNORE INTO review_comments (id, review_id, key, github_review_id, user, state, body, submitted_at, synced_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, c.ID, reviewID, c.Key, c.GithubReviewID, c.User, c.State, c.Body, timeText(c.SubmittedAt), timeText(c.SyncedAt))
+		if err != nil {
+			return 0, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+		inserted += int(n)
+	}
+	return inserted, tx.Commit()
+}
+
+// ListReviewComments returns the synced PR review comments of a review, oldest
+// first. Like ListFindings, ordering uses rowid (insertion order) rather than
+// the stored submitted_at text, whose RFC3339Nano representation strips
+// trailing fractional zeros and is not reliably chronological.
+func (s *Store) ListReviewComments(ctx context.Context, reviewID string) ([]ReviewComment, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, review_id, key, github_review_id, user, state, body, submitted_at, synced_at
+		FROM review_comments
+		WHERE review_id = ?
+		ORDER BY rowid ASC
+	`, reviewID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []ReviewComment{}
+	for rows.Next() {
+		c, err := scanReviewComment(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// ReviewCommentKeys returns the dedupe keys already persisted for a review.
+func (s *Store) ReviewCommentKeys(ctx context.Context, reviewID string) (map[string]bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT key FROM review_comments WHERE review_id = ?`, reviewID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	keys := map[string]bool{}
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		keys[key] = true
+	}
+	return keys, rows.Err()
+}
+
 func (s *Store) FailInterruptedReviews() ([]string, error) {
 	ctx := context.Background()
 	rows, err := s.db.Query(`SELECT id FROM review_requests WHERE status = 'reviewing'`)
@@ -2188,6 +2302,10 @@ type reviewFindingScanner interface {
 	Scan(dest ...any) error
 }
 
+type reviewCommentScanner interface {
+	Scan(dest ...any) error
+}
+
 type taskScanner interface {
 	Scan(dest ...any) error
 }
@@ -2400,6 +2518,19 @@ func scanReviewFinding(row reviewFindingScanner) (ReviewFinding, error) {
 	f.RunID = runID.String
 	f.CreatedAt, _ = parseTime(createdAt)
 	return f, nil
+}
+
+func scanReviewComment(row reviewCommentScanner) (ReviewComment, error) {
+	var c ReviewComment
+	var submittedAt, syncedAt string
+	if err := row.Scan(
+		&c.ID, &c.ReviewID, &c.Key, &c.GithubReviewID, &c.User, &c.State, &c.Body, &submittedAt, &syncedAt,
+	); err != nil {
+		return ReviewComment{}, err
+	}
+	c.SubmittedAt, _ = parseTime(submittedAt)
+	c.SyncedAt, _ = parseTime(syncedAt)
+	return c, nil
 }
 
 func scanTask(row taskScanner) (Task, error) {

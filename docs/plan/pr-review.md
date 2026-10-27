@@ -100,11 +100,17 @@ thread row.
 | task_synced_at | TEXT | newest PR review `submitted_at` already synced to the task |
 | created_at / updated_at / completed_at | TEXT | |
 
+The synced PR review comments live in `review_comments` (the source of truth
+for the review log): each row holds the review id, dedupe key (GitHub review id
+or a content digest), author, state, body and `submitted_at`. The Feishu task
+description is rebuilt from this table as a bounded, rotating summary of the
+newest comments, so an over-limit description rotates the oldest entries out
+without losing history.
+
 Every execution is also appended to `review_runs` (one row per run, ordered by
 `seq`), so the full history — including each run's status, head commit, retry
 reason, session and result — is preserved even after later retries overwrite
 the `review_requests` row:
-
 | column | meaning |
 | --- | --- |
 | id / review_id / seq | run id, owning review, 1-based sequence |
@@ -230,9 +236,13 @@ review) re-syncs a review with its PR and Feishu task:
 - A previously archived PR that was reopened restores the review to `succeeded`
   and clears `archived_at`.
 - For an open PR, `gh api repos/<owner>/<repo>/pulls/<n>/reviews` returns the
-  submitted reviews; those newer than `task_synced_at` are appended to the task
-  description (`[review] <user> (<state>) <submitted_at>\n<body>`, bounded to
-  3000 UTF-8 chars), then `task_synced_at` advances so each comment is synced
+  submitted reviews. Every review comment is persisted durably in the
+  `review_comments` store table (the source of truth, deduped by review id), and
+  the task description is rebuilt as a bounded, rotating summary of the newest
+  comments (`[review] <user> (<state>) <submitted_at>\n<body>`, capped at 3000
+  UTF-8 chars). When the description reaches the limit, the oldest entries
+  rotate out of the description but stay in the store, so a full description
+  never blocks sync; then `task_synced_at` advances so each comment is synced
   once. Requires `gh` and the `task:task` write scope.
 
 Task writes follow the task v2 update contract: a nested `task` object plus an
@@ -464,7 +474,7 @@ requester is DM'd the task link so they can open it directly. Requires
 - `/sat reviews all|archived` — include archived, or only archived
 - `/sat review <id>` — detail of one review
 - `/sat retry <review_id>` — retry a failed review, or re-run after the PR head changed
-- `/sat refresh <review_id|all>` — archive merged/closed PRs, complete their task, append reviewer comments to the task
+- `/sat refresh <review_id|all>` — archive merged/closed PRs, complete their task, sync reviewer comments to the task
 - `/sat act <review_id> <instruction>` — resume the review session to act on the PR
 - `/sat threads <review_id>` — list all chat threads the review was requested in
 - `/sat describe review <id>` — full details including runs, reactions and threads

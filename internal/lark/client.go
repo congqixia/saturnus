@@ -484,9 +484,9 @@ type UpdateTaskInput struct {
 	Completed   *bool
 }
 
-// taskDescriptionMaxRunes is the Feishu task v2 description limit (3000 UTF-8
+// TaskDescriptionMaxRunes is the Feishu task v2 description limit (3000 UTF-8
 // characters). Longer text is truncated before sending.
-const taskDescriptionMaxRunes = 3000
+const TaskDescriptionMaxRunes = 3000
 
 // UpdateTask patches an existing Feishu task (summary / description /
 // completion). The task v2 update contract requires a `task` object plus an
@@ -522,7 +522,7 @@ func buildTaskUpdate(input UpdateTaskInput) (map[string]any, bool) {
 		updateFields = append(updateFields, "summary")
 	}
 	if input.Description != nil {
-		task["description"] = truncateRunes(*input.Description, taskDescriptionMaxRunes)
+		task["description"] = truncateRunes(*input.Description, TaskDescriptionMaxRunes)
 		updateFields = append(updateFields, "description")
 	}
 	if input.Completed != nil {

@@ -145,42 +145,66 @@ func (s *Service) syncReviewsToTask(req *store.ReviewRequest, result *RefreshRes
 		}
 		return a.Before(b)
 	})
-	var pending []PRReview
-	for _, r := range reviews {
-		t, err := time.Parse(time.RFC3339, r.SubmittedAt)
-		if err != nil {
-			result.Error = "PR review has invalid submitted_at"
-			return
-		}
-		if !t.Before(req.TaskSyncedAt) {
-			pending = append(pending, r)
-		}
-	}
-	if len(pending) == 0 {
+
+	existing, err := s.store.ReviewCommentKeys(ctx, req.ID)
+	if err != nil {
+		result.Error = "load synced reviews: " + err.Error()
 		return
 	}
+	if len(reviews) == 0 && len(existing) == 0 {
+		return
+	}
+
 	task, err := s.lark.GetTaskContext(ctx, req.TaskID)
 	if err != nil {
 		result.Error = "load task: " + err.Error()
 		return
 	}
-	desc := task.Description
+
+	// Persist every fetched review into the durable store (source of truth).
+	// Reviews already stored (by key) are skipped, so a retry after a
+	// remote-success/local-save-failure never duplicates. NewReviews counts
+	// only reviews that are both new to the store and at/after the watermark.
+	var toSave []store.ReviewComment
 	newest := req.TaskSyncedAt
-	for _, r := range pending {
+	for _, r := range reviews {
 		t, _ := time.Parse(time.RFC3339, r.SubmittedAt)
-		marker := reviewMarker(r)
-		if !strings.Contains(desc, marker) {
-			addition := fmt.Sprintf("\n\n%s [review] %s (%s) %s\n%s", marker, r.User, r.State, r.SubmittedAt, truncate(strings.TrimSpace(r.Body), 500))
-			if utf8.RuneCountInString(desc+addition) > 3000 {
-				result.Error = "task description is full; review synchronization will retry"
-				break
+		key := reviewMarker(r)
+		if existing[key] {
+			if t.After(newest) {
+				newest = t
 			}
-			desc += addition
+			continue
+		}
+		toSave = append(toSave, store.ReviewComment{
+			Key:            key,
+			GithubReviewID: r.ID,
+			User:           r.User,
+			State:          r.State,
+			Body:           r.Body,
+			SubmittedAt:    t,
+		})
+		if !t.Before(req.TaskSyncedAt) {
 			result.NewReviews++
 		}
 		if t.After(newest) {
 			newest = t
 		}
+	}
+	if len(toSave) > 0 {
+		if _, err := s.store.SaveReviewComments(ctx, req.ID, toSave); err != nil {
+			result.Error = "save review comments: " + err.Error()
+			return
+		}
+	}
+
+	// Rebuild the task description as a bounded, rotating summary of the
+	// newest stored reviews. Older entries rotate out of the description but
+	// stay in the durable store, so a full description no longer blocks sync.
+	desc, err := s.buildTaskDescription(ctx, req.ID, task.Description)
+	if err != nil {
+		result.Error = "load review comments: " + err.Error()
+		return
 	}
 	if desc != task.Description {
 		desc = strings.TrimSpace(desc)
@@ -192,4 +216,45 @@ func (s *Service) syncReviewsToTask(req *store.ReviewRequest, result *RefreshRes
 		result.TaskUpdated = true
 	}
 	req.TaskSyncedAt = newest
+}
+
+// buildTaskDescription renders the bounded task description from the durable
+// review log: the non-review base prefix (everything before the first synced
+// review marker) plus the newest review comments that fit within the Feishu
+// description limit. When the limit is reached, the oldest entries rotate out
+// of the description while staying in the store.
+func (s *Service) buildTaskDescription(ctx context.Context, reviewID, current string) (string, error) {
+	comments, err := s.store.ListReviewComments(ctx, reviewID)
+	if err != nil {
+		return "", err
+	}
+	base := reviewLogBase(current)
+	entries := make([]string, 0, len(comments))
+	total := utf8.RuneCountInString(base)
+	for _, c := range comments {
+		e := reviewEntryText(c)
+		entries = append(entries, e)
+		total += utf8.RuneCountInString(e)
+	}
+	for total > lark.TaskDescriptionMaxRunes && len(entries) > 0 {
+		total -= utf8.RuneCountInString(entries[0])
+		entries = entries[1:]
+	}
+	return strings.TrimSpace(base + strings.Join(entries, "")), nil
+}
+
+// reviewLogBase returns the non-review prefix of a task description: the text
+// before the first synced-review marker, or the whole description when no
+// reviews have been synced yet.
+func reviewLogBase(desc string) string {
+	if i := strings.Index(desc, "[github-review:"); i >= 0 {
+		return strings.TrimSpace(desc[:i])
+	}
+	return strings.TrimSpace(desc)
+}
+
+// reviewEntryText renders one stored review comment as a description entry,
+// matching the legacy append format.
+func reviewEntryText(c store.ReviewComment) string {
+	return fmt.Sprintf("\n\n%s [review] %s (%s) %s\n%s", c.Key, c.User, c.State, c.SubmittedAt.Format(time.RFC3339), truncate(strings.TrimSpace(c.Body), 500))
 }

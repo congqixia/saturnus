@@ -3,9 +3,11 @@ package review
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"saturnus/internal/lark"
 	"saturnus/internal/store"
@@ -156,5 +158,70 @@ func TestFetchPRReviewsPaginationAndMalformedLaterPage(t *testing.T) {
 	}
 	if _, err := FetchPRReviews(context.Background(), fakeGHRefresh(t, "OPEN", page+"\ninvalid"), "a/b", 1); err == nil {
 		t.Fatal("later-page failure hidden")
+	}
+}
+
+// TestSyncPRRotatesFullTaskDescription verifies the fix for the "task
+// description is full" deadlock: reviews are persisted durably in the store and
+// the description is rebuilt as a bounded, rotating summary instead of failing
+// forever.
+func TestSyncPRRotatesFullTaskDescription(t *testing.T) {
+	st := refreshStore(t)
+	newRefreshReview(t, st, "rvw_full", "succeeded", "fs-task")
+
+	// Pre-populate enough large comments that a description holding all of
+	// them would exceed the Feishu limit.
+	var stored []store.ReviewComment
+	desc := "PR review request rvw_full\nhttps://github.com/a/b/pull/1"
+	bigBody := strings.Repeat("z", 600)
+	for i := 1; i <= 6; i++ {
+		submitted := time.Date(2026, 10, i, 12, 0, 0, 0, time.UTC)
+		key := fmt.Sprintf("[github-review:%d]", i)
+		stored = append(stored, store.ReviewComment{
+			Key: key, GithubReviewID: int64(i), User: "reviewer", State: "COMMENTED", Body: bigBody, SubmittedAt: submitted,
+		})
+		desc += reviewEntryText(store.ReviewComment{Key: key, User: "reviewer", State: "COMMENTED", SubmittedAt: submitted, Body: bigBody})
+	}
+	if utf8.RuneCountInString(desc) <= lark.TaskDescriptionMaxRunes {
+		t.Fatal("test setup must overflow the description limit")
+	}
+	if _, err := st.SaveReviewComments(context.Background(), "rvw_full", stored); err != nil {
+		t.Fatal(err)
+	}
+
+	fake := &fakeLark{enabled: true, task: lark.Task{GUID: "fs-task", Description: desc}}
+	payload := `[{"id":7,"user":"reviewer","state":"COMMENTED","body":"new comment","submitted_at":"2026-10-07T12:00:00Z"}]`
+	svc := New(st, fake, Config{Enabled: true, GHCli: fakeGHRefresh(t, "OPEN", payload)})
+	if err := svc.SyncPR(context.Background(), "a/b", 1, PRInfo{State: "OPEN", HeadCommit: "new-head"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// All reviews are durably stored; the newest one is present even though the
+	// oldest entries rotated out of the description.
+	comments, err := st.ListReviewComments(context.Background(), "rvw_full")
+	if err != nil || len(comments) != 7 {
+		t.Fatalf("comments=%d err=%v", len(comments), err)
+	}
+	req, _ := st.GetReview("rvw_full")
+	if req.TaskSyncedAt.IsZero() {
+		t.Fatalf("watermark not advanced: %+v", req)
+	}
+	if !(utf8.RuneCountInString(fake.task.Description) <= lark.TaskDescriptionMaxRunes) {
+		t.Fatalf("description still over the limit: %d runes", utf8.RuneCountInString(fake.task.Description))
+	}
+	if !strings.Contains(fake.task.Description, "[github-review:7]") || !strings.Contains(fake.task.Description, "new comment") {
+		t.Fatalf("newest comment missing from description: %q", fake.task.Description)
+	}
+	if strings.Contains(fake.task.Description, "[github-review:1]") {
+		t.Fatalf("oldest comment not rotated out: %q", fake.task.Description)
+	}
+
+	// A second sync with nothing new must not duplicate or error.
+	if err := svc.SyncPR(context.Background(), "a/b", 1, PRInfo{State: "OPEN", HeadCommit: "new-head"}); err != nil {
+		t.Fatal(err)
+	}
+	comments, err = st.ListReviewComments(context.Background(), "rvw_full")
+	if err != nil || len(comments) != 7 {
+		t.Fatalf("comments after resync=%d err=%v", len(comments), err)
 	}
 }

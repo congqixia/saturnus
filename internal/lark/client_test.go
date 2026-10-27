@@ -148,7 +148,7 @@ func TestTruncateRunes(t *testing.T) {
 // TestUpdateTaskBody verifies the task v2 PATCH contract: a `task` object plus
 // `update_fields`, and completion expressed via `completed_at` (ms timestamp).
 func TestUpdateTaskBody(t *testing.T) {
-	desc := strings.Repeat("长", taskDescriptionMaxRunes+100)
+	desc := strings.Repeat("长", TaskDescriptionMaxRunes+100)
 	completed := true
 	payload, ok := buildTaskUpdate(UpdateTaskInput{Description: &desc, Completed: &completed})
 	if !ok {
@@ -162,8 +162,8 @@ func TestUpdateTaskBody(t *testing.T) {
 		t.Fatalf("update body must not use a top-level completed field: %s", raw)
 	}
 	task := payload["task"].(map[string]any)
-	if len([]rune(task["description"].(string))) > taskDescriptionMaxRunes {
-		t.Fatalf("description not truncated to %d runes", taskDescriptionMaxRunes)
+	if len([]rune(task["description"].(string))) > TaskDescriptionMaxRunes {
+		t.Fatalf("description not truncated to %d runes", TaskDescriptionMaxRunes)
 	}
 
 	// Reopen: completed=false maps to completed_at "0".

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"testing"
@@ -209,6 +210,64 @@ func TestStoreReviewFlow(t *testing.T) {
 	}
 	if after.Status != "failed" {
 		t.Fatalf("expected failed status, got %q", after.Status)
+	}
+}
+
+func TestStoreReviewComments(t *testing.T) {
+	st, err := Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	thread, err := st.GetOrCreateReviewThread("oc_chat", "om_root", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := st.CreateReview(ReviewRequest{
+		ThreadID: thread.ID, PRURL: "https://github.com/a/b/pull/1",
+		Repo: "a/b", PRNumber: 1, RequesterOpenID: "ou_a",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	base := time.Now().UTC()
+	comments := []ReviewComment{
+		{Key: "[github-review:42]", GithubReviewID: 42, User: "reviewer1", State: "COMMENTED", Body: "one", SubmittedAt: base},
+		{Key: "[github-review:43]", GithubReviewID: 43, User: "reviewer2", State: "APPROVED", Body: "two", SubmittedAt: base.Add(time.Minute)},
+	}
+	inserted, err := st.SaveReviewComments(context.Background(), req.ID, comments)
+	if err != nil || inserted != 2 {
+		t.Fatalf("inserted=%d err=%v", inserted, err)
+	}
+
+	// Re-saving the same keys is idempotent.
+	inserted, err = st.SaveReviewComments(context.Background(), req.ID, comments[:1])
+	if err != nil || inserted != 0 {
+		t.Fatalf("duplicate insert not skipped: inserted=%d err=%v", inserted, err)
+	}
+
+	got, err := st.ListReviewComments(context.Background(), req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Key != "[github-review:42]" || got[1].Key != "[github-review:43]" {
+		t.Fatalf("unexpected comments: %#v", got)
+	}
+	if got[0].User != "reviewer1" || got[0].GithubReviewID != 42 || got[0].SubmittedAt.IsZero() {
+		t.Fatalf("comment fields lost: %#v", got[0])
+	}
+
+	keys, err := st.ReviewCommentKeys(context.Background(), req.ID)
+	if err != nil || len(keys) != 2 || !keys["[github-review:42]"] {
+		t.Fatalf("keys=%v err=%v", keys, err)
+	}
+
+	// Comments of another review are isolated.
+	otherKeys, err := st.ReviewCommentKeys(context.Background(), "rvw_none")
+	if err != nil || len(otherKeys) != 0 {
+		t.Fatalf("other keys=%v err=%v", otherKeys, err)
 	}
 }
 

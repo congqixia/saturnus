@@ -138,8 +138,8 @@ Supported text commands:
 
 The server can accept PR review requests from the Lark bot conversation, record
 the review request together with its thread context, optionally create a Feishu
-task, and run a local tool (default `opencode`) to review the PR in a detached
-worktree. The result is sent to a fixed reviewer.
+task, and run a local tool (default `opencode`) to review the PR inside a mapped
+local checkout. The result is sent to a fixed reviewer.
 
 Enable it with:
 
@@ -147,19 +147,45 @@ Enable it with:
 export SATURNUS_REVIEW_ENABLED=1
 export SATURNUS_REVIEW_ALLOWED_USERS=ou_xxx,ou_yyy     # senders who may request reviews
 export SATURNUS_REVIEW_REVIEWER_OPEN_ID=ou_reviewer    # who receives the result (or REVIEWER_CHAT_ID)
-export SATURNUS_REVIEW_REPOS='owner/repo=/path/to/local/checkout,owner2/repo2=/path/to/other'
+export SATURNUS_REVIEW_REPOS_FILE=/etc/saturnus/repos.json  # create the mapping file below
 export SATURNUS_REVIEW_CREATE_TASK=1                   # optional: create a Feishu task
 export SATURNUS_REVIEW_REPLY_IN_THREAD=1               # optional: also reply in the original thread
 make run-server
 ```
 
-`SATURNUS_REVIEW_REPOS` is a comma-separated whitelist of `owner/repo=/local/path`
-pairs. Only repos listed here can be reviewed; anything else is rejected
-immediately with "repo is not in the review whitelist". Each mapped path must be
-a git checkout. The server does not fetch or check out anything itself: it runs
-the review tool directly inside the mapped checkout and lets the tool fetch and
-check out the PR head on its own, so the shared checkout is left untouched by
-Saturnus.
+Create the mapping file before starting the server. It is a JSON object mapping
+GitHub repo names to local checkout paths (see [repos.example.json](repos.example.json)):
+
+```json
+{
+  "milvus-io/milvus": "/srv/checkouts/milvus",
+  "milvus-io/milvus-storage": "/srv/checkouts/milvus-storage",
+  "congqixia/saturnus": "../checkouts/saturnus"
+}
+```
+
+Relative checkout paths are resolved against the mapping file's directory, not
+the process working directory. Paths can contain commas, equals signs and spaces;
+shell variables and `~` are not expanded. Repo names must have the form
+`owner/repo`, paths must be non-empty strings, and duplicate repo keys are rejected.
+An unreadable or invalid file prevents startup, even if review and Tasks are disabled.
+The file is loaded once at startup; restart the corresponding process after editing it.
+
+The legacy `SATURNUS_REVIEW_REPOS='owner/repo=/local/path,...'` format remains
+supported, including its existing path and parsing behavior. Choose one source:
+setting both `SATURNUS_REVIEW_REPOS` and `SATURNUS_REVIEW_REPOS_FILE` is an error.
+When migrating, unset the old variable; the sources are never merged and a file
+error never falls back to inline configuration. Other review environment variables,
+including `SATURNUS_REVIEW_GUIDES`, keep their existing behavior.
+
+The server mapping is shared with Tasks and its local review executor. Remote
+workers register their own host-local mappings; the server file does not restrict
+which repos remote workers can serve. A server may use an empty mapping (`{}`) or
+no mapping when all reviews run remotely; workers must configure at least one repo.
+
+Each mapped path must be a git checkout when a job runs. The server does not
+fetch or check out anything itself: it runs the review tool directly inside the
+mapped checkout and lets the tool fetch and check out the PR head on its own.
 
 Environment variables:
 
@@ -169,6 +195,7 @@ Environment variables:
 | `SATURNUS_COMMAND_ALLOWED_USERS` | - | who may run `/sat` commands; `*` = everyone, empty = deny all |
 | `SATURNUS_REVIEW_ALLOWED_USERS` | - | comma-separated open_ids; `*` = allow everyone; empty = reject all |
 | `SATURNUS_REVIEW_REPOS` | - | whitelist `owner/repo=/local/path,...` |
+| `SATURNUS_REVIEW_REPOS_FILE` | - | JSON repo-to-checkout mapping file; mutually exclusive with `SATURNUS_REVIEW_REPOS` |
 | `SATURNUS_REVIEW_REVIEWER_OPEN_ID` | - | DM recipient for results |
 | `SATURNUS_REVIEW_REVIEWER_CHAT_ID` | - | chat recipient fallback |
 | `SATURNUS_REVIEW_REPLY_IN_THREAD` | 0 | also reply into the original thread |
@@ -200,7 +227,7 @@ the server, so no inbound ports are needed on the worker host.
 The scheduler prefers a remote worker whose checkout serves the PR's repo,
 routing retries and reviewer reactions back to the same host so the tool session
 can be resumed. When no worker can serve a repo, the server falls back to its
-own local executor (the `SATURNUS_REVIEW_REPOS` checkouts), so existing
+own local executor (using the server's repo mapping), so existing
 single-host deployments keep working unchanged.
 
 Server side:
@@ -215,7 +242,7 @@ Worker side (on each host that should provide review service):
 ```sh
 export SATURNUS_SERVER=http://saturnus:8787     # server URL (worker must reach it)
 export SATURNUS_WORKER_REGISTER_KEY=secret      # must match the server
-export SATURNUS_REVIEW_REPOS='owner/repo=/path/to/local/checkout,...'
+export SATURNUS_REVIEW_REPOS_FILE=/etc/saturnus/worker-repos.json
 export SATURNUS_WORKER_MAX_CONCURRENT=2
 go run ./cmd/saturnus-worker                     # or make build-worker
 ```
@@ -228,10 +255,18 @@ Worker environment variables:
 | `SATURNUS_WORKER_ID` | hostname-derived | stable worker id |
 | `SATURNUS_WORKER_REGISTER_KEY` | - | shared key, must match the server's |
 | `SATURNUS_REVIEW_REPOS` | - | worker-local whitelist `owner/repo=/local/path,...` |
+| `SATURNUS_REVIEW_REPOS_FILE` | - | worker-local JSON repo-to-checkout mapping file; mutually exclusive with `SATURNUS_REVIEW_REPOS` |
 | `SATURNUS_REVIEW_TOOL` | opencode | review executable on the worker host |
 | `SATURNUS_REVIEW_GH` | 1 | worker has `gh` available (used to resolve PR head/title) |
 | `SATURNUS_WORKER_MAX_CONCURRENT` | 1 | concurrent reviews per worker |
 | `SATURNUS_REVIEW_LOG_DIR` | `<tmp>/saturnus-review-logs` | per-review transcript logs on the worker |
+
+Workers also accept `-repos-file /path/to/repos.json` and the legacy `-repos`
+option. Each command-line option overrides its corresponding environment variable;
+the resulting inline and file settings remain mutually exclusive. To switch
+sources when an environment default is set, unset it or clear it explicitly,
+for example `saturnus-worker -repos= -repos-file /etc/saturnus/worker-repos.json`.
+Create each worker's file on that host; checkout paths refer to that host's filesystem.
 
 `GET /api/workers` lists registered workers. Worker status is derived from
 heartbeats: a worker whose connection has been silent longer than
@@ -658,11 +693,12 @@ Enable it with:
 ```sh
 export SATURNUS_TASKS_ENABLED=1
 export SATURNUS_TASKS_GH_CLI=gh            # optional; default gh
-export SATURNUS_REVIEW_REPOS='owner/repo=/path/to/local/checkout,...'   # shared repo whitelist
+export SATURNUS_REVIEW_REPOS_FILE=/etc/saturnus/repos.json   # shared repo whitelist
 make run-server
 ```
 
-The repo whitelist is shared with the review module (`SATURNUS_REVIEW_REPOS`):
+The repo whitelist is shared with the review module (`SATURNUS_REVIEW_REPOS_FILE`
+or the legacy `SATURNUS_REVIEW_REPOS`):
 only whitelisted repos can host issues, design docs and PRs.
 
 Workflow:
@@ -689,6 +725,7 @@ Environment variables:
 | `SATURNUS_TASKS_ENABLED` | 0 | master switch; set to `1` to enable |
 | `SATURNUS_TASKS_GH_CLI` | gh | GitHub CLI for issue/PR resolution |
 | `SATURNUS_REVIEW_REPOS` | - | shared repo whitelist `owner/repo=/local/path,...` |
+| `SATURNUS_REVIEW_REPOS_FILE` | - | shared JSON repo-to-checkout mapping file; mutually exclusive with `SATURNUS_REVIEW_REPOS` |
 
 See `docs/plan/tasks.md` for the full design.
 

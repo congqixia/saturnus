@@ -16,7 +16,7 @@ import (
 	"syscall"
 	"time"
 
-	"saturnus/internal/review"
+	"saturnus/internal/repoconfig"
 	"saturnus/internal/reviewworker"
 	"saturnus/internal/store"
 )
@@ -34,14 +34,15 @@ func main() {
 	registerKey := flag.String("register-key", env("SATURNUS_WORKER_REGISTER_KEY", ""), "shared registration key")
 	tool := flag.String("tool", env("SATURNUS_REVIEW_TOOL", "opencode"), "review tool executable")
 	reposRaw := flag.String("repos", os.Getenv("SATURNUS_REVIEW_REPOS"), "owner/repo=/path/to/checkout,...")
+	reposFile := flag.String("repos-file", os.Getenv("SATURNUS_REVIEW_REPOS_FILE"), "JSON file mapping owner/repo to local checkout path (mutually exclusive with -repos)")
 	gh := flag.Bool("gh", envBool("SATURNUS_REVIEW_GH", true), "worker has gh available")
 	maxConcurrent := flag.Int("max-concurrent", envInt("SATURNUS_WORKER_MAX_CONCURRENT", 1), "concurrent review jobs")
 	logDir := flag.String("log-dir", os.Getenv("SATURNUS_REVIEW_LOG_DIR"), "job transcript log directory")
 	flag.Parse()
 
-	repos := review.ParseRepoMap(*reposRaw)
-	if len(repos) == 0 {
-		log.Fatal("no repos configured: set SATURNUS_REVIEW_REPOS=owner/repo=/path,...")
+	repos, err := loadRepos(*reposRaw, *reposFile)
+	if err != nil {
+		log.Fatal(err)
 	}
 	if *registerKey == "" {
 		log.Fatal("missing registration key: set SATURNUS_WORKER_REGISTER_KEY or -register-key")
@@ -80,6 +81,17 @@ func main() {
 	if err := w.Run(ctx); err != nil {
 		log.Fatalf("%v", err)
 	}
+}
+
+func loadRepos(inline, file string) (map[string]string, error) {
+	repos, err := repoconfig.Load(inline, file)
+	if err != nil {
+		return nil, err
+	}
+	if len(repos) == 0 {
+		return nil, fmt.Errorf("no repos configured: set SATURNUS_REVIEW_REPOS_FILE (-repos-file) or SATURNUS_REVIEW_REPOS (-repos)")
+	}
+	return repos, nil
 }
 
 // register POSTs the worker's identity and capabilities and returns the agent

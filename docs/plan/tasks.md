@@ -60,9 +60,10 @@ Reuses the existing `gh` CLI conventions from `internal/review/github.go`:
 - `gh issue view <n> --repo <owner/repo> --json number,title,state,url`
 - `gh pr view <n> --repo <owner/repo> --json number,title,state,url,baseRefName,headRefOid`
 
-The repo whitelist is the **shared** `SATURNUS_REVIEW_REPOS` map
-(`owner/repo=/local/path`), so docs and PRs are only accepted for repos Saturnus
-already knows a local checkout for.
+The repo whitelist is the **shared** mapping loaded once at server startup from
+`SATURNUS_REVIEW_REPOS_FILE` (JSON) or the legacy `SATURNUS_REVIEW_REPOS` inline
+map (`owner/repo=/local/path`). Docs and PRs are only accepted for repos Saturnus
+already knows a local checkout for. Tasks and local review receive the same mapping.
 
 ### Lark bot
 
@@ -201,8 +202,9 @@ Following the `CreateReview`/`UpdateReview` transaction + audit pattern in
 | SATURNUS_TASKS_ENABLED | 0 | master switch; `1` enables |
 | SATURNUS_TASKS_GH_CLI | gh | GitHub CLI for issue/PR resolution |
 
-Repo whitelist is shared via `SATURNUS_REVIEW_REPOS`. `/sat task ...` commands
-are gated by the existing `SATURNUS_COMMAND_ALLOWED_USERS` access control.
+Repo whitelist is shared via `SATURNUS_REVIEW_REPOS_FILE` or
+`SATURNUS_REVIEW_REPOS`; setting both is an error. `/sat task ...` commands are
+gated by the existing `SATURNUS_COMMAND_ALLOWED_USERS` access control.
 
 ## API Additions
 

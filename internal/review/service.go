@@ -12,6 +12,7 @@ import (
 
 	"saturnus/internal/keylock"
 	"saturnus/internal/lark"
+	"saturnus/internal/repoconfig"
 	"saturnus/internal/store"
 )
 
@@ -237,23 +238,7 @@ func New(st *store.Store, lk larkClient, cfg Config) *Service {
 }
 
 func ParseRepoMap(value string) map[string]string {
-	out := map[string]string{}
-	for _, item := range strings.Split(value, ",") {
-		item = strings.TrimSpace(item)
-		if item == "" {
-			continue
-		}
-		parts := strings.SplitN(item, "=", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		repo := strings.TrimSpace(parts[0])
-		dir := strings.TrimSpace(parts[1])
-		if repo != "" && dir != "" {
-			out[repo] = dir
-		}
-	}
-	return out
+	return repoconfig.ParseInline(value)
 }
 
 func (s *Service) Enabled() bool {
@@ -276,8 +261,7 @@ func (s *Service) ResultToken() string {
 	return s.cfg.ResultToken
 }
 
-// RepoList returns the whitelisted repo names (owner/name), one per configured
-// SATURNUS_REVIEW_REPOS entry.
+// RepoList returns the locally configured repo names (owner/name).
 func (s *Service) RepoList() []string {
 	repos := make([]string, 0, len(s.cfg.Repos))
 	for repo := range s.cfg.Repos {
@@ -485,7 +469,7 @@ func (s *Service) submit(ctx MessageContext, requireUser bool) (store.ReviewRequ
 		return store.ReviewRequest{}, err
 	}
 	if !s.repoServed(pr.Repo) {
-		return store.ReviewRequest{}, fmt.Errorf("repo %s is not served by any review worker (SATURNUS_REVIEW_REPOS)", pr.Repo)
+		return store.ReviewRequest{}, fmt.Errorf("repo %s is not served by any review worker (SATURNUS_REVIEW_REPOS or SATURNUS_REVIEW_REPOS_FILE)", pr.Repo)
 	}
 	thread, err := s.store.GetOrCreateReviewThread(ctx.ChatID, ctx.RootMessageID, ctx.Topic, []string{ctx.SenderOpenID})
 	if err != nil {
@@ -1149,7 +1133,7 @@ func (s *Service) Act(ctx MessageContext, reviewID, instruction string) (store.R
 	if !remote {
 		repoRoot, ok := s.repoDirFor(req.Repo)
 		if !ok {
-			return store.ReviewReaction{}, fmt.Errorf("repo %s is not in the review whitelist (SATURNUS_REVIEW_REPOS)", req.Repo)
+			return store.ReviewReaction{}, fmt.Errorf("repo %s is not in the review whitelist (SATURNUS_REVIEW_REPOS or SATURNUS_REVIEW_REPOS_FILE)", req.Repo)
 		}
 		if sessionID == "" {
 			sessionID = s.captureSessionID(repoRoot, req.ID)
@@ -1260,7 +1244,7 @@ func (s *Service) loadGuide(repo, repoRoot string) (string, error) {
 
 func (s *Service) FormatRepos() string {
 	if len(s.cfg.Repos) == 0 {
-		return "No repos whitelisted. Set SATURNUS_REVIEW_REPOS=owner/repo=/path/to/checkout,..."
+		return "No repos whitelisted. Set SATURNUS_REVIEW_REPOS_FILE to a JSON mapping file, or SATURNUS_REVIEW_REPOS=owner/repo=/path/to/checkout,..."
 	}
 	var b strings.Builder
 	for repo, dir := range s.cfg.Repos {
@@ -1393,12 +1377,12 @@ func (s *Service) process(id string) {
 
 	repoRoot, ok := s.repoDirFor(req.Repo)
 	if !ok {
-		s.finish(&req, "failed", "", fmt.Sprintf("repo %s not in review whitelist (SATURNUS_REVIEW_REPOS)", req.Repo))
+		s.finish(&req, "failed", "", fmt.Sprintf("repo %s not in review whitelist (SATURNUS_REVIEW_REPOS or SATURNUS_REVIEW_REPOS_FILE)", req.Repo))
 		s.notifyReviewer(req)
 		return
 	}
 	if !IsGitDir(repoRoot) {
-		s.finish(&req, "failed", "", fmt.Sprintf("local checkout not found at %q (add it to SATURNUS_REVIEW_REPOS)", repoRoot))
+		s.finish(&req, "failed", "", fmt.Sprintf("local checkout not found at %q (check SATURNUS_REVIEW_REPOS or SATURNUS_REVIEW_REPOS_FILE)", repoRoot))
 		s.notifyReviewer(req)
 		return
 	}
@@ -1994,7 +1978,7 @@ func (s *Service) processReaction(id string) {
 
 	repoRoot, ok := s.repoDirFor(req.Repo)
 	if !ok {
-		s.finishReaction(&reac, "failed", "", fmt.Sprintf("repo %s not in review whitelist (SATURNUS_REVIEW_REPOS)", req.Repo))
+		s.finishReaction(&reac, "failed", "", fmt.Sprintf("repo %s not in review whitelist (SATURNUS_REVIEW_REPOS or SATURNUS_REVIEW_REPOS_FILE)", req.Repo))
 		s.notifyReaction(reac)
 		return
 	}

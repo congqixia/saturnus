@@ -1373,25 +1373,25 @@ func TestPostBotCommandRejectsInvalid(t *testing.T) {
 func TestTasksRefreshConfig(t *testing.T) {
 	t.Setenv("SATURNUS_TASKS_REFRESH_INTERVAL", "")
 	t.Setenv("SATURNUS_TASKS_REFRESH_TIMEOUT", "")
-	cfg, err := tasksConfig()
+	cfg, err := tasksConfig(nil)
 	if err != nil || cfg.RefreshInterval != 5*time.Minute || cfg.RefreshTimeout != time.Minute {
 		t.Fatalf("cfg=%+v err=%v", cfg, err)
 	}
 	t.Setenv("SATURNUS_TASKS_REFRESH_INTERVAL", "0")
-	cfg, err = tasksConfig()
+	cfg, err = tasksConfig(nil)
 	if err != nil || cfg.RefreshInterval != 0 {
 		t.Fatalf("cannot disable: %+v %v", cfg, err)
 	}
 	for _, value := range []string{"-1s", "invalid"} {
 		t.Setenv("SATURNUS_TASKS_REFRESH_INTERVAL", value)
-		if _, err := tasksConfig(); err == nil {
+		if _, err := tasksConfig(nil); err == nil {
 			t.Fatalf("accepted interval %q", value)
 		}
 	}
 	t.Setenv("SATURNUS_TASKS_REFRESH_INTERVAL", "1m")
 	for _, value := range []string{"0", "-1s", "invalid"} {
 		t.Setenv("SATURNUS_TASKS_REFRESH_TIMEOUT", value)
-		if _, err := tasksConfig(); err == nil {
+		if _, err := tasksConfig(nil); err == nil {
 			t.Fatalf("accepted timeout %q", value)
 		}
 	}

@@ -179,6 +179,25 @@ LARK_NOTIFY_CHAT_ID=oc_xxx
 
 不要写 export，不要提交到 Git。
 
+如需启用本地 PR review 或 Tasks，在 server.env 中配置仓库映射文件：
+
+~~~ini
+SATURNUS_REVIEW_REPOS_FILE=/etc/saturnus/repos.json
+~~~
+
+先创建该 JSON 文件（可参考仓库根目录的 repos.example.json）：
+
+~~~json
+{
+  "owner/repo": "/var/lib/saturnus/checkouts/repo"
+}
+~~~
+
+仓库相对路径以 JSON 文件所在目录为基准。不要同时设置旧变量
+SATURNUS_REVIEW_REPOS；配置文件不存在或格式错误会阻止 server 启动。
+映射由本地 review 和 Tasks 共享，只在启动时加载，修改后重启 server。
+远程 worker 使用各自主机的映射文件，也可通过 -repos-file 指定。
+
 ~~~sh
 sudo chown root:saturnus /etc/saturnus/server.env
 sudo chmod 0640 /etc/saturnus/server.env

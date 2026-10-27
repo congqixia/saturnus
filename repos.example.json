@@ -1,0 +1,5 @@
+{
+  "milvus-io/milvus": "/srv/checkouts/milvus",
+  "milvus-io/milvus-storage": "/srv/checkouts/milvus-storage",
+  "congqixia/saturnus": "../checkouts/saturnus"
+}

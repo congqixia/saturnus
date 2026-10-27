@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"saturnus/internal/keylock"
+	"saturnus/internal/repoconfig"
 	"saturnus/internal/store"
 )
 
@@ -26,7 +27,8 @@ type Config struct {
 	RefreshTimeout  time.Duration
 	// SyncReview receives previously fetched metadata and never starts a review.
 	SyncReview func(context.Context, string, int, PRInfo) error
-	// Repos maps owner/repo -> local checkout path (see SATURNUS_REVIEW_REPOS).
+	// Repos maps owner/repo -> local checkout path, loaded from the shared
+	// SATURNUS_REVIEW_REPOS or SATURNUS_REVIEW_REPOS_FILE configuration.
 	Repos map[string]string
 }
 
@@ -58,23 +60,7 @@ func New(st *store.Store, cfg Config) *Service {
 // ParseRepoMap parses a comma-separated "owner/repo=/local/path" whitelist into
 // a map. Invalid entries are skipped.
 func ParseRepoMap(value string) map[string]string {
-	out := map[string]string{}
-	for _, item := range strings.Split(value, ",") {
-		item = strings.TrimSpace(item)
-		if item == "" {
-			continue
-		}
-		parts := strings.SplitN(item, "=", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		repo := strings.TrimSpace(parts[0])
-		dir := strings.TrimSpace(parts[1])
-		if repo != "" && dir != "" {
-			out[repo] = dir
-		}
-	}
-	return out
+	return repoconfig.ParseInline(value)
 }
 
 func (s *Service) Enabled() bool {

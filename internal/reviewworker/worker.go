@@ -179,7 +179,7 @@ func (w *Worker) send(frame workerproto.Frame) error {
 func (w *Worker) runReview(ctx context.Context, p workerproto.JobPayload) {
 	dir, ok := w.cfg.Repos[p.Repo]
 	if !ok {
-		w.complete(p.ReviewID, "", false, "", "", "", fmt.Sprintf("repo %s is not checked out on this worker (SATURNUS_REVIEW_REPOS)", p.Repo))
+		w.complete(p.ReviewID, "", false, "", "", "", fmt.Sprintf("repo %s is not checked out on this worker (SATURNUS_REVIEW_REPOS or SATURNUS_REVIEW_REPOS_FILE)", p.Repo))
 		return
 	}
 	if !review.IsGitDir(dir) {
@@ -292,7 +292,7 @@ func (w *Worker) runReview(ctx context.Context, p workerproto.JobPayload) {
 func (w *Worker) runReaction(ctx context.Context, p workerproto.JobPayload) {
 	dir, ok := w.cfg.Repos[p.Repo]
 	if !ok {
-		w.complete(p.ReviewID, p.ReactionID, false, "", "", "", fmt.Sprintf("repo %s is not checked out on this worker (SATURNUS_REVIEW_REPOS)", p.Repo))
+		w.complete(p.ReviewID, p.ReactionID, false, "", "", "", fmt.Sprintf("repo %s is not checked out on this worker (SATURNUS_REVIEW_REPOS or SATURNUS_REVIEW_REPOS_FILE)", p.Repo))
 		return
 	}
 	if !review.IsGitDir(dir) {

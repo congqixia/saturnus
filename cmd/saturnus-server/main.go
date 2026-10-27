@@ -24,6 +24,7 @@ import (
 	"saturnus/internal/cloudops"
 	"saturnus/internal/lark"
 	"saturnus/internal/policy"
+	"saturnus/internal/repoconfig"
 	"saturnus/internal/review"
 	"saturnus/internal/store"
 	"saturnus/internal/tasks"
@@ -64,7 +65,11 @@ func main() {
 }
 
 func run(ctx context.Context, addr, data, staticDir string) (err error) {
-	taskCfg, err := tasksConfig()
+	repos, err := repoconfig.Load(os.Getenv("SATURNUS_REVIEW_REPOS"), os.Getenv("SATURNUS_REVIEW_REPOS_FILE"))
+	if err != nil {
+		return err
+	}
+	taskCfg, err := tasksConfig(repos)
 	if err != nil {
 		return err
 	}
@@ -88,7 +93,7 @@ func run(ctx context.Context, addr, data, staticDir string) (err error) {
 	s := &server{
 		store:              st,
 		lark:               larkClient,
-		reviews:            review.New(st, larkClient, reviewConfig()),
+		reviews:            review.New(st, larkClient, reviewConfig(repos)),
 		cloudops:           cloudopsClient,
 		botUsers:           splitCSV(os.Getenv("SATURNUS_COMMAND_ALLOWED_USERS")),
 		botOpenID:          resolveBotOpenID(larkClient),
@@ -1654,7 +1659,7 @@ func reviewStatusCell(req store.ReviewRequest) any {
 func (s *server) prsReply() botReply {
 	repos := s.reviews.RepoList()
 	if len(repos) == 0 {
-		return botReply{text: "No repos whitelisted. Set SATURNUS_REVIEW_REPOS=owner/repo=/path/to/checkout,..."}
+		return botReply{text: "No repos whitelisted. Set SATURNUS_REVIEW_REPOS_FILE to a JSON mapping file, or SATURNUS_REVIEW_REPOS=owner/repo=/path/to/checkout,..."}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -2530,14 +2535,14 @@ func extractLarkMessage(payload map[string]any) review.MessageContext {
 	return msg
 }
 
-func reviewConfig() review.Config {
+func reviewConfig(repos map[string]string) review.Config {
 	return review.Config{
 		Enabled:               os.Getenv("SATURNUS_REVIEW_ENABLED") == "1",
 		AllowedUsers:          splitCSV(os.Getenv("SATURNUS_REVIEW_ALLOWED_USERS")),
 		ReviewerOpenID:        os.Getenv("SATURNUS_REVIEW_REVIEWER_OPEN_ID"),
 		ReviewerChatID:        os.Getenv("SATURNUS_REVIEW_REVIEWER_CHAT_ID"),
 		ReplyInThread:         os.Getenv("SATURNUS_REVIEW_REPLY_IN_THREAD") == "1",
-		Repos:                 review.ParseRepoMap(os.Getenv("SATURNUS_REVIEW_REPOS")),
+		Repos:                 repos,
 		Guides:                review.ParseRepoMap(os.Getenv("SATURNUS_REVIEW_GUIDES")),
 		Tool:                  os.Getenv("SATURNUS_REVIEW_TOOL"),
 		CommandTemplate:       os.Getenv("SATURNUS_REVIEW_COMMAND_TEMPLATE"),
@@ -2557,8 +2562,8 @@ func reviewConfig() review.Config {
 }
 
 // tasksConfig loads the Tasks module config. The repo whitelist is shared with
-// the review module (SATURNUS_REVIEW_REPOS).
-func tasksConfig() (tasks.Config, error) {
+// the review module (SATURNUS_REVIEW_REPOS or SATURNUS_REVIEW_REPOS_FILE).
+func tasksConfig(repos map[string]string) (tasks.Config, error) {
 	interval, err := strictDuration("SATURNUS_TASKS_REFRESH_INTERVAL", 5*time.Minute, true)
 	if err != nil {
 		return tasks.Config{}, err
@@ -2570,7 +2575,7 @@ func tasksConfig() (tasks.Config, error) {
 	return tasks.Config{
 		Enabled:         os.Getenv("SATURNUS_TASKS_ENABLED") == "1",
 		GHCli:           os.Getenv("SATURNUS_TASKS_GH_CLI"),
-		Repos:           review.ParseRepoMap(os.Getenv("SATURNUS_REVIEW_REPOS")),
+		Repos:           repos,
 		RefreshInterval: interval, RefreshTimeout: timeout,
 	}, nil
 }

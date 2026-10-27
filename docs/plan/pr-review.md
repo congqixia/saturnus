@@ -265,13 +265,23 @@ restart; interrupted `running` reactions are marked `failed`.
 
 ## Repo Whitelist
 
-Review is only allowed for repos explicitly mapped to a local checkout.
-`SATURNUS_REVIEW_REPOS=owner/repo=/local/path,owner2/repo2=/path2`. Nothing is
-checked out by default: a repo outside the whitelist is rejected at submission
-time (`repo is not in the review whitelist`) and checked again by the worker as
-defense in depth. Each mapped path must be a git checkout. Saturnus never
-fetches or creates worktrees itself; the review tool runs inside the checkout
-and handles the PR head fetch/checkout on its own.
+Review is only allowed for repos explicitly mapped to a local checkout on the
+server or served by a registered online worker. Configure each host using
+`SATURNUS_REVIEW_REPOS_FILE=/path/to/repos.json`, a JSON object mapping
+`owner/repo` to checkout path, or the legacy inline
+`SATURNUS_REVIEW_REPOS=owner/repo=/local/path,owner2/repo2=/path2`. The sources
+are mutually exclusive. File configuration is validated once before startup;
+duplicate repo keys and invalid entries fail startup, and relative paths resolve
+against the file's directory. No shell expansion is performed. Restart after
+editing the file. See [the example](../../repos.example.json).
+
+Nothing is checked out by default: an unserved repo is rejected at submission
+time and checked again by the executor. The server's mapping is shared with
+Tasks; remote workers keep their own host-local mappings. An empty server map
+is allowed for remote-only review deployments; workers require a non-empty map.
+Each mapped path must be a git checkout when a job runs. Saturnus never fetches
+or creates worktrees itself; the review tool runs inside the checkout and handles
+the PR head fetch/checkout on its own.
 
 ## Local Executor
 
@@ -424,6 +434,7 @@ requester is DM'd the task link so they can open it directly. Requires
 | SATURNUS_REVIEW_REVIEWER_CHAT_ID | - | chat recipient fallback |
 | SATURNUS_REVIEW_REPLY_IN_THREAD | 0 | also reply into original thread |
 | SATURNUS_REVIEW_REPOS | - | whitelist `owner/repo=/local/path,...` |
+| SATURNUS_REVIEW_REPOS_FILE | - | JSON repo-to-checkout mapping file; mutually exclusive with SATURNUS_REVIEW_REPOS |
 | SATURNUS_REVIEW_TOOL | opencode | executable |
 | SATURNUS_REVIEW_COMMAND_TEMPLATE | see above | command args template |
 | SATURNUS_REVIEW_MAX_CONCURRENT | 1 | worker count |

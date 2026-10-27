@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"saturnus/internal/ghinfo"
 	"saturnus/internal/repoconfig"
 	"saturnus/internal/reviewworker"
 	"saturnus/internal/store"
@@ -39,6 +40,8 @@ func main() {
 	maxConcurrent := flag.Int("max-concurrent", envInt("SATURNUS_WORKER_MAX_CONCURRENT", 1), "concurrent review jobs")
 	logDir := flag.String("log-dir", os.Getenv("SATURNUS_REVIEW_LOG_DIR"), "job transcript log directory")
 	flag.Parse()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	repos, err := loadRepos(*reposRaw, *reposFile)
 	if err != nil {
@@ -53,7 +56,15 @@ func main() {
 	}
 
 	// Register with the central server and obtain the control-channel token.
-	agent, err := register(*serverURL, *workerID, *registerKey, *tool, repos, *gh, *maxConcurrent)
+	var github *ghinfo.Info
+	if *gh {
+		github, err = ghinfo.Probe(ctx, "gh")
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("GitHub CLI version=%s auth=%s token_expiry=%s", github.Version, github.AuthStatus, github.ExpiryStatus)
+	}
+	agent, err := register(*serverURL, *workerID, *registerKey, *tool, repos, *gh, *maxConcurrent, github)
 	if err != nil {
 		log.Fatalf("register with server: %v", err)
 	}
@@ -68,13 +79,11 @@ func main() {
 		Tool:          *tool,
 		Repos:         repos,
 		GH:            *gh,
+		GitHub:        github,
 		MaxConcurrent: *maxConcurrent,
 		LogDir:        *logDir,
 	})
 	defer w.Close()
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	log.Printf("saturnus-worker %s registered with %s (host=%s, tool=%s, repos=%d, max_concurrent=%d)",
 		agent.ID, *serverURL, host, *tool, len(repos), *maxConcurrent)
@@ -96,7 +105,7 @@ func loadRepos(inline, file string) (map[string]string, error) {
 
 // register POSTs the worker's identity and capabilities and returns the agent
 // with its issued worker token.
-func register(serverURL, workerID, registerKey, tool string, repos map[string]string, gh bool, maxConcurrent int) (store.Agent, error) {
+func register(serverURL, workerID, registerKey, tool string, repos map[string]string, gh bool, maxConcurrent int, github *ghinfo.Info) (store.Agent, error) {
 	host, _ := os.Hostname()
 	req := registerRequest{
 		Agent: store.Agent{
@@ -111,6 +120,7 @@ func register(serverURL, workerID, registerKey, tool string, repos map[string]st
 			Tool:          tool,
 			ToolVersion:   env("SATURNUS_REVIEW_TOOL_VERSION", ""),
 			GH:            gh,
+			GitHub:        github,
 			MaxConcurrent: maxConcurrent,
 		},
 		RegisterKey: registerKey,

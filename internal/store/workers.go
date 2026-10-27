@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"saturnus/internal/ghinfo"
 )
 
 // RoleReviewWorker marks an agent as a remote review executor.
@@ -21,7 +23,38 @@ type WorkerCapabilities struct {
 	Tool          string            `json:"tool"`
 	ToolVersion   string            `json:"tool_version"`
 	GH            bool              `json:"gh"`
+	GitHub        *ghinfo.Info      `json:"github,omitempty"`
 	MaxConcurrent int               `json:"max_concurrent"`
+}
+
+// UpdateWorkerGitHub refreshes metadata from an authenticated control channel.
+// A stale heartbeat cannot replace a newer registration or capability set.
+func (s *Store) UpdateWorkerGitHub(workerID string, info *ghinfo.Info) (bool, error) {
+	if info == nil {
+		return false, nil
+	}
+	agent, err := s.GetWorker(workerID)
+	if err != nil {
+		return false, err
+	}
+	caps, err := ParseWorkerCapabilities(agent.Capabilities)
+	if err != nil {
+		return false, err
+	}
+	if caps.GitHub != nil && !info.CheckedAt.After(caps.GitHub.CheckedAt) {
+		return false, nil
+	}
+	caps.GitHub = info
+	raw, err := caps.EncodeJSON()
+	if err != nil {
+		return false, err
+	}
+	result, err := s.db.Exec(`UPDATE agents SET capabilities=? WHERE id=? AND role=? AND capabilities=?`, raw, workerID, RoleReviewWorker, agent.Capabilities)
+	if err != nil {
+		return false, err
+	}
+	n, err := result.RowsAffected()
+	return n == 1, err
 }
 
 // RepoList returns the worker's checked-out repo names.
@@ -139,19 +172,30 @@ func (s *Store) GetWorker(id string) (Agent, error) {
 
 // ListWorkers returns every review worker, most recently seen first.
 func (s *Store) ListWorkers() []Agent {
+	workers, err := s.ListWorkersWithError()
+	if err != nil {
+		return []Agent{}
+	}
+	return workers
+}
+
+// ListWorkersWithError lets background monitoring report storage failures.
+func (s *Store) ListWorkersWithError() ([]Agent, error) {
 	rows, err := s.db.Query(`SELECT id, name, type, host, version, role, capabilities, worker_token, last_seen, created_at
 		FROM agents WHERE role = ? ORDER BY last_seen DESC`, RoleReviewWorker)
 	if err != nil {
-		return []Agent{}
+		return nil, err
 	}
 	defer rows.Close()
 	out := []Agent{}
 	for rows.Next() {
-		if agent, err := scanAgent(rows); err == nil {
-			out = append(out, agent)
+		agent, err := scanAgent(rows)
+		if err != nil {
+			return nil, err
 		}
+		out = append(out, agent)
 	}
-	return out
+	return out, rows.Err()
 }
 
 // ListOnlineWorkers returns review workers whose last heartbeat is within

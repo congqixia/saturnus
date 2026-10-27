@@ -10,6 +10,8 @@ package workerproto
 import (
 	"encoding/json"
 	"time"
+
+	"saturnus/internal/ghinfo"
 )
 
 // Command types sent from the server to a worker.
@@ -103,9 +105,10 @@ type HelloPayload struct {
 
 // HeartbeatPayload reports liveness and current load.
 type HeartbeatPayload struct {
-	Load      int `json:"load,omitempty"`
-	InFlight  int `json:"in_flight,omitempty"`
-	ReposOK   int `json:"repos_ok,omitempty"`
+	Load     int          `json:"load,omitempty"`
+	InFlight int          `json:"in_flight,omitempty"`
+	ReposOK  int          `json:"repos_ok,omitempty"`
+	GitHub   *ghinfo.Info `json:"github,omitempty"`
 }
 
 // ProgressPayload is a chunk of a job's streamed output.

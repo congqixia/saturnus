@@ -29,6 +29,7 @@ import (
 	"saturnus/internal/store"
 	"saturnus/internal/tasks"
 	"saturnus/internal/worker"
+	"saturnus/internal/workermonitor"
 )
 
 type server struct {
@@ -46,6 +47,7 @@ type server struct {
 	// workerOnlineWindow bounds how long a worker's heartbeat stays fresh; a
 	// review owned by a worker offline longer than this is requeued.
 	workerOnlineWindow time.Duration
+	workerAlerts       *workermonitor.Monitor
 }
 
 const shutdownTimeout = 15 * time.Second
@@ -105,11 +107,16 @@ func run(ctx context.Context, addr, data, staticDir string) (err error) {
 		return s.reviews.SyncPR(ctx, repo, num, review.PRInfo{Title: info.Title, BaseBranch: info.BaseBranch, HeadCommit: info.HeadCommit, State: info.State})
 	}
 	s.tasks = tasks.New(st, taskCfg)
+	s.workerAlerts = workermonitor.New(st, larkClient, workermonitor.Config{
+		ReviewerOpenID: os.Getenv("SATURNUS_REVIEW_REVIEWER_OPEN_ID"),
+		ReviewerChatID: os.Getenv("SATURNUS_REVIEW_REVIEWER_CHAT_ID"),
+	})
 
 	// Control plane for remote review workers: the scheduler dispatches jobs to
 	// connected workers over WebSocket, falling back to the local executor.
 	sched := newScheduler(s.reviews, st)
 	sched.onlineWindow = s.workerOnlineWindow
+	sched.onWorkerHeartbeat = s.workerAlerts.Notify
 	s.reviews.SetJobSink(sched.Notify)
 	s.reviews.SetRepoProvider(sched)
 	s.hub = worker.NewHub(sched, func(workerID, token string) bool {
@@ -127,6 +134,8 @@ func run(ctx context.Context, addr, data, staticDir string) (err error) {
 	go sched.Run(ctx)
 	stopRefresh := s.tasks.Start(ctx)
 	defer stopRefresh()
+	stopWorkerAlerts := s.workerAlerts.Start(ctx)
+	defer stopWorkerAlerts()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", s.health)
@@ -280,6 +289,9 @@ func (s *server) registerWorker(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		agent.WorkerToken = token
+	}
+	if s.workerAlerts != nil {
+		s.workerAlerts.Notify()
 	}
 	writeJSON(w, http.StatusOK, agent)
 }

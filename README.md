@@ -273,6 +273,60 @@ heartbeats: a worker whose connection has been silent longer than
 `SATURNUS_WORKER_ONLINE_WINDOW` (default `90s`) is considered offline and its
 in-flight reviews are re-queued to other workers.
 
+### Worker GitHub version and credential expiry
+
+With `SATURNUS_REVIEW_GH=1` (the default), the worker runs `gh --version` before
+registering. A missing executable or unrecognized version output prevents startup.
+The detected version and authentication metadata are included in
+`capabilities.github`, available through `GET /api/workers`. PR metadata continues
+to use the existing `gh pr view` command; this feature does not change that path.
+
+Example of the decoded `capabilities.github` object:
+
+```json
+{
+  "version": "2.86.0",
+  "host": "github.com",
+  "checked_at": "2026-10-27T08:00:00Z",
+  "auth_status": "valid",
+  "expiry_status": "known",
+  "expiry_source": "github_response_header",
+  "token_expires_at": "2026-11-01T02:00:00Z"
+}
+```
+
+For PAT authentication, the worker uses an authenticated
+`gh api --hostname github.com --include --silent user` request and reads the
+`GitHub-Authentication-Token-Expiration` response header when GitHub supplies it.
+For newer automatically refreshed OAuth credentials, `gh auth status --active
+--hostname github.com --json hosts` can provide `tokenExpiresAt`, `refreshable`
+and `refreshTokenExpiresAt`. The worker never requests `--show-token`, reads
+credential storage, or reports token values to the server.
+
+Expiry is not available for every authentication method. A missing header is
+reported as `expiry_status=unknown`, not as proof that the token never expires.
+Failed probes report `check_failed`; they do not prevent registration. Workers
+recheck once an hour and publish new metadata via their existing authenticated
+heartbeat. A failed refresh probe retains a previously known expiry so it cannot
+silence an upcoming reminder. Token rotation is detected on the next successful
+probe; restarting the worker probes immediately. `SATURNUS_REVIEW_GH=0` skips
+all GitHub checks, and older workers without metadata remain supported.
+
+The server checks stored expirations at startup, after registration/metadata
+changes, and hourly. When less than seven days remain (including already expired
+credentials), it notifies `SATURNUS_REVIEW_REVIEWER_OPEN_ID`, falling back to
+`SATURNUS_REVIEW_REVIEWER_CHAT_ID` when no reviewer open_id is configured. Lark
+app credentials must be configured. Without a recipient or enabled Lark client,
+the condition is logged and is not marked delivered.
+
+For the same worker, expiry and warning phase, successful reminders are limited
+to once per 24 hours, with deduplication persisted in SQLite across server
+restarts. Crossing into expired status sends a separate immediate reminder;
+failed sends remain retryable. For credentials that `gh` refreshes automatically,
+the reminder uses the **refresh token** expiry instead of treating the normal
+short access-token lifetime as an outage. Unknown expiry cannot trigger a timed
+reminder. Update both server and worker to enable the full feature.
+
 While a review is running, the tool output is streamed: the accumulated text is
 flushed into `result_text` roughly every 5 seconds (poll
 `GET /api/reviews/{id}` to watch progress), and the full line-by-line

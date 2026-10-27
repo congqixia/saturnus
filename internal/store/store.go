@@ -427,6 +427,12 @@ func (s *Store) migrate(ctx context.Context) error {
 			last_seen TEXT NOT NULL,
 			created_at TEXT NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS worker_token_alerts (
+			worker_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+			alert_key TEXT NOT NULL,
+			sent_at TEXT NOT NULL,
+			PRIMARY KEY (worker_id, alert_key)
+		)`,
 		`CREATE TABLE IF NOT EXISTS sessions (
 			id TEXT PRIMARY KEY,
 			agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,

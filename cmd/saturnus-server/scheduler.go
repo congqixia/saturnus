@@ -19,11 +19,12 @@ const jobKindReconcile = "reconcile"
 // to the server's own local executor, and recovers orphans when workers go
 // offline. It is the single consumer of the review Service's job sink.
 type scheduler struct {
-	svc            *review.Service
-	st             *store.Store
-	hub            *worker.Hub
-	onlineWindow   time.Duration
-	reconcileEvery time.Duration
+	svc               *review.Service
+	st                *store.Store
+	hub               *worker.Hub
+	onlineWindow      time.Duration
+	reconcileEvery    time.Duration
+	onWorkerHeartbeat func()
 
 	jobs chan jobRef
 }
@@ -111,6 +112,14 @@ func (s *scheduler) OnEvent(ctx context.Context, workerID string, frame workerpr
 		// last_seen fresh so ListOnlineWorkers stays accurate.
 		if err := s.st.Heartbeat(workerID); err != nil {
 			log.Printf("scheduler: worker %s heartbeat: %v", workerID, err)
+		}
+		var p workerproto.HeartbeatPayload
+		if err := frame.Decode(&p); err == nil && p.GitHub != nil {
+			if changed, err := s.st.UpdateWorkerGitHub(workerID, p.GitHub); err != nil {
+				log.Printf("scheduler: worker %s GitHub metadata: %v", workerID, err)
+			} else if changed && s.onWorkerHeartbeat != nil {
+				s.onWorkerHeartbeat()
+			}
 		}
 	case workerproto.EvProgress:
 		var p workerproto.ProgressPayload

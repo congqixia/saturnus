@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"saturnus/internal/ghinfo"
 	"saturnus/internal/review"
 	"saturnus/internal/worker"
 	"saturnus/internal/workerproto"
@@ -26,6 +27,7 @@ type Config struct {
 	Tool          string
 	Repos         map[string]string // owner/repo -> local checkout path
 	GH            bool
+	GitHub        *ghinfo.Info
 	MaxConcurrent int
 	LogDir        string
 }
@@ -37,6 +39,7 @@ type Worker struct {
 	sem      chan struct{}
 	mu       sync.Mutex
 	inFlight map[string]context.CancelFunc
+	github   *ghinfo.Info
 }
 
 // New builds a Worker from config, applying defaults.
@@ -54,11 +57,14 @@ func New(cfg Config) *Worker {
 		cfg:      cfg,
 		sem:      make(chan struct{}, cfg.MaxConcurrent),
 		inFlight: map[string]context.CancelFunc{},
+		github:   cfg.GitHub,
 	}
 }
 
 // Run connects to the server and serves jobs until ctx is cancelled.
 func (w *Worker) Run(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	w.client = worker.NewClient(worker.ClientConfig{
 		ServerURL: w.cfg.ServerURL,
 		WorkerID:  w.cfg.WorkerID,
@@ -67,7 +73,48 @@ func (w *Worker) Run(ctx context.Context) error {
 		Heartbeat: w.heartbeat,
 		OnCommand: w.onCommand,
 	})
-	return w.client.Run(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w.refreshGitHub(ctx)
+	}()
+	err := w.client.Run(ctx)
+	cancel()
+	<-done
+	return err
+}
+
+func (w *Worker) refreshGitHub(ctx context.Context) {
+	if !w.cfg.GH {
+		return
+	}
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			info, err := ghinfo.Probe(ctx, "gh")
+			if err != nil {
+				continue // retain the last observed expiry if gh stops working
+			}
+			w.updateGitHub(info)
+		}
+	}
+}
+
+func (w *Worker) updateGitHub(info *ghinfo.Info) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if info.ExpiryStatus == "check_failed" && w.github != nil {
+		// A temporary probe failure must not erase an already known expiry.
+		info.TokenExpiresAt = w.github.TokenExpiresAt
+		info.Refreshable = w.github.Refreshable
+		info.RefreshTokenExpiresAt = w.github.RefreshTokenExpiresAt
+		info.ExpirySource = w.github.ExpirySource
+	}
+	w.github = info
 }
 
 // Close disconnects the control channel.
@@ -94,6 +141,7 @@ func (w *Worker) heartbeat() workerproto.HeartbeatPayload {
 		Load:     len(w.inFlight),
 		InFlight: len(w.inFlight),
 		ReposOK:  len(w.cfg.Repos),
+		GitHub:   w.github,
 	}
 }
 

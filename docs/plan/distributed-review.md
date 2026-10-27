@@ -52,10 +52,23 @@
   - `worker_id`（默认 `hostname` 派生，如 `wrk_...`）
   - `host`、`version`、`tool`（如 `opencode`）、`tool_version`
   - **capabilities**：`repos`（`owner/repo→/local/path`，即 worker 本机的 `SATURNUS_REVIEW_REPOS`）、`gh` 是否可用、`max_concurrent`
+  - `capabilities.github`：启动探测到的 `gh --version`、GitHub host、探测时间、认证状态、到期探测状态和可用的 token 到期时间；不含 token 值。
   - 鉴权：携带注册密钥 `SATURNUS_WORKER_REGISTER_KEY`，server 校验后为该 worker 下发/确认 `worker_token`。
 - 注册成功后建立 WS 连接（`wss://`）。
 
 server 维护 `repo → [在线 worker]` 聚合索引，由注册事件增量维护（内存 + 落库）。
+
+Worker 每小时重新探测认证元数据，经现有认证心跳上报；server 更新该 worker
+的 `capabilities.github`，保留其他 capability，并忽略旧时间戳的心跳快照。
+PAT 到期时间从 GitHub 返回的 `GitHub-Authentication-Token-Expiration` 响应头读取；
+支持自动刷新的 OAuth 凭据还可从 `gh auth status --json hosts` 获取 access/refresh
+到期时间。无法获取时明确标记 unknown，探测失败标记 check_failed，不推断永不过期。
+
+Server 在启动、注册或认证元数据更新时以及每小时检查一次，剩余不足 7 天时通知
+现有 reviewer（优先 REVIEWER_OPEN_ID，否则 REVIEWER_CHAT_ID）。同一 worker、
+到期时间和预警阶段 24 小时内成功提醒一次，发送结果写入 `worker_token_alerts`
+表以跨 server 重启去重，发送失败不标记成功；进入已过期阶段立即单独提醒。
+对于 gh 可自动刷新的短期 access token，使用 refresh token 的到期时间预警。
 
 ### 4.2 调度与亲和
 

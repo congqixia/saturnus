@@ -9,7 +9,9 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
+	"saturnus/internal/ghinfo"
 	"saturnus/internal/store"
 )
 
@@ -38,12 +40,17 @@ func TestFileReposRegisteredAsWorkerCapabilities(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(store.Agent{ID: "worker", WorkerToken: "token"})
 	}))
 	defer srv.Close()
-	agent, err := register(srv.URL, "worker", "key", "opencode", repos, true, 2)
+	expiry := time.Now().UTC().Add(6 * 24 * time.Hour)
+	info := &ghinfo.Info{Version: "2.86.0", Host: ghinfo.Host, TokenExpiresAt: &expiry, ExpiryStatus: "known"}
+	agent, err := register(srv.URL, "worker", "key", "opencode", repos, true, 2, info)
 	if err != nil || agent.WorkerToken != "token" {
 		t.Fatalf("agent=%+v err=%v", agent, err)
 	}
 	select {
 	case req := <-requests:
+		if req.Capabilities.GitHub == nil || req.Capabilities.GitHub.Version != "2.86.0" || !req.Capabilities.GitHub.TokenExpiresAt.Equal(expiry) {
+			t.Fatalf("GitHub metadata missing from registration: %+v", req.Capabilities)
+		}
 		want := map[string]string{"owner/repo": filepath.Join(base, "checkout,with=punctuation")}
 		if !reflect.DeepEqual(req.Capabilities.Repos, want) {
 			t.Fatalf("registered repos=%v, want %v", req.Capabilities.Repos, want)

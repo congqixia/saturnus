@@ -4,6 +4,7 @@ GO ?= go
 BIN_DIR ?= bin
 SERVER_BIN := $(BIN_DIR)/saturnus-server
 AGENT_BIN := $(BIN_DIR)/saturnus-agent
+WORKER_BIN := $(BIN_DIR)/saturnus-worker
 
 ADDR ?= :8787
 DATA ?= saturnus.db
@@ -25,13 +26,14 @@ endif
 
 GO_BUILD_ENV := CGO_ENABLED=$(CGO_ENABLED) CC="$(BUILD_CC)" CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)"
 
-.PHONY: help all build build-server build-agent run-server lark-bridge test test-agent check-cgo clean
+.PHONY: help all build build-server build-agent build-worker run-server lark-bridge test test-agent check-cgo clean
 
 help:
 	@echo "Targets:"
-	@echo "  make build        Build server and agent binaries into $(BIN_DIR)/"
+	@echo "  make build        Build server, agent and worker binaries into $(BIN_DIR)/"
 	@echo "  make build-server Build $(SERVER_BIN)"
 	@echo "  make build-agent  Build $(AGENT_BIN)"
+	@echo "  make build-worker Build $(WORKER_BIN)"
 	@echo "  make run-server   Build and run $(SERVER_BIN)"
 	@echo "  make lark-bridge  Build and run $(AGENT_BIN) lark-bridge"
 	@echo "  make test         Run go test ./..."
@@ -46,7 +48,7 @@ help:
 
 all: build
 
-build: build-server build-agent
+build: build-server build-agent build-worker
 
 $(BIN_DIR):
 	@mkdir -p $(BIN_DIR)
@@ -62,6 +64,9 @@ build-server: $(BIN_DIR) check-cgo
 build-agent: $(BIN_DIR)
 	$(GO_BUILD_ENV) $(GO) build -o $(AGENT_BIN) ./cmd/saturnus-agent
 
+build-worker: $(BIN_DIR)
+	$(GO_BUILD_ENV) $(GO) build -o $(WORKER_BIN) ./cmd/saturnus-worker
+
 run-server: build-server
 	$(SERVER_BIN) -addr $(ADDR) -data $(DATA) -static $(STATIC)
 
@@ -75,4 +80,4 @@ test: check-cgo
 	$(GO_BUILD_ENV) $(GO) test ./...
 
 clean:
-	rm -f $(SERVER_BIN) $(AGENT_BIN)
+	rm -f $(SERVER_BIN) $(AGENT_BIN) $(WORKER_BIN)

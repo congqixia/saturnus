@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -25,6 +27,7 @@ import (
 	"saturnus/internal/review"
 	"saturnus/internal/store"
 	"saturnus/internal/tasks"
+	"saturnus/internal/worker"
 )
 
 type server struct {
@@ -35,6 +38,13 @@ type server struct {
 	cloudops  *cloudops.Client
 	botUsers  []string
 	botOpenID string
+	// hub is the WebSocket control channel for remote review workers.
+	hub *worker.Hub
+	// workerRegisterKey authenticates worker registration when set.
+	workerRegisterKey string
+	// workerOnlineWindow bounds how long a worker's heartbeat stays fresh; a
+	// review owned by a worker offline longer than this is requeued.
+	workerOnlineWindow time.Duration
 }
 
 const shutdownTimeout = 15 * time.Second
@@ -76,20 +86,40 @@ func run(ctx context.Context, addr, data, staticDir string) (err error) {
 		return err
 	}
 	s := &server{
-		store:     st,
-		lark:      larkClient,
-		reviews:   review.New(st, larkClient, reviewConfig()),
-		cloudops:  cloudopsClient,
-		botUsers:  splitCSV(os.Getenv("SATURNUS_COMMAND_ALLOWED_USERS")),
-		botOpenID: resolveBotOpenID(larkClient),
+		store:              st,
+		lark:               larkClient,
+		reviews:            review.New(st, larkClient, reviewConfig()),
+		cloudops:           cloudopsClient,
+		botUsers:           splitCSV(os.Getenv("SATURNUS_COMMAND_ALLOWED_USERS")),
+		botOpenID:          resolveBotOpenID(larkClient),
+		workerRegisterKey:  os.Getenv("SATURNUS_WORKER_REGISTER_KEY"),
+		workerOnlineWindow: envDuration("SATURNUS_WORKER_ONLINE_WINDOW", 90*time.Second),
 	}
 	taskCfg.Context = ctx
 	taskCfg.SyncReview = func(ctx context.Context, repo string, num int, info tasks.PRInfo) error {
 		return s.reviews.SyncPR(ctx, repo, num, review.PRInfo{Title: info.Title, BaseBranch: info.BaseBranch, HeadCommit: info.HeadCommit, State: info.State})
 	}
 	s.tasks = tasks.New(st, taskCfg)
+
+	// Control plane for remote review workers: the scheduler dispatches jobs to
+	// connected workers over WebSocket, falling back to the local executor.
+	sched := newScheduler(s.reviews, st)
+	sched.onlineWindow = s.workerOnlineWindow
+	s.reviews.SetJobSink(sched.Notify)
+	s.reviews.SetRepoProvider(sched)
+	s.hub = worker.NewHub(sched, func(workerID, token string) bool {
+		if workerID == "" || token == "" {
+			return false
+		}
+		agent, err := st.GetWorker(workerID)
+		return err == nil && agent.WorkerToken != "" && agent.WorkerToken == token
+	})
+	sched.SetHub(s.hub)
+	defer s.hub.Close()
+
 	s.reviews.Start()
 	defer s.reviews.Stop()
+	go sched.Run(ctx)
 	stopRefresh := s.tasks.Start(ctx)
 	defer stopRefresh()
 
@@ -97,6 +127,9 @@ func run(ctx context.Context, addr, data, staticDir string) (err error) {
 	mux.HandleFunc("GET /api/health", s.health)
 	mux.HandleFunc("POST /api/agents/register", s.registerAgent)
 	mux.HandleFunc("POST /api/agents/{agent_id}/heartbeat", s.heartbeat)
+	mux.HandleFunc("POST /api/workers/register", s.registerWorker)
+	mux.HandleFunc("GET /api/workers/ws", s.workerWS)
+	mux.HandleFunc("GET /api/workers", s.listWorkers)
 	mux.HandleFunc("GET /api/sessions", s.listSessions)
 	mux.HandleFunc("GET /api/sessions/{session_id}", s.getSession)
 	mux.HandleFunc("PATCH /api/sessions/{session_id}/autopass", s.updateAutoPass)
@@ -204,6 +237,69 @@ func (s *server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// registerWorker registers a remote review worker: its identity (host, tool,
+// version) and capabilities (repos it has checked out, gh availability,
+// concurrency). When SATURNUS_WORKER_REGISTER_KEY is set the request must carry
+// it; the returned agent includes the worker_token the control channel uses.
+func (s *server) registerWorker(w http.ResponseWriter, r *http.Request) {
+	if s.workerRegisterKey == "" {
+		writeError(w, http.StatusServiceUnavailable, errors.New("worker registration is disabled (set SATURNUS_WORKER_REGISTER_KEY)"))
+		return
+	}
+	var req struct {
+		Agent        store.Agent              `json:"agent"`
+		Capabilities store.WorkerCapabilities `json:"capabilities"`
+		RegisterKey  string                   `json:"register_key"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.RegisterKey != s.workerRegisterKey {
+		writeError(w, http.StatusUnauthorized, errors.New("invalid worker register key"))
+		return
+	}
+	if req.Agent.ID == "" {
+		req.Agent.ID = "wrk_" + newToken()
+	}
+	agent, err := s.store.RegisterWorker(req.Agent, req.Capabilities)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if agent.WorkerToken == "" {
+		token := newToken()
+		if err := s.store.SetWorkerToken(agent.ID, token); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		agent.WorkerToken = token
+	}
+	writeJSON(w, http.StatusOK, agent)
+}
+
+// workerWS upgrades a worker's request into its WebSocket control channel. The
+// connection is authenticated by the worker_id + token query parameters.
+func (s *server) workerWS(w http.ResponseWriter, r *http.Request) {
+	if err := s.hub.ServeWS(w, r); err != nil {
+		if r.Context().Err() == nil {
+			log.Printf("worker ws: %v", err)
+		}
+	}
+}
+
+func (s *server) listWorkers(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"workers": s.store.ListWorkers()})
+}
+
+// newToken returns a random hex token for worker authentication.
+func newToken() string {
+	var b [24]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return hex.EncodeToString([]byte(time.Now().UTC().String()))
+	}
+	return hex.EncodeToString(b[:])
 }
 
 func (s *server) listSessions(w http.ResponseWriter, r *http.Request) {

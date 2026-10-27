@@ -166,6 +166,37 @@ type Service struct {
 	taskListOnce sync.Once
 	taskListGUID string
 	taskListErr  error
+
+	// onJob, when set (distributed mode), routes newly available jobs to the
+	// scheduler instead of the local worker pool. The scheduler decides whether
+	// to dispatch to a remote worker or fall back to local execution.
+	onJob func(kind, id string)
+
+	// repoProvider, when set (distributed mode), is consulted at submission
+	// time to accept repos served by registered remote workers, in addition to
+	// the server's own checkouts.
+	repoProvider RepoProvider
+}
+
+// RepoProvider reports whether a repo can be served by some registered review
+// worker. It is implemented by the scheduler in distributed mode.
+type RepoProvider interface {
+	RepoAvailable(repo string) bool
+}
+
+// SetRepoProvider installs the worker-repo registry consulted at submission
+// time (distributed mode).
+func (s *Service) SetRepoProvider(p RepoProvider) {
+	s.repoProvider = p
+}
+
+// repoServed reports whether a repo is accepted for review: the server has its
+// own checkout, or a registered worker can serve it.
+func (s *Service) repoServed(repo string) bool {
+	if _, ok := s.repoDirFor(repo); ok {
+		return true
+	}
+	return s.repoProvider != nil && s.repoProvider.RepoAvailable(repo)
 }
 
 func New(st *store.Store, lk larkClient, cfg Config) *Service {
@@ -259,22 +290,29 @@ func (s *Service) Start() {
 	if !s.cfg.Enabled {
 		return
 	}
-	if _, err := s.store.FailInterruptedReviews(); err != nil {
-		logf("fail interrupted reviews: %v", err)
-	}
-	if _, err := s.store.FailInterruptedReactions(); err != nil {
-		logf("fail interrupted reactions: %v", err)
+	if s.onJob == nil {
+		// Local-only mode: reviews/reactions interrupted by a restart are failed
+		// here and re-enqueued below. In distributed mode the scheduler owns
+		// worker-aware recovery.
+		if _, err := s.store.FailInterruptedReviews(); err != nil {
+			logf("fail interrupted reviews: %v", err)
+		}
+		if _, err := s.store.FailInterruptedReactions(); err != nil {
+			logf("fail interrupted reactions: %v", err)
+		}
 	}
 	s.BackfillRequesterNames()
 	for i := 0; i < s.cfg.MaxConcurrent; i++ {
 		s.wg.Add(1)
 		go s.worker()
 	}
-	for _, req := range s.store.ListReviews("pending", false) {
-		s.enqueue("review", req.ID)
-	}
-	for _, reac := range s.store.ListPendingReactions() {
-		s.enqueue("reaction", reac.ID)
+	if s.onJob == nil {
+		for _, req := range s.store.ListReviews("pending", false) {
+			s.enqueue("review", req.ID)
+		}
+		for _, reac := range s.store.ListPendingReactions() {
+			s.enqueue("reaction", reac.ID)
+		}
 	}
 }
 
@@ -300,7 +338,25 @@ func (s *Service) worker() {
 	}
 }
 
+// SetJobSink installs a scheduler callback that receives every newly available
+// job instead of the local worker pool. The scheduler decides remote vs local
+// execution. Setting a sink also disables the local-only restart recovery (the
+// scheduler performs worker-aware recovery of its own).
+func (s *Service) SetJobSink(fn func(kind, id string)) {
+	s.onJob = fn
+}
+
+// enqueue routes a job to the scheduler when one is installed, otherwise to the
+// local worker pool.
 func (s *Service) enqueue(kind, id string) {
+	if s.onJob != nil {
+		s.onJob(kind, id)
+		return
+	}
+	s.enqueueLocal(kind, id)
+}
+
+func (s *Service) enqueueLocal(kind, id string) {
 	j := job{kind: kind, id: id}
 	select {
 	case s.jobs <- j:
@@ -428,8 +484,8 @@ func (s *Service) submit(ctx MessageContext, requireUser bool) (store.ReviewRequ
 	if err != nil {
 		return store.ReviewRequest{}, err
 	}
-	if _, ok := s.repoDirFor(pr.Repo); !ok {
-		return store.ReviewRequest{}, fmt.Errorf("repo %s is not in the review whitelist (SATURNUS_REVIEW_REPOS)", pr.Repo)
+	if !s.repoServed(pr.Repo) {
+		return store.ReviewRequest{}, fmt.Errorf("repo %s is not served by any review worker (SATURNUS_REVIEW_REPOS)", pr.Repo)
 	}
 	thread, err := s.store.GetOrCreateReviewThread(ctx.ChatID, ctx.RootMessageID, ctx.Topic, []string{ctx.SenderOpenID})
 	if err != nil {
@@ -1084,17 +1140,23 @@ func (s *Service) Act(ctx MessageContext, reviewID, instruction string) (store.R
 		return store.ReviewReaction{}, errors.New("review is still in progress; wait for it to finish first")
 	}
 	// Resolve the tool session to resume now so a missing one fails fast
-	// instead of enqueuing a job that cannot run.
-	repoRoot, ok := s.repoDirFor(req.Repo)
-	if !ok {
-		return store.ReviewReaction{}, fmt.Errorf("repo %s is not in the review whitelist (SATURNUS_REVIEW_REPOS)", req.Repo)
-	}
+	// instead of enqueuing a job that cannot run. For reviews that ran on a
+	// remote worker the session lives on that host, so the local checkout is
+	// not required here; the scheduler routes the reaction back to the owning
+	// worker, which resolves the session itself.
+	remote := req.WorkerID != ""
 	sessionID := req.SessionID
-	if sessionID == "" {
-		sessionID = s.captureSessionID(repoRoot, req.ID)
-	}
-	if sessionID == "" {
-		return store.ReviewReaction{}, errors.New("review has no tool session to continue; run the review first")
+	if !remote {
+		repoRoot, ok := s.repoDirFor(req.Repo)
+		if !ok {
+			return store.ReviewReaction{}, fmt.Errorf("repo %s is not in the review whitelist (SATURNUS_REVIEW_REPOS)", req.Repo)
+		}
+		if sessionID == "" {
+			sessionID = s.captureSessionID(repoRoot, req.ID)
+		}
+		if sessionID == "" {
+			return store.ReviewReaction{}, errors.New("review has no tool session to continue; run the review first")
+		}
 	}
 	reac, err := s.store.CreateReaction(store.ReviewReaction{
 		ReviewID:     reviewID,

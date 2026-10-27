@@ -8,6 +8,12 @@ import (
 
 const summaryMarker = "REVIEW SUMMARY:"
 
+// StripANSI removes ANSI escape sequences from output (exported for remote
+// workers that stream tool output to the server).
+func StripANSI(s string) string {
+	return stripANSI(s)
+}
+
 func stripANSI(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))

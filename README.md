@@ -188,6 +188,56 @@ Environment variables:
 | `SATURNUS_REVIEW_POST_INLINE_MIN_SEVERITY` | P2 | lowest finding severity posted as an inline comment: `P2` = all, `P1` = only P0/P1 |
 | `SATURNUS_REVIEW_NOTIFY_REQUESTER` | 0 | DM the requester a short result once the review succeeds: verdict, finding counts (P0/P1/P2), and how many inline comments were posted to the PR |
 
+### Remote review workers
+
+Reviews can also be executed on **remote hosts** that register with the server as
+review workers (`cmd/saturnus-worker`). The server keeps all control-plane
+responsibilities (scheduling, state, notifications, GitHub comment posting,
+Feishu task sync); each worker owns its own repo checkouts and runs the review
+tool locally. The worker keeps a single outbound WebSocket control channel to
+the server, so no inbound ports are needed on the worker host.
+
+The scheduler prefers a remote worker whose checkout serves the PR's repo,
+routing retries and reviewer reactions back to the same host so the tool session
+can be resumed. When no worker can serve a repo, the server falls back to its
+own local executor (the `SATURNUS_REVIEW_REPOS` checkouts), so existing
+single-host deployments keep working unchanged.
+
+Server side:
+
+```sh
+export SATURNUS_WORKER_REGISTER_KEY=secret     # required to accept workers
+make run-server
+```
+
+Worker side (on each host that should provide review service):
+
+```sh
+export SATURNUS_SERVER=http://saturnus:8787     # server URL (worker must reach it)
+export SATURNUS_WORKER_REGISTER_KEY=secret      # must match the server
+export SATURNUS_REVIEW_REPOS='owner/repo=/path/to/local/checkout,...'
+export SATURNUS_WORKER_MAX_CONCURRENT=2
+go run ./cmd/saturnus-worker                     # or make build-worker
+```
+
+Worker environment variables:
+
+| variable | default | note |
+|---|---|---|
+| `SATURNUS_SERVER` | `http://localhost:8787` | server URL; the worker connects outbound (WS) |
+| `SATURNUS_WORKER_ID` | hostname-derived | stable worker id |
+| `SATURNUS_WORKER_REGISTER_KEY` | - | shared key, must match the server's |
+| `SATURNUS_REVIEW_REPOS` | - | worker-local whitelist `owner/repo=/local/path,...` |
+| `SATURNUS_REVIEW_TOOL` | opencode | review executable on the worker host |
+| `SATURNUS_REVIEW_GH` | 1 | worker has `gh` available (used to resolve PR head/title) |
+| `SATURNUS_WORKER_MAX_CONCURRENT` | 1 | concurrent reviews per worker |
+| `SATURNUS_REVIEW_LOG_DIR` | `<tmp>/saturnus-review-logs` | per-review transcript logs on the worker |
+
+`GET /api/workers` lists registered workers. Worker status is derived from
+heartbeats: a worker whose connection has been silent longer than
+`SATURNUS_WORKER_ONLINE_WINDOW` (default `90s`) is considered offline and its
+in-flight reviews are re-queued to other workers.
+
 While a review is running, the tool output is streamed: the accumulated text is
 flushed into `result_text` roughly every 5 seconds (poll
 `GET /api/reviews/{id}` to watch progress), and the full line-by-line

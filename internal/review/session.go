@@ -7,15 +7,16 @@ import (
 	"time"
 )
 
-func (s *Service) captureSessionID(repoRoot, reviewID string) string {
-	if s.cfg.Tool == "" {
+// CaptureSessionID finds the tool session created for a review by its title,
+// falling back to the most recently updated session in the checkout. It is
+// used both by the server (local execution) and by remote workers to record the
+// session a retry should resume.
+func CaptureSessionID(ctx context.Context, tool, repoRoot, reviewID string) string {
+	if tool == "" {
 		return ""
 	}
 	title := "saturnus-review-" + reviewID
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, s.cfg.Tool, "session", "list", "--format", "json", "-n", "10")
+	cmd := exec.CommandContext(ctx, tool, "session", "list", "--format", "json", "-n", "10")
 	cmd.Dir = repoRoot
 	out, err := cmd.Output()
 	if err != nil {
@@ -43,4 +44,13 @@ func (s *Service) captureSessionID(repoRoot, reviewID string) string {
 		}
 	}
 	return bestID
+}
+
+func (s *Service) captureSessionID(repoRoot, reviewID string) string {
+	if s.cfg.Tool == "" {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return CaptureSessionID(ctx, s.cfg.Tool, repoRoot, reviewID)
 }

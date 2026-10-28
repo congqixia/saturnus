@@ -15,6 +15,7 @@ import (
 
 	"saturnus/internal/ghinfo"
 	"saturnus/internal/review"
+	"saturnus/internal/reviewlog"
 	"saturnus/internal/worker"
 	"saturnus/internal/workerproto"
 )
@@ -164,13 +165,20 @@ func (w *Worker) onCommand(ctx context.Context, frame workerproto.Frame) error {
 // dispatch starts a job, respecting the concurrency limit. When the worker is
 // at capacity it replies with a "busy" error so the server can requeue.
 func (w *Worker) dispatch(ctx context.Context, p workerproto.JobPayload) {
+	w.jobEvent("received", "pending", p).Log()
 	select {
 	case w.sem <- struct{}{}:
 	default:
-		_ = w.send(workerproto.NewFrame(workerproto.EvError, p.ReviewID, workerproto.ErrorPayload{
+		event := w.jobEvent("rejected", "busy", p)
+		event.Error = "worker at capacity"
+		event.Log()
+		if err := w.send(workerproto.NewFrame(workerproto.EvError, p.ReviewID, workerproto.ErrorPayload{
 			Code:    "busy",
 			Message: "worker at capacity",
-		}))
+		})); err != nil {
+			event.Name, event.Error = "rejection_report_failed", err.Error()
+			event.Log()
+		}
 		return
 	}
 	jobCtx, cancel := context.WithCancel(ctx)
@@ -178,12 +186,19 @@ func (w *Worker) dispatch(ctx context.Context, p workerproto.JobPayload) {
 	w.inFlight[p.ReviewID] = cancel
 	w.mu.Unlock()
 	go func() {
+		defer cancel()
 		defer func() {
 			<-w.sem
 			w.mu.Lock()
 			delete(w.inFlight, p.ReviewID)
 			w.mu.Unlock()
 		}()
+		w.jobEvent("started", "running", p).Log()
+		if err := w.send(workerproto.NewFrame(workerproto.EvStarted, p.ReviewID, workerproto.StartedPayload{RunID: p.RunID, ReactionID: p.ReactionID})); err != nil {
+			event := w.jobEvent("start_report_failed", "running", p)
+			event.Error = err.Error()
+			event.Log()
+		}
 		w.runJob(jobCtx, p)
 	}()
 }
@@ -193,6 +208,7 @@ func (w *Worker) cancel(reviewID string) {
 	cancel, ok := w.inFlight[reviewID]
 	w.mu.Unlock()
 	if ok {
+		reviewlog.Event{Name: "cancel_requested", Component: "worker", ReviewID: reviewID, WorkerID: w.cfg.WorkerID, Status: "running"}.Log()
 		cancel()
 		_ = w.send(workerproto.NewFrame(workerproto.EvCancelAck, reviewID, nil))
 	}
@@ -206,15 +222,37 @@ func (w *Worker) runJob(ctx context.Context, p workerproto.JobPayload) {
 	w.runReview(ctx, p)
 }
 
-func (w *Worker) complete(reviewID, reactionID string, ok bool, headCommit, sessionID, result, errText string) {
-	_ = w.send(workerproto.NewFrame(workerproto.EvComplete, reviewID, workerproto.CompletePayload{
+func (w *Worker) jobEvent(name, status string, p workerproto.JobPayload) reviewlog.Event {
+	kind := p.Kind
+	if kind == "" {
+		kind = workerproto.JobReview
+	}
+	return reviewlog.Event{Name: name, Component: "worker", Kind: kind, ReviewID: p.ReviewID, RunID: p.RunID, ReactionID: p.ReactionID, WorkerID: w.cfg.WorkerID, Repo: p.Repo, PRNumber: p.PRNumber, Status: status}
+}
+
+func (w *Worker) complete(p workerproto.JobPayload, ok bool, headCommit, sessionID, result, errText string) {
+	status := "succeeded"
+	if !ok {
+		status = "failed"
+	}
+	event := w.jobEvent("completed", status, p)
+	event.Error = errText
+	event.Log()
+	err := w.send(workerproto.NewFrame(workerproto.EvComplete, p.ReviewID, workerproto.CompletePayload{
+		RunID:      p.RunID,
 		OK:         ok,
 		HeadCommit: headCommit,
 		SessionID:  sessionID,
-		ReactionID: reactionID,
+		ReactionID: p.ReactionID,
 		ResultText: result,
 		Error:      errText,
 	}))
+	if err != nil {
+		event.Name, event.Error = "completion_report_failed", err.Error()
+	} else {
+		event.Name, event.Error = "completion_reported", ""
+	}
+	event.Log()
 }
 
 func (w *Worker) send(frame workerproto.Frame) error {
@@ -227,11 +265,11 @@ func (w *Worker) send(frame workerproto.Frame) error {
 func (w *Worker) runReview(ctx context.Context, p workerproto.JobPayload) {
 	dir, ok := w.cfg.Repos[p.Repo]
 	if !ok {
-		w.complete(p.ReviewID, "", false, "", "", "", fmt.Sprintf("repo %s is not checked out on this worker (SATURNUS_REVIEW_REPOS or SATURNUS_REVIEW_REPOS_FILE)", p.Repo))
+		w.complete(p, false, "", "", "", fmt.Sprintf("repo %s is not checked out on this worker (SATURNUS_REVIEW_REPOS or SATURNUS_REVIEW_REPOS_FILE)", p.Repo))
 		return
 	}
 	if !review.IsGitDir(dir) {
-		w.complete(p.ReviewID, "", false, "", "", "", fmt.Sprintf("local checkout not found at %q", dir))
+		w.complete(p, false, "", "", "", fmt.Sprintf("local checkout not found at %q", dir))
 		return
 	}
 
@@ -285,13 +323,13 @@ func (w *Worker) runReview(ctx context.Context, p workerproto.JobPayload) {
 		PriorFindings: p.PriorFindings,
 	})
 	if err != nil {
-		w.complete(p.ReviewID, "", false, head, "", "", "render command: "+err.Error())
+		w.complete(p, false, head, "", "", "render command: "+err.Error())
 		return
 	}
 
 	logFile, err := openLog(w.cfg.LogDir, p.ReviewID)
 	if err != nil {
-		w.complete(p.ReviewID, "", false, head, "", "", "prepare log: "+err.Error())
+		w.complete(p, false, head, "", "", "prepare log: "+err.Error())
 		return
 	}
 	defer logFile.Close()
@@ -325,30 +363,36 @@ func (w *Worker) runReview(ctx context.Context, p workerproto.JobPayload) {
 		}
 	}
 
+	event := w.jobEvent("tool_started", "running", p)
+	event.Tool, event.LogPath = w.cfg.Tool, logFile.Name()
+	event.Log()
 	output, runErr := review.Run(jobCtx, w.cfg.Tool, args, dir, sink)
+	if runErr != nil && jobCtx.Err() != nil {
+		runErr = fmt.Errorf("%w: %v", jobCtx.Err(), runErr)
+	}
 	sessionCtx, scancel := context.WithTimeout(ctx, 15*time.Second)
 	sessionID := review.CaptureSessionID(sessionCtx, w.cfg.Tool, dir, p.ReviewID)
 	scancel()
 	clean := review.StripANSI(output)
 	if runErr != nil {
-		w.complete(p.ReviewID, "", false, head, sessionID, clean, runErr.Error())
+		w.complete(p, false, head, sessionID, clean, runErr.Error())
 	} else {
-		w.complete(p.ReviewID, "", true, head, sessionID, clean, "")
+		w.complete(p, true, head, sessionID, clean, "")
 	}
 }
 
 func (w *Worker) runReaction(ctx context.Context, p workerproto.JobPayload) {
 	dir, ok := w.cfg.Repos[p.Repo]
 	if !ok {
-		w.complete(p.ReviewID, p.ReactionID, false, "", "", "", fmt.Sprintf("repo %s is not checked out on this worker (SATURNUS_REVIEW_REPOS or SATURNUS_REVIEW_REPOS_FILE)", p.Repo))
+		w.complete(p, false, "", "", "", fmt.Sprintf("repo %s is not checked out on this worker (SATURNUS_REVIEW_REPOS or SATURNUS_REVIEW_REPOS_FILE)", p.Repo))
 		return
 	}
 	if !review.IsGitDir(dir) {
-		w.complete(p.ReviewID, p.ReactionID, false, "", "", "", fmt.Sprintf("local checkout not found at %q", dir))
+		w.complete(p, false, "", "", "", fmt.Sprintf("local checkout not found at %q", dir))
 		return
 	}
 	if p.SessionID == "" {
-		w.complete(p.ReviewID, p.ReactionID, false, "", "", "", "no tool session to resume; run the review first")
+		w.complete(p, false, "", "", "", "no tool session to resume; run the review first")
 		return
 	}
 	// The instruction is passed as a single argv element so arbitrary reviewer
@@ -357,7 +401,7 @@ func (w *Worker) runReaction(ctx context.Context, p workerproto.JobPayload) {
 
 	logFile, err := openLog(w.cfg.LogDir, p.ReactionID)
 	if err != nil {
-		w.complete(p.ReviewID, p.ReactionID, false, "", "", "", "prepare log: "+err.Error())
+		w.complete(p, false, "", "", "", "prepare log: "+err.Error())
 		return
 	}
 	defer logFile.Close()
@@ -368,12 +412,18 @@ func (w *Worker) runReaction(ctx context.Context, p workerproto.JobPayload) {
 	sink := func(line string) {
 		_, _ = logFile.WriteString(line)
 	}
+	event := w.jobEvent("tool_started", "running", p)
+	event.Tool, event.LogPath = w.cfg.Tool, logFile.Name()
+	event.Log()
 	output, runErr := review.Run(jobCtx, w.cfg.Tool, args, dir, sink)
+	if runErr != nil && jobCtx.Err() != nil {
+		runErr = fmt.Errorf("%w: %v", jobCtx.Err(), runErr)
+	}
 	clean := review.StripANSI(output)
 	if runErr != nil {
-		w.complete(p.ReviewID, p.ReactionID, false, "", p.SessionID, clean, runErr.Error())
+		w.complete(p, false, "", p.SessionID, clean, runErr.Error())
 	} else {
-		w.complete(p.ReviewID, p.ReactionID, true, "", p.SessionID, clean, "")
+		w.complete(p, true, "", p.SessionID, clean, "")
 	}
 }
 

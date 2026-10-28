@@ -13,6 +13,7 @@ import (
 	"saturnus/internal/keylock"
 	"saturnus/internal/lark"
 	"saturnus/internal/repoconfig"
+	"saturnus/internal/reviewlog"
 	"saturnus/internal/store"
 )
 
@@ -975,6 +976,17 @@ func ReviewOutdated(req store.ReviewRequest) bool {
 	return req.PrHeadCommit != "" && req.HeadCommit != "" && req.PrHeadCommit != req.HeadCommit
 }
 
+// WorkerDescription includes the registered host when it is still available.
+func (s *Service) WorkerDescription(req store.ReviewRequest) string {
+	label := WorkerLabel(req.Status, req.WorkerID)
+	if req.WorkerID != "" && s.store != nil {
+		if worker, err := s.store.GetWorker(req.WorkerID); err == nil && worker.Host != "" {
+			label += " (host: " + worker.Host + ")"
+		}
+	}
+	return label
+}
+
 func (s *Service) FormatList(reqs []store.ReviewRequest) string {
 	if len(reqs) == 0 {
 		return "No reviews."
@@ -988,7 +1000,7 @@ func (s *Service) FormatList(reqs []store.ReviewRequest) string {
 		if ReviewOutdated(req) {
 			status += " OUTDATED"
 		}
-		fmt.Fprintf(&b, "%s %s %s#%d %s\n", req.ID, status, req.Repo, req.PRNumber, req.CreatedAt.Format(time.RFC3339))
+		fmt.Fprintf(&b, "%s %s %s#%d worker=%s %s\n", req.ID, status, req.Repo, req.PRNumber, WorkerLabel(req.Status, req.WorkerID), req.CreatedAt.Format(time.RFC3339))
 	}
 	return strings.TrimSpace(b.String())
 }
@@ -1000,6 +1012,7 @@ func (s *Service) FormatOne(req store.ReviewRequest) string {
 		status += " OUTDATED"
 	}
 	fmt.Fprintf(&b, "%s status=%s\n%s\nrepo=%s#%d", req.ID, status, req.PRURL, req.Repo, req.PRNumber)
+	fmt.Fprintf(&b, "\nworker=%s", s.WorkerDescription(req))
 	if req.Title != "" {
 		fmt.Fprintf(&b, "\ntitle=%s", req.Title)
 	}
@@ -1337,6 +1350,7 @@ func (s *Service) process(id string) {
 		return
 	}
 	req.Status = "reviewing"
+	req.WorkerID = "" // local fallback must not retain a previous remote owner
 	if _, err := s.store.UpdateReview(req); err != nil {
 		logf("mark reviewing: %v", err)
 		return
@@ -1344,14 +1358,16 @@ func (s *Service) process(id string) {
 
 	// Record this execution as an append-only run so every review attempt
 	// (initial + retries) is traceable, including the head commit it reviewed.
-	if _, err := s.store.CreateReviewRun(store.ReviewRun{
+	run, runErr := s.store.CreateReviewRun(store.ReviewRun{
 		ReviewID:    req.ID,
 		Status:      "running",
 		RetryReason: req.RetryReason,
 		Tool:        s.cfg.Tool,
-	}); err != nil {
-		logf("create review run %s: %v", req.ID, err)
+	})
+	if runErr != nil {
+		logf("create review run %s: %v", req.ID, runErr)
 	}
+	reviewlog.Event{Name: "started", Component: "server", Kind: "review", ReviewID: req.ID, RunID: run.ID, WorkerID: "local", Repo: req.Repo, PRNumber: req.PRNumber, Status: "reviewing"}.Log()
 
 	ctx, cancel := context.WithTimeout(s.ctx, s.cfg.Timeout)
 	defer cancel()
@@ -1468,6 +1484,7 @@ func (s *Service) process(id string) {
 		}
 	}
 
+	reviewlog.Event{Name: "tool_started", Component: "server", Kind: "review", ReviewID: req.ID, RunID: run.ID, WorkerID: "local", Repo: req.Repo, PRNumber: req.PRNumber, Status: "reviewing", Tool: s.cfg.Tool, LogPath: logFile.Name()}.Log()
 	output, runErr := Run(ctx, s.cfg.Tool, args, repoRoot, sink)
 	if sessionID := s.captureSessionID(repoRoot, req.ID); sessionID != "" {
 		req.SessionID = sessionID
@@ -1524,13 +1541,16 @@ func (s *Service) finish(req *store.ReviewRequest, status, result, errText strin
 	req.CompletedAt = time.Now().UTC()
 	// Update only the outcome columns so verdict/summary written by
 	// SetReviewResult (the tool's POST) are never clobbered here.
-	if err := s.store.UpdateReviewOutcome(req.ID, status, result, errText, req.CompletedAt); err != nil {
-		logf("update status %s: %v", status, err)
+	finishErr := s.store.UpdateReviewOutcome(req.ID, status, result, errText, req.CompletedAt)
+	if finishErr != nil {
+		logf("update status %s: %v", status, finishErr)
 	}
 	// Record the terminal outcome on the in-flight run (head commit, session,
 	// verdict/summary, result/error) so each run's history is preserved for
 	// traceability.
+	runID := ""
 	if run, err := s.store.CurrentRun(req.ID); err == nil {
+		runID = run.ID
 		run.Status = status
 		run.HeadCommit = req.HeadCommit
 		run.SessionID = req.SessionID
@@ -1543,11 +1563,17 @@ func (s *Service) finish(req *store.ReviewRequest, status, result, errText strin
 			logf("update review run %s: %v", run.ID, err)
 		}
 	}
+	event := reviewlog.Event{Name: "completed", Component: "server", Kind: "review", ReviewID: req.ID, RunID: runID, WorkerID: "local", Repo: req.Repo, PRNumber: req.PRNumber, Status: status, Error: errText}
+	if finishErr != nil {
+		event.Name, event.Error = "completion_failed", finishErr.Error()
+	}
+	event.Log()
 }
 
 func (s *Service) FormatResult(req store.ReviewRequest) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "PR review %s status=%s\n%s\nrepo=%s#%d", req.ID, req.Status, req.PRURL, req.Repo, req.PRNumber)
+	fmt.Fprintf(&b, "\nworker=%s", s.WorkerDescription(req))
 	if req.Title != "" {
 		fmt.Fprintf(&b, "\ntitle=%s", req.Title)
 	}
@@ -1971,10 +1997,12 @@ func (s *Service) processReaction(id string) {
 		return
 	}
 	reac.Status = "running"
+	reac.WorkerID = ""
 	if _, err := s.store.UpdateReaction(reac); err != nil {
 		logf("mark reaction running: %v", err)
 		return
 	}
+	reviewlog.Event{Name: "started", Component: "server", Kind: "reaction", ReviewID: req.ID, ReactionID: reac.ID, WorkerID: "local", Repo: req.Repo, PRNumber: req.PRNumber, Status: "running"}.Log()
 
 	repoRoot, ok := s.repoDirFor(req.Repo)
 	if !ok {
@@ -2045,6 +2073,7 @@ func (s *Service) processReaction(id string) {
 		}
 	}
 
+	reviewlog.Event{Name: "tool_started", Component: "server", Kind: "reaction", ReviewID: req.ID, ReactionID: reac.ID, WorkerID: "local", Repo: req.Repo, PRNumber: req.PRNumber, Status: "running", Tool: s.cfg.Tool, LogPath: logFile.Name()}.Log()
 	output, runErr := Run(ctx, s.cfg.Tool, args, repoRoot, sink)
 	clean := stripANSI(output)
 	if runErr != nil {
@@ -2060,9 +2089,12 @@ func (s *Service) finishReaction(reac *store.ReviewReaction, status, result, err
 	reac.ResultText = result
 	reac.Error = errText
 	reac.CompletedAt = time.Now().UTC()
+	event := reviewlog.Event{Name: "completed", Component: "server", Kind: "reaction", ReviewID: reac.ReviewID, ReactionID: reac.ID, WorkerID: "local", Status: status, Error: errText}
 	if _, err := s.store.UpdateReaction(*reac); err != nil {
 		logf("update reaction status %s: %v", status, err)
+		event.Name, event.Error = "completion_failed", err.Error()
 	}
+	event.Log()
 }
 
 // notifyReaction delivers a reaction's outcome to the reviewer, preferring the

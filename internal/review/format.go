@@ -8,6 +8,21 @@ import (
 
 const summaryMarker = "REVIEW SUMMARY:"
 
+// WorkerLabel distinguishes a pending retry's previous worker from an active
+// assignment. Empty worker ids on running/completed records mean local execution.
+func WorkerLabel(status, workerID string) string {
+	if status == "pending" {
+		if workerID != "" {
+			return "unassigned (previous: " + workerID + ")"
+		}
+		return "unassigned"
+	}
+	if workerID == "" {
+		return "server (local)"
+	}
+	return workerID
+}
+
 // StripANSI removes ANSI escape sequences from output (exported for remote
 // workers that stream tool output to the server).
 func StripANSI(s string) string {

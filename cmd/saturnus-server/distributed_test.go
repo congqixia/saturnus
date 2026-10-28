@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,7 +15,38 @@ import (
 	"saturnus/internal/reviewworker"
 	"saturnus/internal/store"
 	"saturnus/internal/worker"
+	"saturnus/internal/workerproto"
 )
+
+type recordingWorkerHandler struct {
+	worker.Handler
+	mu     sync.Mutex
+	starts []workerproto.StartedPayload
+}
+
+func (h *recordingWorkerHandler) OnEvent(ctx context.Context, id string, frame workerproto.Frame) error {
+	if frame.Type == workerproto.EvStarted {
+		var p workerproto.StartedPayload
+		if err := frame.Decode(&p); err != nil {
+			return err
+		}
+		h.mu.Lock()
+		h.starts = append(h.starts, p)
+		h.mu.Unlock()
+	}
+	return h.Handler.OnEvent(ctx, id, frame)
+}
+
+func (h *recordingWorkerHandler) hasStart(runID, reactionID string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, p := range h.starts {
+		if p.RunID == runID && p.ReactionID == reactionID {
+			return true
+		}
+	}
+	return false
+}
 
 // TestDistributedReviewEndToEnd exercises the full remote-worker flow: a worker
 // registers, connects its WebSocket control channel, the scheduler dispatches a
@@ -81,7 +113,8 @@ exit 0
 	sched.onlineWindow = 60 * time.Second
 	svc.SetJobSink(sched.Notify)
 	svc.SetRepoProvider(sched)
-	hub := worker.NewHub(sched, func(workerID, token string) bool {
+	recorder := &recordingWorkerHandler{Handler: sched}
+	hub := worker.NewHub(recorder, func(workerID, token string) bool {
 		return workerID == "wrk-test" && token == "test-token"
 	})
 	sched.SetHub(hub)
@@ -172,6 +205,9 @@ exit 0
 	if len(runs) != 1 || runs[0].WorkerID != "wrk-test" || runs[0].Status != "succeeded" {
 		t.Fatalf("run record not persisted for worker: %#v", runs)
 	}
+	if !recorder.hasStart(runs[0].ID, "") {
+		t.Fatal("worker did not report the actual review run starting")
+	}
 	// No lingering in-flight job on the worker.
 	if n := hub.InFlightCount("wrk-test"); n != 0 {
 		t.Fatalf("worker still has %d in-flight jobs", n)
@@ -216,6 +252,9 @@ exit 0
 	if reacFinal.WorkerID != "wrk-test" {
 		t.Fatalf("reaction executed by %q, want wrk-test", reacFinal.WorkerID)
 	}
+	if !recorder.hasStart("", reac.ID) {
+		t.Fatal("worker did not report the reaction starting")
+	}
 
 	// --- Retry keeps session affinity: the re-run goes back to the same worker. ---
 	retried, err := svc.Retry(created.ID, review.MessageContext{
@@ -244,6 +283,9 @@ exit 0
 	runs = svc.ListRuns(created.ID)
 	if len(runs) != 2 || runs[1].WorkerID != "wrk-test" {
 		t.Fatalf("retry run not recorded for worker: %#v", runs)
+	}
+	if !recorder.hasStart(runs[1].ID, "") {
+		t.Fatal("retry did not report its distinct run id")
 	}
 }
 

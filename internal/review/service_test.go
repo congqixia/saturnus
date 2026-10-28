@@ -253,6 +253,12 @@ func TestServiceProcessRunsToolInRepoDir(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A pending retry may retain a previous remote worker for affinity. A
+	// local fallback must replace that stale owner before executing the tool.
+	req.WorkerID = "wrk-previous"
+	if _, err := st.UpdateReview(req); err != nil {
+		t.Fatal(err)
+	}
 	svc.process(req.ID)
 
 	got, err := svc.Get(req.ID)
@@ -264,6 +270,9 @@ func TestServiceProcessRunsToolInRepoDir(t *testing.T) {
 	}
 	if strings.TrimSpace(got.ResultText) != repoDir {
 		t.Fatalf("tool ran in %q, want repo dir %q", strings.TrimSpace(got.ResultText), repoDir)
+	}
+	if got.WorkerID != "" {
+		t.Fatalf("local fallback still attributed to %q", got.WorkerID)
 	}
 }
 

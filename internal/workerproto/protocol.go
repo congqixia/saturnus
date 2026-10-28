@@ -26,6 +26,7 @@ const (
 	EvHello     = "hello"
 	EvHeartbeat = "heartbeat"
 	EvProgress  = "progress"
+	EvStarted   = "started"
 	EvComplete  = "complete"
 	EvCancelAck = "cancel_ack"
 	EvError     = "error"
@@ -33,8 +34,8 @@ const (
 
 // Job kinds dispatched to workers.
 const (
-	JobReview    = "review"
-	JobReaction  = "reaction"
+	JobReview   = "review"
+	JobReaction = "reaction"
 )
 
 // Frame is the envelope for every control message.
@@ -69,6 +70,7 @@ type JobPayload struct {
 	Kind       string `json:"kind"`
 	ReviewID   string `json:"review_id"`
 	ReactionID string `json:"reaction_id,omitempty"`
+	RunID      string `json:"run_id,omitempty"`
 
 	// PR context (shared by review and reaction jobs).
 	Repo       string `json:"repo"`
@@ -79,13 +81,13 @@ type JobPayload struct {
 	HeadCommit string `json:"head_commit,omitempty"`
 
 	// Review-run fields.
-	RetryReason    string `json:"retry_reason,omitempty"`
-	SessionID      string `json:"session_id,omitempty"`
-	PriorFindings  string `json:"prior_findings,omitempty"`
+	RetryReason     string `json:"retry_reason,omitempty"`
+	SessionID       string `json:"session_id,omitempty"`
+	PriorFindings   string `json:"prior_findings,omitempty"`
 	CommandTemplate string `json:"command_template,omitempty"`
-	Guide          string `json:"guide,omitempty"`
-	ResultAPIURL   string `json:"result_api_url,omitempty"`
-	ResultToken    string `json:"result_token,omitempty"`
+	Guide           string `json:"guide,omitempty"`
+	ResultAPIURL    string `json:"result_api_url,omitempty"`
+	ResultToken     string `json:"result_token,omitempty"`
 
 	// Reaction fields.
 	Instruction string `json:"instruction,omitempty"`
@@ -116,8 +118,16 @@ type ProgressPayload struct {
 	Text string `json:"text"`
 }
 
+// StartedPayload reports that the worker accepted the job and began executing
+// it. Optional run_id keeps old workers and servers compatible.
+type StartedPayload struct {
+	RunID      string `json:"run_id,omitempty"`
+	ReactionID string `json:"reaction_id,omitempty"`
+}
+
 // CompletePayload reports a job's outcome.
 type CompletePayload struct {
+	RunID      string `json:"run_id,omitempty"`
 	OK         bool   `json:"ok"`
 	ExitCode   int    `json:"exit_code,omitempty"`
 	HeadCommit string `json:"head_commit,omitempty"`

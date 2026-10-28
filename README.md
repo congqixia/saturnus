@@ -333,6 +333,34 @@ flushed into `result_text` roughly every 5 seconds (poll
 transcript is written to `<SATURNUS_REVIEW_LOG_DIR>/<review_id>.log`. The
 review detail (and the bot result message) includes the `log=` path.
 
+Server and worker process logs include `review_task` lifecycle events with
+`review_id`, `worker_id`, `kind`, `repo`, `pr_number` and `status`; review runs
+also carry `run_id`, and reviewer actions carry `reaction_id`. For example:
+
+```text
+review_task event="dispatch" component="server" kind="review" review_id="rvw_..." run_id="run_..." worker_id="wrk-host-a" repo="owner/repo" status="reviewing" pr_number=1
+review_task event="started" component="worker" kind="review" review_id="rvw_..." run_id="run_..." worker_id="wrk-host-a" repo="owner/repo" status="running" pr_number=1
+review_task event="completed" component="server" kind="review" review_id="rvw_..." run_id="run_..." worker_id="wrk-host-a" repo="owner/repo" status="succeeded" pr_number=1
+```
+
+The server logs `dispatch` before sending a job and `dispatched` after a
+successful send. New workers report `started` back over WebSocket, so the server
+can distinguish sending a task from the worker actually starting it. Workers log
+`tool_started` with the executable and transcript `log_path`, then `completed`
+and either `completion_reported` or `completion_report_failed`. Dispatch failures,
+busy rejections, cancellation requests and requeues are also logged. Local
+execution uses `worker_id="local"`. These process events do not include prompts,
+instructions, callback credentials or tool output. Older workers remain supported
+but do not send the new start event.
+
+Filter both hosts' logs by `review_id="rvw_..."`; use `run_id` to distinguish
+retries and `reaction_id` for reviewer actions. `/sat describe review <id>` and
+`/sat review <id>` show the worker and registered hostname; `/sat reviews` shows
+a Worker column. Describe's run and reaction histories list each execution's
+worker. Local execution is labeled `server (local)`. A pending retry is labeled
+`unassigned (previous: <worker>)` rather than implying it is already running on
+the previous host.
+
 Result messages sent to the reviewer contain a concise conclusion, not the raw
 log. When `SATURNUS_REVIEW_RESULT_API_URL` is set, the review prompt asks the
 tool to POST a machine-readable result to that endpoint (with the `{review_id}`

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"saturnus/internal/review"
+	"saturnus/internal/reviewlog"
 	"saturnus/internal/store"
 	"saturnus/internal/worker"
 	"saturnus/internal/workerproto"
@@ -128,9 +129,22 @@ func (s *scheduler) OnEvent(ctx context.Context, workerID string, frame workerpr
 				log.Printf("scheduler: progress for %s: %v", frame.ReviewID, err)
 			}
 		}
+	case workerproto.EvStarted:
+		var p workerproto.StartedPayload
+		if err := frame.Decode(&p); err != nil {
+			return err
+		}
+		return s.recordStarted(workerID, frame.ReviewID, p)
 	case workerproto.EvComplete:
 		var p workerproto.CompletePayload
 		if err := frame.Decode(&p); err == nil {
+			if p.RunID != "" && p.ReactionID == "" {
+				run, err := s.st.CurrentRun(frame.ReviewID)
+				if err != nil || run.ID != p.RunID || run.WorkerID != workerID {
+					reviewlog.Event{Name: "completion_rejected", Component: "server", Kind: "review", ReviewID: frame.ReviewID, RunID: p.RunID, WorkerID: workerID, Error: "completion does not match the current review run"}.Log()
+					return nil
+				}
+			}
 			s.hub.ClearInFlight(workerID, frame.ReviewID)
 			var cErr error
 			if p.ReactionID != "" {
@@ -139,7 +153,11 @@ func (s *scheduler) OnEvent(ctx context.Context, workerID string, frame workerpr
 				cErr = s.svc.CompleteRemote(frame.ReviewID, workerID, p.OK, p.HeadCommit, p.SessionID, p.ResultText, p.Error)
 			}
 			if cErr != nil {
-				log.Printf("scheduler: complete %s from %s: %v", frame.ReviewID, workerID, cErr)
+				event := reviewlog.Event{Name: "completion_rejected", Component: "server", Kind: "review", ReviewID: frame.ReviewID, RunID: p.RunID, ReactionID: p.ReactionID, WorkerID: workerID, Error: cErr.Error()}
+				if p.ReactionID != "" {
+					event.Kind = "reaction"
+				}
+				event.Log()
 			}
 		}
 	case workerproto.EvCancelAck:
@@ -154,6 +172,38 @@ func (s *scheduler) OnEvent(ctx context.Context, workerID string, frame workerpr
 			}
 		}
 	}
+	return nil
+}
+
+func (s *scheduler) jobEvent(name, status, workerID string, p workerproto.JobPayload) reviewlog.Event {
+	return reviewlog.Event{Name: name, Component: "server", Kind: p.Kind, ReviewID: p.ReviewID, RunID: p.RunID, ReactionID: p.ReactionID, WorkerID: workerID, Repo: p.Repo, PRNumber: p.PRNumber, Status: status}
+}
+
+func (s *scheduler) recordStarted(workerID, reviewID string, p workerproto.StartedPayload) error {
+	event := reviewlog.Event{Name: "started", Component: "server", Kind: "review", ReviewID: reviewID, RunID: p.RunID, ReactionID: p.ReactionID, WorkerID: workerID, Status: "running"}
+	req, err := s.st.GetReview(reviewID)
+	if err != nil {
+		return err
+	}
+	event.Repo, event.PRNumber = req.Repo, req.PRNumber
+	valid := req.Status == "reviewing" && req.WorkerID == workerID
+	if p.ReactionID != "" {
+		event.Kind = "reaction"
+		reac, err := s.st.GetReaction(p.ReactionID)
+		if err != nil {
+			return err
+		}
+		valid = reac.ReviewID == reviewID && reac.Status == "running" && reac.WorkerID == workerID
+	} else if run, err := s.st.CurrentRun(reviewID); err == nil {
+		valid = valid && (p.RunID == "" || p.RunID == run.ID)
+		event.RunID = run.ID
+	} else if p.RunID != "" {
+		valid = false
+	}
+	if !valid {
+		event.Name, event.Status, event.Error = "start_rejected", "", "job is no longer running on this worker"
+	}
+	event.Log()
 	return nil
 }
 
@@ -190,23 +240,31 @@ func (s *scheduler) dispatchReview(id string) {
 		// when the server has the checkout, otherwise leave pending for the
 		// next sweep (a worker may register later).
 		if s.svc.LocalAvailable(req.Repo) {
+			s.jobEvent("dispatched", "pending", "local", workerproto.JobPayload{Kind: workerproto.JobReview, ReviewID: req.ID, Repo: req.Repo, PRNumber: req.PRNumber}).Log()
 			s.svc.EnqueueLocal(workerproto.JobReview, req.ID)
 		}
 		return
 	}
 	payload, err := s.svc.StartRemote(req, workerID)
 	if err != nil {
-		log.Printf("scheduler: assign review %s to %s: %v", req.ID, workerID, err)
+		event := s.jobEvent("dispatch_failed", "", workerID, workerproto.JobPayload{Kind: workerproto.JobReview, ReviewID: req.ID, Repo: req.Repo, PRNumber: req.PRNumber})
+		event.Error = err.Error()
+		event.Log()
 		return
 	}
 	s.hub.AddInFlight(workerID, req.ID)
+	s.jobEvent("dispatch", "reviewing", workerID, payload).Log()
 	if err := s.hub.Send(workerID, workerproto.NewFrame(workerproto.CmdClaim, req.ID, payload)); err != nil {
 		s.hub.ClearInFlight(workerID, req.ID)
-		log.Printf("scheduler: claim send to %s failed: %v", workerID, err)
+		event := s.jobEvent("dispatch_failed", "reviewing", workerID, payload)
+		event.Error = err.Error()
+		event.Log()
 		if err := s.svc.RequeueForOrphan(req.ID, workerID, "claim send failed"); err != nil {
 			log.Printf("scheduler: requeue after failed claim %s: %v", req.ID, err)
 		}
+		return
 	}
+	s.jobEvent("dispatched", "reviewing", workerID, payload).Log()
 }
 
 func (s *scheduler) dispatchReaction(id string) {
@@ -226,21 +284,29 @@ func (s *scheduler) dispatchReaction(id string) {
 		}
 		payload, err := s.svc.StartRemoteReaction(reac, req, req.WorkerID)
 		if err != nil {
-			log.Printf("scheduler: assign reaction %s to %s: %v", reac.ID, req.WorkerID, err)
+			event := s.jobEvent("dispatch_failed", "", req.WorkerID, workerproto.JobPayload{Kind: workerproto.JobReaction, ReviewID: req.ID, ReactionID: reac.ID, Repo: req.Repo, PRNumber: req.PRNumber})
+			event.Error = err.Error()
+			event.Log()
 			return
 		}
 		s.hub.AddInFlight(req.WorkerID, req.ID)
+		s.jobEvent("dispatch", "running", req.WorkerID, payload).Log()
 		if err := s.hub.Send(req.WorkerID, workerproto.NewFrame(workerproto.CmdClaim, req.ID, payload)); err != nil {
 			s.hub.ClearInFlight(req.WorkerID, req.ID)
-			log.Printf("scheduler: reaction claim send to %s failed: %v", req.WorkerID, err)
+			event := s.jobEvent("dispatch_failed", "running", req.WorkerID, payload)
+			event.Error = err.Error()
+			event.Log()
 			if err := s.svc.RequeueOrphanReaction(reac.ID, req.WorkerID); err != nil {
 				log.Printf("scheduler: requeue after failed reaction claim %s: %v", reac.ID, err)
 			}
+			return
 		}
+		s.jobEvent("dispatched", "running", req.WorkerID, payload).Log()
 		return
 	}
 	// Local review: run the reaction locally too.
 	if s.svc.LocalAvailable(req.Repo) {
+		s.jobEvent("dispatched", "pending", "local", workerproto.JobPayload{Kind: workerproto.JobReaction, ReviewID: req.ID, ReactionID: reac.ID, Repo: req.Repo, PRNumber: req.PRNumber}).Log()
 		s.svc.EnqueueLocal(workerproto.JobReaction, reac.ID)
 	}
 }

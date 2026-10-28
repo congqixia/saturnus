@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"saturnus/internal/reviewlog"
 	"saturnus/internal/store"
 	"saturnus/internal/workerproto"
 )
@@ -22,16 +23,19 @@ func (s *Service) StartRemote(req store.ReviewRequest, workerID string) (workerp
 	if err != nil {
 		return workerproto.JobPayload{}, err
 	}
-	if _, err := s.store.CreateReviewRun(store.ReviewRun{
+	run, err := s.store.CreateReviewRun(store.ReviewRun{
 		ReviewID:    assigned.ID,
 		Status:      "running",
 		RetryReason: assigned.RetryReason,
 		Tool:        s.cfg.Tool,
 		WorkerID:    workerID,
-	}); err != nil {
+	})
+	if err != nil {
 		logf("create remote review run %s: %v", assigned.ID, err)
 	}
-	return s.JobPayload(assigned)
+	payload, err := s.JobPayload(assigned)
+	payload.RunID = run.ID
+	return payload, err
 }
 
 // StartRemoteReaction atomically assigns a pending reaction to a remote worker.
@@ -141,6 +145,7 @@ func (s *Service) CompleteRemote(reviewID, workerID string, ok bool, headCommit,
 	req.HeadCommit = headCommit
 	req.PrHeadCommit = headCommit
 	req.SessionID = sessionID
+	runID := ""
 	// Merge any structured result the tool POSTed directly to the server while
 	// this run was executing (the POST handler writes verdict/summary onto the
 	// review row, so the run record below can preserve them alongside the text).
@@ -149,6 +154,7 @@ func (s *Service) CompleteRemote(reviewID, workerID string, ok bool, headCommit,
 		req.Summary = fresh.Summary
 	}
 	if run, err := s.store.CurrentRun(reviewID); err == nil {
+		runID = run.ID
 		run.Status = status
 		run.HeadCommit = headCommit
 		run.SessionID = sessionID
@@ -161,6 +167,7 @@ func (s *Service) CompleteRemote(reviewID, workerID string, ok bool, headCommit,
 			logf("update remote review run %s: %v", run.ID, err)
 		}
 	}
+	reviewlog.Event{Name: "completed", Component: "server", Kind: "review", ReviewID: reviewID, RunID: runID, WorkerID: workerID, Repo: req.Repo, PRNumber: req.PRNumber, Status: status, Error: errText}.Log()
 	// Publish inline comments (plus the verdict review) when enabled and the
 	// run produced a structured verdict.
 	if status == "succeeded" && s.cfg.PostInlineComments && req.Verdict != "" && req.CommentsPostedAt.IsZero() {
@@ -207,6 +214,7 @@ func (s *Service) CompleteRemoteReaction(reactionID, workerID string, ok bool, s
 	reac.ResultText = result
 	reac.Error = errText
 	reac.SessionID = sessionID
+	reviewlog.Event{Name: "completed", Component: "server", Kind: "reaction", ReviewID: reac.ReviewID, ReactionID: reac.ID, WorkerID: workerID, Status: status, Error: errText}.Log()
 	s.notifyReaction(reac)
 	return nil
 }
@@ -242,7 +250,9 @@ func (s *Service) RequeueForOrphan(reviewID, workerID, reason string) error {
 	if err := s.store.RequeueReview(reviewID, workerID); err != nil {
 		return err
 	}
+	runID := ""
 	if run, err := s.store.CurrentRun(reviewID); err == nil {
+		runID = run.ID
 		run.Status = "failed"
 		run.Error = reason
 		run.CompletedAt = time.Now().UTC()
@@ -250,6 +260,7 @@ func (s *Service) RequeueForOrphan(reviewID, workerID, reason string) error {
 			logf("mark orphan run failed %s: %v", run.ID, err)
 		}
 	}
+	reviewlog.Event{Name: "requeued", Component: "server", Kind: "review", ReviewID: reviewID, RunID: runID, WorkerID: workerID, Status: "pending", Error: reason}.Log()
 	s.NotifyJob(workerproto.JobReview, reviewID)
 	return nil
 }
@@ -258,6 +269,9 @@ func (s *Service) RequeueForOrphan(reviewID, workerID, reason string) error {
 func (s *Service) RequeueOrphanReaction(reactionID, workerID string) error {
 	if err := s.store.RequeueReaction(reactionID, workerID); err != nil {
 		return err
+	}
+	if reac, err := s.store.GetReaction(reactionID); err == nil {
+		reviewlog.Event{Name: "requeued", Component: "server", Kind: "reaction", ReviewID: reac.ReviewID, ReactionID: reactionID, WorkerID: workerID, Status: "pending"}.Log()
 	}
 	s.NotifyJob(workerproto.JobReaction, reactionID)
 	return nil

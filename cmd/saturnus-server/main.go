@@ -1307,6 +1307,7 @@ func (s *server) reviewsReply(mode string) botReply {
 		rows = append(rows, map[string]any{
 			"id":        req.ID,
 			"status":    reviewStatusCell(req),
+			"worker":    review.WorkerLabel(req.Status, req.WorkerID),
 			"repo":      fmt.Sprintf("%s#%d", req.Repo, req.PRNumber),
 			"requester": requesterDisplayName(req),
 			"createdAt": lark.UnixMillis(req.CreatedAt),
@@ -1322,10 +1323,11 @@ func (s *server) reviewsReply(mode string) botReply {
 			Title: title,
 			Columns: []lark.TableColumn{
 				{Name: "id", Display: "ID", DataType: lark.ColumnText, Width: "17%"},
-				{Name: "status", Display: "Status", DataType: lark.ColumnOption, Width: "19%"},
-				{Name: "repo", Display: "Repo#PR", DataType: lark.ColumnText, Width: "24%"},
-				{Name: "requester", Display: "Requester", DataType: lark.ColumnText, Width: "23%"},
-				{Name: "createdAt", Display: "Created", DataType: lark.ColumnDate, DateFormat: "YYYY-MM-DD HH:mm", Width: "17%"},
+				{Name: "status", Display: "Status", DataType: lark.ColumnOption, Width: "14%"},
+				{Name: "repo", Display: "Repo#PR", DataType: lark.ColumnText, Width: "20%"},
+				{Name: "worker", Display: "Worker", DataType: lark.ColumnText, Width: "20%"},
+				{Name: "requester", Display: "Requester", DataType: lark.ColumnText, Width: "16%"},
+				{Name: "createdAt", Display: "Created", DataType: lark.ColumnDate, DateFormat: "YYYY-MM-DD HH:mm", Width: "13%"},
 			},
 			Rows: rows,
 		},
@@ -1963,7 +1965,7 @@ func (s *server) describeReviewReply(id string) botReply {
 	if err := s.reviews.ResolveRequesterName(&req); err != nil {
 		logRequesterResolveFailure(req, err)
 	}
-	content := formatReviewMarkdown(req, s.reviews.Tool(), s.reviews.ListFindings(req.ID))
+	content := formatReviewMarkdown(req, s.reviews.Tool(), s.reviews.ListFindings(req.ID), s.reviews.WorkerDescription(req))
 	if runs := s.reviews.ListRuns(req.ID); len(runs) > 0 {
 		content += "\n\n" + formatReviewRuns(runs)
 	}
@@ -1987,8 +1989,8 @@ func (s *server) describeReviewReply(id string) botReply {
 func formatReviewRuns(runs []store.ReviewRun) string {
 	var b strings.Builder
 	b.WriteString("**Runs**:\n")
-	b.WriteString("| # | Status | Head | Retry reason | Started |\n")
-	b.WriteString("| - | ------ | ---- | ------------ | ------- |\n")
+	b.WriteString("| # | Status | Worker | Head | Retry reason | Started |\n")
+	b.WriteString("| - | ------ | ------ | ---- | ------------ | ------- |\n")
 	for _, run := range runs {
 		head := run.HeadCommit
 		if len(head) > 7 {
@@ -1998,7 +2000,7 @@ func formatReviewRuns(runs []store.ReviewRun) string {
 		if !run.StartedAt.IsZero() {
 			started = run.StartedAt.Local().Format("2006-01-02 15:04:05")
 		}
-		fmt.Fprintf(&b, "| %d | %s | `%s` | %s | %s |\n", run.Seq, run.Status, head, markdownTableCell(run.RetryReason), started)
+		fmt.Fprintf(&b, "| %d | %s | %s | `%s` | %s | %s |\n", run.Seq, run.Status, markdownTableCell(review.WorkerLabel(run.Status, run.WorkerID)), head, markdownTableCell(run.RetryReason), started)
 	}
 	return b.String()
 }
@@ -2008,14 +2010,14 @@ func formatReviewRuns(runs []store.ReviewRun) string {
 func formatReviewReactions(reacs []store.ReviewReaction) string {
 	var b strings.Builder
 	b.WriteString("**Reactions**:\n")
-	b.WriteString("| # | Status | Instruction | Updated |\n")
-	b.WriteString("| - | ------ | ----------- | ------- |\n")
+	b.WriteString("| # | Status | Worker | Instruction | Updated |\n")
+	b.WriteString("| - | ------ | ------ | ----------- | ------- |\n")
 	for i, reac := range reacs {
 		updated := ""
 		if !reac.UpdatedAt.IsZero() {
 			updated = reac.UpdatedAt.Local().Format("2006-01-02 15:04:05")
 		}
-		fmt.Fprintf(&b, "| %d | %s | %s | %s |\n", i+1, reac.Status, markdownTableCell(truncateText(reac.Instruction, 60)), updated)
+		fmt.Fprintf(&b, "| %d | %s | %s | %s | %s |\n", i+1, reac.Status, markdownTableCell(review.WorkerLabel(reac.Status, reac.WorkerID)), markdownTableCell(truncateText(reac.Instruction, 60)), updated)
 	}
 	return b.String()
 }
@@ -2052,13 +2054,14 @@ func markdownTableCell(s string) string {
 //     progress is visible without scrolling through the whole transcript;
 //   - for a completed review the full REVIEW SUMMARY block is shown instead
 //     (falling back to the output tail when the tool omitted the marker).
-func formatReviewMarkdown(req store.ReviewRequest, tool string, findings []store.ReviewFinding) string {
+func formatReviewMarkdown(req store.ReviewRequest, tool string, findings []store.ReviewFinding, worker string) string {
 	var b strings.Builder
 	status := req.Status
 	if review.ReviewOutdated(req) {
 		status += " (OUTDATED)"
 	}
 	fmt.Fprintf(&b, "**Status**: `%s`\n", status)
+	fmt.Fprintf(&b, "**Worker**: %s\n", escapeMarkdown(worker))
 	if req.PRURL != "" {
 		label := fmt.Sprintf("%s#%d", req.Repo, req.PRNumber)
 		fmt.Fprintf(&b, "**PR**: [%s](%s)\n", label, req.PRURL)
@@ -2399,7 +2402,7 @@ func (s *server) handleBotCommand(text string, msg review.MessageContext) botRep
 		req, err := s.reviews.Submit(msg)
 		if err != nil {
 			if errors.Is(err, review.ErrAlreadyPending) {
-				return botReply{text: "Review already in progress: " + req.ID + " (" + req.PRURL + ")"}
+				return botReply{text: "Review already in progress: " + req.ID + " (" + req.PRURL + ") worker=" + s.reviews.WorkerDescription(req)}
 			}
 			if errors.Is(err, review.ErrReviewUnchanged) {
 				return botReply{text: "Review " + req.ID + " is already up to date: PR head commit unchanged since the last review. Use /sat retry to force another run."}
@@ -2414,7 +2417,7 @@ func (s *server) handleBotCommand(text string, msg review.MessageContext) botRep
 		req, err := s.reviews.Retry(fields[2], msg)
 		if err != nil {
 			if errors.Is(err, review.ErrAlreadyPending) {
-				return botReply{text: "Review already in progress: " + req.ID + " (" + req.PRURL + ")"}
+				return botReply{text: "Review already in progress: " + req.ID + " (" + req.PRURL + ") worker=" + s.reviews.WorkerDescription(req)}
 			}
 			if errors.Is(err, review.ErrReviewUnchanged) {
 				return botReply{text: "Review " + fields[2] + " is already up to date: PR head commit unchanged since the last review."}

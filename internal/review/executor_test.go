@@ -38,6 +38,23 @@ func TestSplitCommand(t *testing.T) {
 	}
 }
 
+func TestRenderCommandContextTitlePreservesLegacyCustomization(t *testing.T) {
+	for _, contextID := range []string{"", "ctx_new"} {
+		title := SessionTitle("rvw", contextID)
+		args, err := RenderCommand(`run --title custom-review prompt`, ToolArgs{ReviewID: "rvw", SessionTitle: title})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := "custom-review"
+		if contextID != "" {
+			want = title
+		}
+		if len(args) != 4 || args[2] != want {
+			t.Fatalf("context=%s args=%v want title=%s", contextID, args, want)
+		}
+	}
+}
+
 func TestRenderCommand(t *testing.T) {
 	args := ToolArgs{Repo: "congqixia/saturnus", PRNumber: 42, PRURL: "https://github.com/congqixia/saturnus/pull/42", ReviewID: "rvw_x"}
 	got, err := RenderCommand(DefaultCommandTemplate, args)

@@ -109,6 +109,7 @@ Supported text commands:
 - `/sat review <pr-url> @user` — start the review but attribute the requester to the @mentioned user (e.g. when the request came to you by DM instead of the bot). `@all` and the bot itself are ignored; for chats where the user can't be @mentioned (e.g. a p2p chat with the bot) pass the open_id instead: `/sat review <pr-url> ou_xxx`
 - `/sat review <review_id>`
 - `/sat retry <review_id>` — retry a failed review, or re-run a successful one after its PR head commit moved
+- `/sat reset <review_id>` — reset the tool session and queue a fresh review context, even if the PR head is unchanged
 - `/sat post <review_id>` — publish a review's findings as GitHub inline comments (plus the verdict review); for reviews whose findings were never posted (feature off at the time, or a posting failure)
 - `/sat refresh <review_id|all>` — re-sync PR/task state: archive merged/closed PRs (and complete their task), restore reopened PRs, sync new reviewer comments to the task
 - `/sat act <review_id> <instruction>` — resume the review's tool session to act on the PR (e.g. post inline comments for selected issues, work out concrete code for an issue); the agent output is sent back to the chat
@@ -473,6 +474,37 @@ date (`ErrReviewUnchanged`). `/sat retry <review_id>` forces another run: failed
 reviews always retry, successful ones only when the head changed. Retries keep
 the previous tool session (`session_id`), so the run resumes the same review
 conversation via `opencode run --session <id> --title ...`.
+
+### Reset a review's tool context
+
+Use `/sat reset <review_id>` when the saved tool session is bound to an expired
+tool-account token or otherwise needs to be replaced. The command clears the
+current `session_id` and queues a fresh run, including when the PR head has not
+changed. It uses the same reviewer authorization as `/sat act` and rejects
+archived reviews or reviews with pending/running review jobs or reactions.
+
+Reset preserves the review ID, PR, requester, linked threads, prior findings,
+run history and reaction history. Current verdict/output/publish markers are
+cleared as for a normal re-run. The new session starts with a fresh conversation;
+existing structured findings are still supplied for tracking across review rounds.
+Old tool sessions and historical run session IDs are retained rather than deleted.
+
+Each reset persists a new `context_id` in SQLite and isolates discovery with a
+title such as `saturnus-review-<review_id>-<context_id>`. A reset context never
+falls back to a session from another title or checkout, including when the new
+tool run fails before creating a session. Subsequent ordinary retries and
+reactions resume the new session. `/sat describe review` and the review detail
+API (`context_id`) expose the active context; process logs record `context_reset`.
+
+Update both server and worker. New workers register `context_reset=true` in
+capabilities; the scheduler will not dispatch a reset context to an older worker.
+If no compatible worker or local executor is available, the reset review remains
+pending. Custom tool templates should use the session id conditionally and expose
+the title through `--title` (or `--title=...`); the renderer substitutes the context
+title there. `{{.SessionTitle}}` is also available for custom templates.
+
+Reset changes the saved conversation, not the tool's authentication settings.
+Configure valid credentials for the worker's current tool account before retrying.
 
 ### Reply-triggered re-review
 

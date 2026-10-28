@@ -120,6 +120,7 @@ func register(serverURL, workerID, registerKey, tool string, repos map[string]st
 			Tool:          tool,
 			ToolVersion:   env("SATURNUS_REVIEW_TOOL_VERSION", ""),
 			GH:            gh,
+			ContextReset:  true,
 			GitHub:        github,
 			MaxConcurrent: maxConcurrent,
 		},

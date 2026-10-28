@@ -531,6 +531,12 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_review_requests_created ON review_requests(created_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_review_requests_status ON review_requests(status, created_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_review_requests_thread ON review_requests(thread_id)`,
+		`CREATE TABLE IF NOT EXISTS review_contexts (
+			review_id TEXT PRIMARY KEY REFERENCES review_requests(id) ON DELETE CASCADE,
+			context_id TEXT NOT NULL,
+			reset_by TEXT NOT NULL,
+			reset_at TEXT NOT NULL
+		)`,
 		`CREATE TABLE IF NOT EXISTS review_runs (
 			id TEXT PRIMARY KEY,
 			review_id TEXT NOT NULL REFERENCES review_requests(id) ON DELETE CASCADE,

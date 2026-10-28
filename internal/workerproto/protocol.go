@@ -83,6 +83,7 @@ type JobPayload struct {
 	// Review-run fields.
 	RetryReason     string `json:"retry_reason,omitempty"`
 	SessionID       string `json:"session_id,omitempty"`
+	ContextID string `json:"context_id,omitempty"`
 	PriorFindings   string `json:"prior_findings,omitempty"`
 	CommandTemplate string `json:"command_template,omitempty"`
 	Guide           string `json:"guide,omitempty"`

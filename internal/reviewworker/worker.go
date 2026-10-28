@@ -227,7 +227,7 @@ func (w *Worker) jobEvent(name, status string, p workerproto.JobPayload) reviewl
 	if kind == "" {
 		kind = workerproto.JobReview
 	}
-	return reviewlog.Event{Name: name, Component: "worker", Kind: kind, ReviewID: p.ReviewID, RunID: p.RunID, ReactionID: p.ReactionID, WorkerID: w.cfg.WorkerID, Repo: p.Repo, PRNumber: p.PRNumber, Status: status}
+	return reviewlog.Event{Name: name, Component: "worker", Kind: kind, ReviewID: p.ReviewID, RunID: p.RunID, ContextID: p.ContextID, ReactionID: p.ReactionID, WorkerID: w.cfg.WorkerID, Repo: p.Repo, PRNumber: p.PRNumber, Status: status}
 }
 
 func (w *Worker) complete(p workerproto.JobPayload, ok bool, headCommit, sessionID, result, errText string) {
@@ -317,6 +317,7 @@ func (w *Worker) runReview(ctx context.Context, p workerproto.JobPayload) {
 		ReviewID:      p.ReviewID,
 		HeadCommit:    head,
 		SessionID:     p.SessionID,
+		SessionTitle:  review.SessionTitle(p.ReviewID, p.ContextID),
 		RetryNote:     retryNote,
 		ResultAPIURL:  p.ResultAPIURL,
 		ResultToken:   p.ResultToken,
@@ -371,7 +372,7 @@ func (w *Worker) runReview(ctx context.Context, p workerproto.JobPayload) {
 		runErr = fmt.Errorf("%w: %v", jobCtx.Err(), runErr)
 	}
 	sessionCtx, scancel := context.WithTimeout(ctx, 15*time.Second)
-	sessionID := review.CaptureSessionID(sessionCtx, w.cfg.Tool, dir, p.ReviewID)
+	sessionID := review.CaptureContextSessionID(sessionCtx, w.cfg.Tool, dir, p.ReviewID, p.ContextID)
 	scancel()
 	clean := review.StripANSI(output)
 	if runErr != nil {
@@ -397,7 +398,7 @@ func (w *Worker) runReaction(ctx context.Context, p workerproto.JobPayload) {
 	}
 	// The instruction is passed as a single argv element so arbitrary reviewer
 	// text (quotes, backslashes, whitespace) survives verbatim.
-	args := []string{"run", "--session", p.SessionID, "--title", "saturnus-review-" + p.ReviewID, p.Instruction}
+	args := []string{"run", "--session", p.SessionID, "--title", review.SessionTitle(p.ReviewID, p.ContextID), p.Instruction}
 
 	logFile, err := openLog(w.cfg.LogDir, p.ReactionID)
 	if err != nil {

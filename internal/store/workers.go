@@ -23,6 +23,7 @@ type WorkerCapabilities struct {
 	Tool          string            `json:"tool"`
 	ToolVersion   string            `json:"tool_version"`
 	GH            bool              `json:"gh"`
+	ContextReset  bool              `json:"context_reset,omitempty"`
 	GitHub        *ghinfo.Info      `json:"github,omitempty"`
 	MaxConcurrent int               `json:"max_concurrent"`
 }

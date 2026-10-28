@@ -214,6 +214,12 @@ Re-submission and retry semantics:
   `gh pr view --json headRefOid`), otherwise the request is refused as already
   up to date. The retry keeps `session_id` and sets `retry_reason`.
 - `/sat retry <review_id>`: same policy, plus it works on a specific review id.
+- `/sat reset <review_id>`: reviewer-authorized fresh context, bypassing the
+  unchanged-head check. Atomically clear the saved session and current outcome,
+  rotate a persistent `review_contexts.context_id`, and queue a new run. Reject
+  archived/active reviews and active reactions. Preserve findings, run/reaction
+  history, requester and threads. Context titles isolate session discovery from
+  old sessions; remote workers must advertise `context_reset=true`.
   The previous `session_id` is kept so the run appends to the same tool
   conversation.
 - The requester identity is preserved across re-runs: re-submitting or retrying

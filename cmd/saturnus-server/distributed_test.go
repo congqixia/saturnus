@@ -65,6 +65,20 @@ func TestDistributedReviewEndToEnd(t *testing.T) {
 	// result to the result API URL it finds in its prompt args.
 	tool := filepath.Join(t.TempDir(), "fake-review-tool")
 	script := `#!/bin/bash
+state="` + filepath.Join(filepath.Dir(tool), "sessions.json") + `"
+if [ "$1 $2" = "session list" ]; then
+  if [ -f "$state" ]; then cat "$state"; else printf '[]\n'; fi
+  exit 0
+fi
+title=""
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "--title" ]; then title="$arg"; fi
+  previous="$arg"
+done
+case "$title" in
+  *-ctx_*) printf '[{"id":"ses-reset","title":"%s","directory":"%s","updated":1}]\n' "$title" "$PWD" > "$state" ;;
+esac
 url=$(printf '%s\n' "$@" | grep -oE 'https?://[^ ]*/api/reviews/[^ ]*/result' | head -n1)
 echo "FAKE-TOOL ARGS: $*"
 echo "REVIEW SUMMARY:"
@@ -123,7 +137,7 @@ exit 0
 
 	// Register the remote worker with its capabilities and token.
 	if _, err := st.RegisterWorker(store.Agent{ID: "wrk-test", Name: "review-worker", Type: "review-worker", Host: "test-host"},
-		store.WorkerCapabilities{Repos: map[string]string{repo: checkout}, Tool: tool, MaxConcurrent: 1}); err != nil {
+		store.WorkerCapabilities{Repos: map[string]string{repo: checkout}, Tool: tool, MaxConcurrent: 1, ContextReset: true}); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.SetWorkerToken("wrk-test", "test-token"); err != nil {
@@ -286,6 +300,30 @@ exit 0
 	}
 	if !recorder.hasStart(runs[1].ID, "") {
 		t.Fatal("retry did not report its distinct run id")
+	}
+	// Reset must create a new tool session even with the same PR head, and
+	// remote completion must not restore the previous session as a fallback.
+	if _, err := svc.ResetContext(created.ID, review.MessageContext{SenderOpenID: "ou_user"}); err != nil {
+		t.Fatal(err)
+	}
+	contextID, err := svc.ContextID(created.ID)
+	if err != nil || contextID == "" {
+		t.Fatalf("missing reset context: %s %v", contextID, err)
+	}
+	waitFor(t, 15*time.Second, func() bool {
+		req, err := svc.Get(created.ID)
+		return err == nil && req.Status == "succeeded" && req.SessionID == "ses-reset"
+	})
+	fresh, err := svc.Get(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contains(fresh.ResultText, "--session") || !contains(fresh.ResultText, review.SessionTitle(created.ID, contextID)) {
+		t.Fatalf("reset resumed the old tool context: %s", fresh.ResultText)
+	}
+	runs = svc.ListRuns(created.ID)
+	if len(runs) != 3 || runs[2].SessionID != "ses-reset" {
+		t.Fatalf("new session not recorded in remote run: %+v", runs)
 	}
 }
 

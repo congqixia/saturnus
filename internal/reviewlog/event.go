@@ -12,6 +12,7 @@ import (
 type Event struct {
 	Name, Component, Kind                 string
 	ReviewID, RunID, ReactionID, WorkerID string
+	ContextID                             string
 	Repo                                  string
 	PRNumber                              int
 	Status, Error                         string
@@ -23,6 +24,7 @@ func (e Event) String() string {
 	for _, field := range []struct{ key, value string }{
 		{"event", e.Name}, {"component", e.Component}, {"kind", e.Kind},
 		{"review_id", e.ReviewID}, {"run_id", e.RunID}, {"reaction_id", e.ReactionID},
+		{"context_id", e.ContextID},
 		{"worker_id", e.WorkerID}, {"repo", e.Repo}, {"status", e.Status},
 		{"tool", e.Tool}, {"log_path", e.LogPath}, {"error", e.Error},
 	} {

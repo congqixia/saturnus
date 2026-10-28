@@ -464,7 +464,12 @@ func (s *server) getReview(w http.ResponseWriter, r *http.Request) {
 	if err := s.reviews.ResolveRequesterName(&req); err != nil {
 		logRequesterResolveFailure(req, err)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"review": req, "runs": s.reviews.ListRuns(req.ID), "reactions": s.reviews.ListReactions(req.ID), "threads": s.reviews.ListThreads(req.ID), "findings": s.reviews.ListFindings(req.ID)})
+	contextID, err := s.reviews.ContextID(req.ID)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"review": req, "context_id": contextID, "runs": s.reviews.ListRuns(req.ID), "reactions": s.reviews.ListReactions(req.ID), "threads": s.reviews.ListThreads(req.ID), "findings": s.reviews.ListFindings(req.ID)})
 }
 
 // submitReviewResult receives the machine-readable review result the review
@@ -832,7 +837,7 @@ func isReviewRequest(text string) bool {
 	fields := strings.Fields(strings.TrimSpace(text))
 	if len(fields) >= 2 && fields[0] == "/sat" {
 		switch fields[1] {
-		case "review", "retry", "refresh", "act", "threads", "describe", "reply", "post":
+		case "review", "retry", "reset", "refresh", "act", "threads", "describe", "reply", "post":
 			return true
 		}
 	}
@@ -1966,6 +1971,9 @@ func (s *server) describeReviewReply(id string) botReply {
 		logRequesterResolveFailure(req, err)
 	}
 	content := formatReviewMarkdown(req, s.reviews.Tool(), s.reviews.ListFindings(req.ID), s.reviews.WorkerDescription(req))
+	if contextID, err := s.reviews.ContextID(req.ID); err == nil && contextID != "" {
+		content += "\n\n**Context**: " + escapeMarkdown(contextID)
+	}
 	if runs := s.reviews.ListRuns(req.ID); len(runs) > 0 {
 		content += "\n\n" + formatReviewRuns(runs)
 	}
@@ -2214,6 +2222,7 @@ var satCommandList = []struct {
 	{"/sat reviews all|archived", "list PR reviews including archived, or only archived"},
 	{"/sat review <pr-url|review_id> [@user]", "start a review (optionally attribute the requester to @user), or show one review by id"},
 	{"/sat retry <review_id>", "retry a failed review, or re-run after the PR head changed"},
+	{"/sat reset <review_id>", "reset the tool session and queue a fresh review context, even when the PR head is unchanged"},
 	{"/sat post <review_id>", "publish the review's findings as GitHub inline comments (plus the verdict review); for reviews whose findings were never posted"},
 	{"/sat refresh <review_id|all>", "sync PR/task state: archive merged/closed PRs, complete their task, append reviewer comments to the task"},
 	{"/sat act <review_id> <instruction>", "resume the review session to act on the PR (e.g. inline comments for selected issues, concrete code for an issue)"},
@@ -2405,7 +2414,7 @@ func (s *server) handleBotCommand(text string, msg review.MessageContext) botRep
 				return botReply{text: "Review already in progress: " + req.ID + " (" + req.PRURL + ") worker=" + s.reviews.WorkerDescription(req)}
 			}
 			if errors.Is(err, review.ErrReviewUnchanged) {
-				return botReply{text: "Review " + req.ID + " is already up to date: PR head commit unchanged since the last review. Use /sat retry to force another run."}
+				return botReply{text: "Review " + req.ID + " is already up to date: PR head commit unchanged since the last review. Use /sat reset " + req.ID + " to run again with a fresh context."}
 			}
 			return botReply{text: "Review failed: " + err.Error()}
 		}
@@ -2425,6 +2434,15 @@ func (s *server) handleBotCommand(text string, msg review.MessageContext) botRep
 			return botReply{text: "Retry failed: " + err.Error()}
 		}
 		return botReply{text: "Retry started " + req.ID + " (" + req.PRURL + ")"}
+	case "reset":
+		if len(fields) != 3 {
+			return botReply{text: "Usage: /sat reset <review_id>"}
+		}
+		req, err := s.reviews.ResetContext(fields[2], msg)
+		if err != nil {
+			return botReply{text: "Reset context failed: " + err.Error()}
+		}
+		return botReply{text: "Review context reset: " + req.ID + ". A fresh tool session will be created on the next run (old session will not be resumed)."}
 	case "post":
 		if len(fields) < 3 {
 			return botReply{text: "Usage: /sat post <review_id>"}

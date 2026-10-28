@@ -25,6 +25,9 @@ type ToolArgs struct {
 	// (opencode run --session <id>) so a retry/continue appends to the previous
 	// review conversation instead of starting fresh.
 	SessionID string
+	// SessionTitle changes when context is reset, preventing rediscovery of an
+	// older session. Custom command templates should use this for --title.
+	SessionTitle string
 	// RetryNote, when set, replaces the initial review prompt with a
 	// continuation instruction; it is shellquoted into the outer prompt.
 	RetryNote string
@@ -82,7 +85,26 @@ func RenderCommand(templateText string, args ToolArgs) ([]string, error) {
 	if err := tmpl.Execute(&buf, args); err != nil {
 		return nil, err
 	}
-	return splitCommand(buf.String())
+	argv, err := splitCommand(buf.String())
+	if err != nil {
+		return nil, err
+	}
+	if args.SessionTitle != "" && args.SessionTitle != SessionTitle(args.ReviewID, "") {
+		// Honor context titles even for existing templates that still construct
+		// --title from ReviewID. Ordinary runs keep their configured title;
+		// the wire template remains compatible with old workers.
+		for i, arg := range argv {
+			if arg == "--title" && i+1 < len(argv) {
+				argv[i+1] = args.SessionTitle
+				break
+			}
+			if strings.HasPrefix(arg, "--title=") {
+				argv[i] = "--title=" + args.SessionTitle
+				break
+			}
+		}
+	}
+	return argv, nil
 }
 
 func shellquote(s string) string {

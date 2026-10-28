@@ -176,7 +176,7 @@ func (s *scheduler) OnEvent(ctx context.Context, workerID string, frame workerpr
 }
 
 func (s *scheduler) jobEvent(name, status, workerID string, p workerproto.JobPayload) reviewlog.Event {
-	return reviewlog.Event{Name: name, Component: "server", Kind: p.Kind, ReviewID: p.ReviewID, RunID: p.RunID, ReactionID: p.ReactionID, WorkerID: workerID, Repo: p.Repo, PRNumber: p.PRNumber, Status: status}
+	return reviewlog.Event{Name: name, Component: "server", Kind: p.Kind, ReviewID: p.ReviewID, RunID: p.RunID, ContextID: p.ContextID, ReactionID: p.ReactionID, WorkerID: workerID, Repo: p.Repo, PRNumber: p.PRNumber, Status: status}
 }
 
 func (s *scheduler) recordStarted(workerID, reviewID string, p workerproto.StartedPayload) error {
@@ -315,6 +315,11 @@ func (s *scheduler) dispatchReaction(id string) {
 // has capacity, preferring the worker that ran the previous run (session
 // affinity for retries) and otherwise the least loaded.
 func (s *scheduler) pickReviewWorker(req store.ReviewRequest) string {
+	contextID, err := s.svc.ContextID(req.ID)
+	if err != nil {
+		log.Printf("scheduler: read review context review_id=%s: %v", req.ID, err)
+		return ""
+	}
 	workers := s.st.ListOnlineWorkers(s.onlineWindow)
 	type candidate struct {
 		id   string
@@ -327,6 +332,9 @@ func (s *scheduler) pickReviewWorker(req store.ReviewRequest) string {
 			continue
 		}
 		if _, ok := caps.Repos[req.Repo]; !ok {
+			continue
+		}
+		if contextID != "" && !caps.ContextReset {
 			continue
 		}
 		max := caps.MaxConcurrent

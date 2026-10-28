@@ -1013,6 +1013,9 @@ func (s *Service) FormatOne(req store.ReviewRequest) string {
 	}
 	fmt.Fprintf(&b, "%s status=%s\n%s\nrepo=%s#%d", req.ID, status, req.PRURL, req.Repo, req.PRNumber)
 	fmt.Fprintf(&b, "\nworker=%s", s.WorkerDescription(req))
+	if contextID, err := s.ContextID(req.ID); err == nil && contextID != "" {
+		fmt.Fprintf(&b, "\ncontext=%s", contextID)
+	}
 	if req.Title != "" {
 		fmt.Fprintf(&b, "\ntitle=%s", req.Title)
 	}
@@ -1129,6 +1132,15 @@ func (s *Service) Act(ctx MessageContext, reviewID, instruction string) (store.R
 	if instruction == "" {
 		return store.ReviewReaction{}, errors.New("empty instruction")
 	}
+	lockCtx := s.ctx
+	if lockCtx == nil {
+		lockCtx = context.Background()
+	}
+	unlock, err := s.syncLocks.Lock(lockCtx, reviewID)
+	if err != nil {
+		return store.ReviewReaction{}, err
+	}
+	defer unlock()
 	req, err := s.store.GetReview(reviewID)
 	if err != nil {
 		return store.ReviewReaction{}, err
@@ -1372,6 +1384,12 @@ func (s *Service) process(id string) {
 	ctx, cancel := context.WithTimeout(s.ctx, s.cfg.Timeout)
 	defer cancel()
 
+	contextID, err := s.ContextID(req.ID)
+	if err != nil {
+		s.finish(&req, "failed", "", "read review context: "+err.Error())
+		s.notifyReviewer(req)
+		return
+	}
 	info := ResolvePRInfo(ctx, s.cfg.GHCli, req.Repo, req.PRNumber)
 	if info.Title != "" && req.Title == "" {
 		req.Title = info.Title
@@ -1435,6 +1453,7 @@ func (s *Service) process(id string) {
 		ReviewID:      req.ID,
 		HeadCommit:    req.HeadCommit,
 		SessionID:     req.SessionID,
+		SessionTitle:  SessionTitle(req.ID, contextID),
 		RetryNote:     retryNote,
 		ResultAPIURL:  resultAPIURL,
 		ResultToken:   s.cfg.ResultToken,
@@ -1488,6 +1507,9 @@ func (s *Service) process(id string) {
 	output, runErr := Run(ctx, s.cfg.Tool, args, repoRoot, sink)
 	if sessionID := s.captureSessionID(repoRoot, req.ID); sessionID != "" {
 		req.SessionID = sessionID
+		if err := s.store.SetReviewSession(req.ID, sessionID); err != nil {
+			logf("store review session review_id=%s: %v", req.ID, err)
+		}
 	}
 	clean := stripANSI(output)
 	req.RetryReason = ""
@@ -2041,7 +2063,13 @@ func (s *Service) processReaction(id string) {
 
 	// The instruction is passed as a single argv element so arbitrary reviewer
 	// text (quotes, backslashes, whitespace) survives verbatim.
-	args := []string{"run", "--session", sessionID, "--title", "saturnus-review-" + req.ID, reac.Instruction}
+	contextID, err := s.ContextID(req.ID)
+	if err != nil {
+		s.finishReaction(&reac, "failed", "", "read review context: "+err.Error())
+		s.notifyReaction(reac)
+		return
+	}
+	args := []string{"run", "--session", sessionID, "--title", SessionTitle(req.ID, contextID), reac.Instruction}
 
 	var mu sync.Mutex
 	var progress string

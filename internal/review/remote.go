@@ -19,6 +19,13 @@ func (s *Service) StartRemote(req store.ReviewRequest, workerID string) (workerp
 	if workerID == "" {
 		return workerproto.JobPayload{}, errors.New("empty worker id")
 	}
+	contextID, err := s.ContextID(req.ID)
+	if err != nil {
+		return workerproto.JobPayload{}, err
+	}
+	if err := s.requireContextWorker(contextID, workerID); err != nil {
+		return workerproto.JobPayload{}, err
+	}
 	assigned, err := s.store.AssignReview(req.ID, workerID)
 	if err != nil {
 		return workerproto.JobPayload{}, err
@@ -45,6 +52,13 @@ func (s *Service) StartRemoteReaction(reac store.ReviewReaction, req store.Revie
 	if workerID == "" {
 		return workerproto.JobPayload{}, errors.New("empty worker id")
 	}
+	contextID, err := s.ContextID(req.ID)
+	if err != nil {
+		return workerproto.JobPayload{}, err
+	}
+	if err := s.requireContextWorker(contextID, workerID); err != nil {
+		return workerproto.JobPayload{}, err
+	}
 	assigned, err := s.store.AssignReaction(reac.ID, workerID)
 	if err != nil {
 		return workerproto.JobPayload{}, err
@@ -61,6 +75,7 @@ func (s *Service) StartRemoteReaction(reac store.ReviewReaction, req store.Revie
 		PRNumber:    req.PRNumber,
 		PRURL:       req.PRURL,
 		SessionID:   sessionID,
+		ContextID:   contextID,
 		Instruction: assigned.Instruction,
 		Timeout:     s.cfg.Timeout,
 		Tool:        s.cfg.Tool,
@@ -72,6 +87,10 @@ func (s *Service) StartRemoteReaction(reac store.ReviewReaction, req store.Revie
 // the worker to discover in its own checkout. The command template, result API
 // URL and prior findings come from the server's configuration.
 func (s *Service) JobPayload(req store.ReviewRequest) (workerproto.JobPayload, error) {
+	contextID, err := s.ContextID(req.ID)
+	if err != nil {
+		return workerproto.JobPayload{}, err
+	}
 	resultAPIURL := ""
 	if s.cfg.ResultAPIURL != "" {
 		resultAPIURL = strings.ReplaceAll(s.cfg.ResultAPIURL, "{review_id}", req.ID)
@@ -99,6 +118,7 @@ func (s *Service) JobPayload(req store.ReviewRequest) (workerproto.JobPayload, e
 		HeadCommit:      req.HeadCommit,
 		RetryReason:     req.RetryReason,
 		SessionID:       req.SessionID,
+		ContextID:       contextID,
 		PriorFindings:   formatPriorFindings(s.store.ListFindings(req.ID)),
 		CommandTemplate: s.cfg.CommandTemplate,
 		Guide:           guide,

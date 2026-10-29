@@ -94,7 +94,7 @@ func TestSchedulerWaitsForBusyOrBackingOffWorker(t *testing.T) {
 
 func TestReviewMarkdownShowsHistoricalFindingsWithoutVerdict(t *testing.T) {
 	md := formatReviewMarkdown(store.ReviewRequest{Status: "failed"}, "opencode", []store.ReviewFinding{{Severity: "P1", Path: "old.go", Message: "existing finding", Status: "addressed", RunID: "run_old"}}, []store.ReviewRun{{ID: "run_old", Seq: 2}}, "local")
-	if !contains(md, "Previous findings") || !contains(md, "existing finding") || !contains(md, "| addressed | #2 |") {
+	if !contains(md, "Previous findings") || !contains(md, "Findings: 1") || !contains(md, "addressed=1") || contains(md, "existing finding") {
 		t.Fatalf("missing historical findings: %s", md)
 	}
 }

@@ -2181,12 +2181,12 @@ func TestFormatFindingsAndStructuredFormatResult(t *testing.T) {
 	}
 
 	got := svc.FormatResult(req)
-	for _, want := range []string{"Verdict: Request change", "Fixes the restore race.", "Findings:", "[P0] data race (internal/etcd_restore.go:40)", "Fix: use a channel"} {
+	for _, want := range []string{"Verdict: Request change", "Fixes the restore race.", "Findings: 1 (P0: 1, P1: 0, P2: 0)", "/sat findings " + req.ID} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("FormatResult missing %q:\n%s", want, got)
 		}
 	}
-	if strings.Contains(got, "REVIEW SUMMARY:") {
+	if strings.Contains(got, "REVIEW SUMMARY:") || strings.Contains(got, "data race") || strings.Contains(got, "use a channel") {
 		t.Fatalf("FormatResult should prefer the structured result, not the text summary:\n%s", got)
 	}
 

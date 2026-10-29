@@ -150,7 +150,7 @@ func TestFormatResultShowsPreviousFindingsWithoutVerdict(t *testing.T) {
 	}
 	svc := New(st, &fakeLark{}, Config{})
 	out := svc.FormatResult(req)
-	if !strings.Contains(out, "Previous findings") || !strings.Contains(out, "existing finding") {
+	if !strings.Contains(out, "Previous findings") || !strings.Contains(out, "Findings: 1") || strings.Contains(out, "existing finding") {
 		t.Fatalf("missing historical findings: %s", out)
 	}
 }

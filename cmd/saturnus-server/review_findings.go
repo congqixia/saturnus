@@ -4,46 +4,64 @@ import (
 	"fmt"
 	"strings"
 
-	"saturnus/internal/store"
+	"saturnus/internal/lark"
+	"saturnus/internal/review"
 )
 
-func formatReviewFindings(findings []store.ReviewFinding, runs []store.ReviewRun) string {
-	if len(findings) == 0 {
-		return ""
+func (s *server) reviewFindingsReply(id string, page int) botReply {
+	req, err := s.reviews.Get(id)
+	if err != nil {
+		return botReply{text: "Review not found."}
 	}
-	seqs := make(map[string]int, len(runs))
-	for _, run := range runs {
-		seqs[run.ID] = run.Seq
+	findings := s.reviews.ListFindings(req.ID)
+	items, pages, err := review.FindingPage(findings, page)
+	if err != nil {
+		return botReply{text: err.Error()}
 	}
-	var b strings.Builder
-	b.WriteString("**Findings**:\n\n")
-	b.WriteString("Run is the review round that created or last updated the finding; see Runs below.\n\n")
-	b.WriteString("| # | Severity | Status | Run (last update) | Location | Finding | Fix |\n")
-	b.WriteString("| - | -------- | ------ | ----------------- | -------- | ------- | --- |\n")
-	for i, f := range findings {
-		round := f.RunID
-		if seq := seqs[f.RunID]; f.RunID != "" && seq > 0 {
-			round = fmt.Sprintf("#%d", seq)
-		}
+	runs := s.reviews.ListRuns(req.ID)
+	text, _ := review.FormatFindingPage(req, findings, runs, page)
+	if len(items) == 0 {
+		return botReply{text: text}
+	}
+	rows := make([]map[string]any, 0, len(items))
+	for i, f := range items {
 		status := f.Status
 		if status == "" {
 			status = "open"
 		}
-		location := f.Path
+		location := review.FindingText(f.Path, 200)
 		if f.Line > 0 {
 			location = fmt.Sprintf("%s:%d", location, f.Line)
 		}
-		detail := truncateText(f.Title, 200)
-		if detail == "" {
-			detail = truncateText(f.Message, 600)
-		} else if f.Message != "" && f.Message != f.Title {
-			detail += ": " + truncateText(f.Message, 600)
+		detail := review.FindingText(f.Title, 200)
+		if f.Message != "" && f.Message != f.Title {
+			detail += "\n" + review.FindingText(f.Message, 600)
 		}
-		fmt.Fprintf(&b, "| %d | %s | %s | %s | %s | %s | %s |\n", i+1,
-			findingCell(f.Severity), findingCell(status), findingCell(round), findingCell(location),
-			findingCell(detail), findingCell(truncateText(f.Suggestion, 300)))
+		rows = append(rows, map[string]any{
+			"number": (page-1)*review.FindingPageSize + i + 1, "severity": review.FindingText(f.Severity, 10),
+			"status": review.FindingText(status, 30), "run": review.FindingRun(f, runs), "location": location,
+			"finding": detail, "fix": review.FindingText(f.Suggestion, 300),
+		})
 	}
-	return b.String()
+	description := fmt.Sprintf("%s\nPage %d/%d. Run = round that last updated the finding.", review.FindingSummary(findings), page, pages)
+	if req.Verdict == "" {
+		description += "\nPrevious findings; the current run has no verdict."
+	}
+	if page < pages {
+		description += fmt.Sprintf("\nNext: `/sat findings %s %d`", req.ID, page+1)
+	}
+	return botReply{text: text, table: &lark.TableCard{
+		Title: "Findings / " + req.ID, Description: description,
+		Columns: []lark.TableColumn{
+			{Name: "number", Display: "#", DataType: lark.ColumnNumber, Width: "5%"},
+			{Name: "severity", Display: "Severity", DataType: lark.ColumnText, Width: "7%"},
+			{Name: "status", Display: "Status", DataType: lark.ColumnText, Width: "10%"},
+			{Name: "run", Display: "Run (last update)", DataType: lark.ColumnText, Width: "10%"},
+			{Name: "location", Display: "Location", DataType: lark.ColumnText, Width: "18%"},
+			{Name: "finding", Display: "Finding", DataType: lark.ColumnText, Width: "30%"},
+			{Name: "fix", Display: "Fix", DataType: lark.ColumnText, Width: "20%"},
+		}, Rows: rows,
+	}}
 }
 
 func findingCell(value string) string {

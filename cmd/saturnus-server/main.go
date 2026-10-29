@@ -852,7 +852,7 @@ func isReviewRequest(text string) bool {
 	fields := strings.Fields(strings.TrimSpace(text))
 	if len(fields) >= 2 && fields[0] == "/sat" {
 		switch fields[1] {
-		case "review", "retry", "reset", "refresh", "act", "threads", "describe", "reply", "post", "pr", "prs":
+		case "review", "retry", "reset", "refresh", "act", "threads", "describe", "findings", "reply", "post", "pr", "prs":
 			return true
 		}
 	}
@@ -2000,12 +2000,18 @@ func (s *server) describeReviewReply(id string) botReply {
 	if threads := s.reviews.ListThreads(req.ID); len(threads) > 0 {
 		content += "\n\n" + formatReviewThreads(threads)
 	}
-	text := s.reviews.FormatOne(req)
-	if table := formatReviewFindings(findings, runs); table != "" {
-		text += "\n\n" + table
-		if len(runs) > 0 {
-			text += "\n\n" + formatReviewRuns(runs)
-		}
+	// Keep the text metadata format without reinserting the tool transcript.
+	textReq := req
+	textReq.ResultText = ""
+	text := s.reviews.FormatOne(textReq) + "\n\n" + review.FindingSummary(findings) + "\nDetails: /sat findings " + req.ID
+	if len(findings) > 0 && req.Verdict == "" {
+		text += "\nPrevious findings; the current run has no verdict."
+	}
+	if req.Verdict != "" && req.Summary != "" {
+		text += "\nSummary: " + review.FindingText(req.Summary, 1000)
+	}
+	if len(runs) > 0 {
+		text += "\n\n" + formatReviewRuns(runs)
 	}
 	return botReply{
 		text: text,
@@ -2148,17 +2154,14 @@ func formatReviewMarkdown(req store.ReviewRequest, tool string, findings []store
 	if req.Verdict != "" {
 		fmt.Fprintf(&b, "**Verdict**: %s\n", reviewVerdictTag(req.Verdict))
 		if req.Summary != "" {
-			fmt.Fprintf(&b, "**Summary**: %s\n", escapeMarkdown(req.Summary))
+			fmt.Fprintf(&b, "**Summary**: %s\n", escapeMarkdown(review.FindingText(req.Summary, 1000)))
 		}
 	}
-	if table := formatReviewFindings(findings, runs); table != "" {
-		b.WriteString("\n")
-		if req.Verdict == "" {
-			b.WriteString("Previous findings; the current run has no verdict.\n\n")
-		}
-		b.WriteString(table)
+	fmt.Fprintf(&b, "\n%s\nDetails: `/sat findings %s`\n", review.FindingSummary(findings), req.ID)
+	if len(findings) > 0 && req.Verdict == "" {
+		b.WriteString("Previous findings; the current run has no verdict.\n")
 	}
-	if req.ResultText != "" {
+	if req.ResultText != "" && req.Verdict == "" {
 		b.WriteString("\n---\n\n")
 		if reviewCompleted(req) {
 			if summary := review.ExtractSummary(req.ResultText); summary != "" {
@@ -2235,7 +2238,8 @@ var satCommandList = []struct {
 	{"/sat refresh <review_id|all>", "sync PR/task state: archive merged/closed PRs, complete their task, append reviewer comments to the task"},
 	{"/sat act <review_id> <instruction>", "resume the review session to act on the PR (e.g. inline comments for selected issues, concrete code for an issue)"},
 	{"/sat threads <review_id>", "list all chat threads a review was requested in"},
-	{"/sat describe review <review_id>", "show full details of one review"},
+	{"/sat describe review <review_id>", "show review details with finding counts"},
+	{"/sat findings <review_id> [page]", "show findings with status and review round (5 per page)"},
 	{"/sat repos", "show the configured review repos"},
 	{"/sat prs [refresh|all]", "list tracked PRs with CI and bypass counts; refresh discovers and polls all whitelisted PRs"},
 	{"/sat pr <pr-url|owner/repo#number|pr_id>", "track/refresh a PR and show CI check details, including bypass policy"},
@@ -2500,6 +2504,19 @@ func (s *server) handleBotCommand(text string, msg review.MessageContext) botRep
 			return botReply{text: "Usage: /sat threads <review_id>"}
 		}
 		return s.threadsReply(fields[2])
+	case "findings":
+		if len(fields) < 3 || len(fields) > 4 {
+			return botReply{text: "Usage: /sat findings <review_id> [page]"}
+		}
+		page := 1
+		if len(fields) == 4 {
+			var err error
+			page, err = strconv.Atoi(fields[3])
+			if err != nil || page < 1 {
+				return botReply{text: "Finding page must be a positive integer."}
+			}
+		}
+		return s.reviewFindingsReply(fields[2], page)
 	case "describe":
 		if len(fields) == 4 && fields[2] == "pr" {
 			return s.prDetailReply(fields[3])

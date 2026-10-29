@@ -115,6 +115,7 @@ Supported text commands:
 - `/sat act <review_id> <instruction>` — resume the review's tool session to act on the PR (e.g. post inline comments for selected issues, work out concrete code for an issue); the agent output is sent back to the chat
 - `/sat threads <review_id>` — list every chat thread a review was requested in
 - `/sat describe review <review_id>` — show full details of one review (as a card), including the run history
+- `/sat findings <review_id> [page]` — show finding details, status and last-updated review round (5 per page)
 - `/sat repos` — show the configured repo whitelist
 - `/sat prs [refresh|all]` — list tracked PRs with CI status and bypass counts; refresh discovers and polls PRs
 - `/sat pr <pr-url|owner/repo#number|pr_id>` — track/refresh a PR and inspect checks, including bypass rules
@@ -378,14 +379,20 @@ the previous host.
 `/sat reviews` includes the latest available verdict in Status: `LGTM`, `NIT`
 (nit comments), or `RC` (request change), for example `succeeded / RC`. A retry
 or reset without a new result still shows the previous round's verdict.
-`/sat describe review <id>` displays findings in a table with severity, status,
-last-updated run, location, details and suggested fix. The run number matches
+`/sat describe review <id>` shows finding counts by severity and status.
+Use `/sat findings <id> [page]` for a separate native table with severity, status,
+last-updated run, location, details and suggested fix. Each page contains at most
+5 findings, with a command for the next page. Long fields are shortened for chat;
+the stored findings and HTTP API retain their full content. The run number matches
 the `#` column in Runs; it identifies the round that created or last updated
 the finding, not necessarily the first round that discovered it. Legacy findings
 without a run reference show `-`; unresolved references retain their raw run ID.
 
-Result messages sent to the reviewer contain a concise conclusion, not the raw
-log. When `SATURNUS_REVIEW_RESULT_API_URL` is set, the review prompt asks the
+Result notifications to the reviewer are two separate messages: the conclusion
+and finding counts, then the first page of findings (including zero findings).
+Configured in-thread result replies use the same split. More findings can be
+read with `/sat findings <id> 2`, etc. Each part is attempted independently if a
+delivery fails. When `SATURNUS_REVIEW_RESULT_API_URL` is set, the review prompt asks the
 tool to POST a machine-readable result to that endpoint (with the `{review_id}`
 placeholder substituted and the token in `Authorization: Bearer <token>`) in
 addition to printing the text `REVIEW SUMMARY:` block. The POST body is:
@@ -424,9 +431,10 @@ URL, a zero process exit without this run's structured result is recorded as
 and verify success before exiting. Existing `succeeded` reviews missing a required
 verdict can be rerun with `/sat retry`, even if the PR head has not changed.
 
-The result message, `/sat describe review` card and web UI render the verdict and
-findings directly. Historical findings stay visible when the current run has no
-verdict. With no configured result URL, text-only reviews remain supported through
+The result summary and `/sat describe review` card render the structured verdict
+and finding counts without repeating the tool transcript. `/sat findings` and
+the web UI show finding details. Historical finding counts stay visible when the current run has no
+verdict; `/sat findings` retains their details. With no configured result URL, text-only reviews remain supported through
 the `REVIEW SUMMARY:` block (`PR summary` / `Issues` / `Review suggestions`). ANSI color codes are stripped
 from `result_text` and messages; the transcript log keeps the raw output.
 
@@ -443,7 +451,7 @@ one by id in the result and reports a new status instead of re-creating it:
 
 New findings are submitted without an `id` (they default to `open`). On the
 next round a finding can also be resolved on GitHub (see below). The status is
-shown in `/sat describe review` and the web UI.
+shown in `/sat findings` and the web UI; `/sat describe review` includes status counts.
 
 ### Posting findings to GitHub
 

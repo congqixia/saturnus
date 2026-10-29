@@ -1671,20 +1671,17 @@ func (s *Service) FormatResult(req store.ReviewRequest) string {
 		// outcome, so render it instead of the raw text summary below.
 		fmt.Fprintf(&b, "\n\nVerdict: %s", verdictLabel(req.Verdict))
 		if req.Summary != "" {
-			fmt.Fprintf(&b, "\nSummary: %s", truncate(req.Summary, 1000))
+			fmt.Fprintf(&b, "\nSummary: %s", FindingText(req.Summary, 1000))
 		}
-		if s.store != nil {
-			if rendered := FormatFindings(s.store.ListFindings(req.ID)); rendered != "" {
-				fmt.Fprintf(&b, "\n\n%s", rendered)
-			}
-		}
+		fmt.Fprintf(&b, "\n\n%s\nDetails: /sat findings %s", FindingSummary(s.ListFindings(req.ID)), req.ID)
 		if s.cfg.LogDir != "" {
 			fmt.Fprintf(&b, "\n\nlog=%s", filepath.Join(s.cfg.LogDir, req.ID+".log"))
 		}
 		return b.String()
 	}
-	if rendered := FormatFindings(s.ListFindings(req.ID)); rendered != "" {
-		fmt.Fprintf(&b, "\n\nPrevious findings (current run has no verdict):\n%s", rendered)
+	findings := s.ListFindings(req.ID)
+	if len(findings) > 0 {
+		fmt.Fprintf(&b, "\n\nPrevious findings (current run has no verdict):\n%s\nDetails: /sat findings %s", FindingSummary(findings), req.ID)
 	}
 	clean := stripANSI(req.ResultText)
 	if summary := ExtractSummary(clean); summary != "" {
@@ -1999,20 +1996,23 @@ func (s *Service) notifyReviewer(req store.ReviewRequest) {
 	if err := s.resolveRequesterName(&req); err != nil {
 		logf("notifyReviewer: %v", err)
 	}
-	text := s.FormatResult(req)
-	var err error
-	switch {
-	case s.cfg.ReviewerOpenID != "":
-		err = s.lark.SendTextToUser(s.cfg.ReviewerOpenID, text)
-	case s.cfg.ReviewerChatID != "":
-		err = s.lark.SendText("chat_id", s.cfg.ReviewerChatID, text)
-	}
-	if err != nil {
-		logf("notify reviewer: %v", err)
-	}
-	if s.cfg.ReplyInThread && req.MessageID != "" {
-		if err := s.lark.ReplyMessage(req.MessageID, text); err != nil {
-			logf("reply in thread: %v", err)
+	findings, _ := FormatFindingPage(req, s.ListFindings(req.ID), s.ListRuns(req.ID), 1)
+	// Send independently so one failed delivery does not suppress the other.
+	for i, text := range []string{s.FormatResult(req), findings} {
+		var err error
+		switch {
+		case s.cfg.ReviewerOpenID != "":
+			err = s.lark.SendTextToUser(s.cfg.ReviewerOpenID, text)
+		case s.cfg.ReviewerChatID != "":
+			err = s.lark.SendText("chat_id", s.cfg.ReviewerChatID, text)
+		}
+		if err != nil {
+			logf("notify reviewer part=%d: %v", i+1, err)
+		}
+		if s.cfg.ReplyInThread && req.MessageID != "" {
+			if err := s.lark.ReplyMessage(req.MessageID, text); err != nil {
+				logf("reply in thread part=%d: %v", i+1, err)
+			}
 		}
 	}
 	s.notifyRequesterResult(req)

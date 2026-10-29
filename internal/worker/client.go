@@ -100,6 +100,7 @@ func (c *Client) connectOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	ws.SetReadLimit(workerproto.MaxMessageBytes)
 	c.mu.Lock()
 	c.ws = ws
 	c.mu.Unlock()

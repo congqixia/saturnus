@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -68,6 +69,7 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	conn.SetReadLimit(workerproto.MaxMessageBytes)
 	c := &Conn{workerID: workerID, ws: conn, hub: h}
 	h.mu.Lock()
 	if h.closed {
@@ -194,17 +196,21 @@ func (c *Conn) close() error {
 func (c *Conn) readLoop() {
 	defer func() {
 		c.hub.mu.Lock()
-		if c.hub.conns[c.workerID] == c {
+		current := c.hub.conns[c.workerID] == c
+		if current {
 			delete(c.hub.conns, c.workerID)
+			delete(c.hub.online, c.workerID)
 		}
-		delete(c.hub.online, c.workerID)
 		c.hub.mu.Unlock()
-		c.hub.handler.OnDisconnect(c.workerID)
+		if current {
+			c.hub.handler.OnDisconnect(c.workerID)
+		}
 	}()
 	ctx := context.Background()
 	for {
 		_, data, err := c.ws.Read(ctx)
 		if err != nil {
+			log.Printf("worker channel closed worker_id=%s status=%d error=%v", c.workerID, websocket.CloseStatus(err), err)
 			return
 		}
 		var frame workerproto.Frame

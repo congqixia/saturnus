@@ -203,6 +203,7 @@ Environment variables:
 | `SATURNUS_REVIEW_TOOL` | opencode | review executable |
 | `SATURNUS_REVIEW_COMMAND_TEMPLATE` | see below | `text/template` for command args |
 | `SATURNUS_REVIEW_MAX_CONCURRENT` | 1 | worker count |
+| `SATURNUS_REVIEW_LOCAL_FALLBACK` | 1 | set to `0` to keep reviews pending when remote workers are unavailable; repo mappings remain available to Tasks |
 | `SATURNUS_REVIEW_TIMEOUT` | 15m | per-review timeout |
 | `SATURNUS_REVIEW_CREATE_TASK` | 0 | create a Feishu task assigned to reviewer + requester |
 | `SATURNUS_REVIEW_TASK_DUE_HOURS` | 24 | task due offset in hours |
@@ -225,11 +226,16 @@ Feishu task sync); each worker owns its own repo checkouts and runs the review
 tool locally. The worker keeps a single outbound WebSocket control channel to
 the server, so no inbound ports are needed on the worker host.
 
-The scheduler prefers a remote worker whose checkout serves the PR's repo,
+The scheduler prefers a connected remote worker whose checkout serves the PR's repo,
 routing retries and reviewer reactions back to the same host so the tool session
 can be resumed. When no worker can serve a repo, the server falls back to its
 own local executor (using the server's repo mapping), so existing
 single-host deployments keep working unchanged.
+
+When eligible connected workers are busy or backing off after a failed dispatch,
+the review stays pending. Failed dispatches use bounded backoff instead of
+immediately creating another run. Set `SATURNUS_REVIEW_LOCAL_FALLBACK=0` to
+disable execution on the server while keeping its checkout mappings for Tasks.
 
 Server side:
 
@@ -268,6 +274,10 @@ the resulting inline and file settings remain mutually exclusive. To switch
 sources when an environment default is set, unset it or clear it explicitly,
 for example `saturnus-worker -repos= -repos-file /etc/saturnus/worker-repos.json`.
 Create each worker's file on that host; checkout paths refer to that host's filesystem.
+
+Both ends of the WebSocket channel accept JSON messages up to 8 MiB, including
+escaping and envelope overhead for the bounded tool transcript. Upgrade both the
+server and workers to apply this limit.
 
 `GET /api/workers` lists registered workers. Worker status is derived from
 heartbeats: a worker whose connection has been silent longer than
@@ -393,11 +403,19 @@ more blocking issues), `nit_comments` (no blockers, but P2 comments).
 (correctness / security / data loss), `P1` = should fix before merge
 (significant bug or design flaw), `P2` = nice-to-have or nit. The server
 validates the submission (`POST /api/reviews/{review_id}/result`, 401 without
-the token, 409 when the review is not running) and persists the verdict,
-summary and findings. The result message, the `/sat describe review` card and
-the web UI then render the verdict and the P0-P2 findings directly; without a
-submitted result the message falls back to the text `REVIEW SUMMARY:` block
-(`PR summary` / `Issues` / `Review suggestions`). ANSI color codes are stripped
+the token, 409 when the review is not running or the callback belongs to an older
+run) and atomically persists the verdict, summary and findings. Generated callback
+URLs include a `run_id` query parameter; preserve the complete URL when POSTing.
+Legacy callbacks without that parameter remain accepted. With a configured result
+URL, a zero process exit without this run's structured result is recorded as
+`failed`, with permission diagnostics when present. The tool must finish the POST
+and verify success before exiting. Existing `succeeded` reviews missing a required
+verdict can be rerun with `/sat retry`, even if the PR head has not changed.
+
+The result message, `/sat describe review` card and web UI render the verdict and
+findings directly. Historical findings stay visible when the current run has no
+verdict. With no configured result URL, text-only reviews remain supported through
+the `REVIEW SUMMARY:` block (`PR summary` / `Issues` / `Review suggestions`). ANSI color codes are stripped
 from `result_text` and messages; the transcript log keeps the raw output.
 
 ### Finding status across review rounds

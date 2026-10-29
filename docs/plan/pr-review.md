@@ -352,20 +352,29 @@ per review and injected into the prompt, together with the JSON body format and
   an `id` is new and defaults to `open`. Findings are persisted (upserted), not
   replaced, so prior rounds' findings are carried into the next round's prompt.
 - The endpoint `POST /api/reviews/{id}/result` validates the payload and stores
-  `verdict`/`summary` on the review (and its current run) plus the findings.
-  While the review is running submissions update the recorded result; a
-  duplicate after completion (verdict already recorded) is rejected 409, and a
+  `verdict`/`summary` on the review and its run plus findings in one transaction.
+  Generated URLs include `run_id`; stale runs and duplicate submissions to a
+  run-bound callback are rejected 409. Legacy callbacks without `run_id` remain
+  supported. A duplicate after completion is also rejected 409, and a
   wrong/missing token is rejected 401.
+
+When a result URL is configured, local and remote completion require a structured
+result from this execution. Exit zero without it is `failed`, with tool permission
+or filesystem diagnostics when available. The tool must finish its POST before
+exiting. Old `succeeded` reviews without a required verdict can be retried even
+when the PR head is unchanged. Text-only operation remains supported when no
+result URL is configured.
 
 On retry/continue the prompt lists the previous findings (id, severity,
 location, status, message) so the tool references them by id and reports the
 new status instead of re-reporting them as new issues.
 
 The result message, `/sat describe review` card and web UI render the verdict
-and the P0-P2 findings directly; without a submitted result they fall back to
-the text `REVIEW SUMMARY:` block. `finish` writes the review outcome with a
-targeted UPDATE (only status/result/error/completed_at), and progress flushes
-touch only `result_text`, so a POST arriving mid-run is never clobbered.
+and the P0-P2 findings directly. Historical findings remain visible when the
+current run has no verdict, alongside any text `REVIEW SUMMARY:` block.
+Completion writes the review and run outcomes in one transaction without
+replacing the structured result. Progress flushes touch only `result_text`, so
+a POST arriving mid-run is never clobbered.
 
 ### Posting findings to the PR
 

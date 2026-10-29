@@ -1,6 +1,7 @@
 package review
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -19,11 +20,26 @@ func (s *Service) StartRemote(req store.ReviewRequest, workerID string) (workerp
 	if workerID == "" {
 		return workerproto.JobPayload{}, errors.New("empty worker id")
 	}
+	unlock, err := s.syncLocks.Lock(context.Background(), req.ID)
+	if err != nil {
+		return workerproto.JobPayload{}, err
+	}
+	defer unlock()
+	req, err = s.store.GetReview(req.ID)
+	if err != nil {
+		return workerproto.JobPayload{}, err
+	}
 	contextID, err := s.ContextID(req.ID)
 	if err != nil {
 		return workerproto.JobPayload{}, err
 	}
 	if err := s.requireContextWorker(contextID, workerID); err != nil {
+		return workerproto.JobPayload{}, err
+	}
+	// Validate guides and build the job before claiming it. Configuration
+	// errors must not strand a reviewing row or create a requeue loop.
+	payload, err := s.JobPayload(req)
+	if err != nil {
 		return workerproto.JobPayload{}, err
 	}
 	assigned, err := s.store.AssignReview(req.ID, workerID)
@@ -38,11 +54,12 @@ func (s *Service) StartRemote(req store.ReviewRequest, workerID string) (workerp
 		WorkerID:    workerID,
 	})
 	if err != nil {
-		logf("create remote review run %s: %v", assigned.ID, err)
+		_ = s.store.RequeueReview(req.ID, workerID)
+		return workerproto.JobPayload{}, fmt.Errorf("create remote review run: %w", err)
 	}
-	payload, err := s.JobPayload(assigned)
 	payload.RunID = run.ID
-	return payload, err
+	payload.ResultAPIURL = s.resultCallbackURL(req.ID, run.ID)
+	return payload, nil
 }
 
 // StartRemoteReaction atomically assigns a pending reaction to a remote worker.
@@ -91,10 +108,11 @@ func (s *Service) JobPayload(req store.ReviewRequest) (workerproto.JobPayload, e
 	if err != nil {
 		return workerproto.JobPayload{}, err
 	}
-	resultAPIURL := ""
-	if s.cfg.ResultAPIURL != "" {
-		resultAPIURL = strings.ReplaceAll(s.cfg.ResultAPIURL, "{review_id}", req.ID)
+	runID := ""
+	if run, err := s.store.CurrentRun(req.ID); err == nil {
+		runID = run.ID
 	}
+	resultAPIURL := s.resultCallbackURL(req.ID, runID)
 	guide := ""
 	if path, ok := s.cfg.Guides[req.Repo]; ok && path != "" {
 		data, err := os.ReadFile(path)
@@ -135,8 +153,25 @@ func (s *Service) JobPayload(req store.ReviewRequest) (workerproto.JobPayload, e
 // reviewer and requester. A stale completion (the review is no longer owned by
 // workerID) is rejected.
 func (s *Service) CompleteRemote(reviewID, workerID string, ok bool, headCommit, sessionID, result, errText string) error {
+	return s.CompleteRemoteRun(reviewID, "", workerID, ok, headCommit, sessionID, result, errText)
+}
+
+// CompleteRemoteRun validates the run fence under the same lock used for
+// callbacks and requeues, so reassignment cannot race the completion check.
+func (s *Service) CompleteRemoteRun(reviewID, runID, workerID string, ok bool, headCommit, sessionID, result, errText string) error {
 	if !s.cfg.Enabled {
 		return errors.New("PR review is disabled")
+	}
+	unlock, err := s.syncLocks.Lock(context.Background(), reviewID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if runID != "" {
+		run, err := s.store.CurrentRun(reviewID)
+		if err != nil || run.ID != runID || run.WorkerID != workerID {
+			return ErrStaleResult
+		}
 	}
 	req, err := s.store.GetReview(reviewID)
 	if err != nil {
@@ -146,18 +181,12 @@ func (s *Service) CompleteRemote(reviewID, workerID string, ok bool, headCommit,
 	if !ok {
 		status = "failed"
 	}
+	status, errText = s.completionResult(&req, status, result, errText)
 	if headCommit == "" {
 		headCommit = req.HeadCommit
 	}
 	if sessionID == "" {
 		sessionID = req.SessionID
-	}
-	applied, err := s.store.UpdateReviewOutcomeByWorker(reviewID, workerID, status, headCommit, sessionID, result, errText, time.Now().UTC())
-	if err != nil {
-		return err
-	}
-	if !applied {
-		return fmt.Errorf("review %s is no longer owned by worker %s (stale completion dropped)", reviewID, workerID)
 	}
 	req.Status = status
 	req.ResultText = result
@@ -165,27 +194,18 @@ func (s *Service) CompleteRemote(reviewID, workerID string, ok bool, headCommit,
 	req.HeadCommit = headCommit
 	req.PrHeadCommit = headCommit
 	req.SessionID = sessionID
-	runID := ""
-	// Merge any structured result the tool POSTed directly to the server while
-	// this run was executing (the POST handler writes verdict/summary onto the
-	// review row, so the run record below can preserve them alongside the text).
-	if fresh, err := s.store.GetReview(reviewID); err == nil {
-		req.Verdict = fresh.Verdict
-		req.Summary = fresh.Summary
-	}
+	req.RetryReason = ""
+	req.CompletedAt = time.Now().UTC()
+	runID = ""
 	if run, err := s.store.CurrentRun(reviewID); err == nil {
 		runID = run.ID
-		run.Status = status
-		run.HeadCommit = headCommit
-		run.SessionID = sessionID
-		run.ResultText = result
-		run.Error = errText
-		run.Verdict = req.Verdict
-		run.Summary = req.Summary
-		run.CompletedAt = time.Now().UTC()
-		if err := s.store.UpdateReviewRun(run); err != nil {
-			logf("update remote review run %s: %v", run.ID, err)
-		}
+	}
+	applied, err := s.store.CompleteReviewRun(req, runID)
+	if err != nil {
+		return err
+	}
+	if !applied {
+		return fmt.Errorf("review %s is no longer owned by worker %s (stale completion dropped)", reviewID, workerID)
 	}
 	reviewlog.Event{Name: "completed", Component: "server", Kind: "review", ReviewID: reviewID, RunID: runID, WorkerID: workerID, Repo: req.Repo, PRNumber: req.PRNumber, Status: status, Error: errText}.Log()
 	// Publish inline comments (plus the verdict review) when enabled and the
@@ -249,7 +269,7 @@ func (s *Service) UpdateRemoteProgress(reviewID, text string) error {
 // repo: the repo is in its own whitelist and the checkout is a git directory.
 func (s *Service) LocalAvailable(repo string) bool {
 	dir, ok := s.repoDirFor(repo)
-	return ok && IsGitDir(dir)
+	return !s.cfg.DisableLocalFallback && ok && IsGitDir(dir)
 }
 
 // ProcessLocal runs a review on the server itself (the existing in-process
@@ -267,6 +287,11 @@ func (s *Service) ProcessReactionLocal(reactionID string) {
 // it can be redispatched, and marks its in-flight run as failed. It is the
 // recovery path when a worker goes offline mid-review.
 func (s *Service) RequeueForOrphan(reviewID, workerID, reason string) error {
+	unlock, err := s.syncLocks.Lock(context.Background(), reviewID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if err := s.store.RequeueReview(reviewID, workerID); err != nil {
 		return err
 	}

@@ -229,7 +229,7 @@ func (s *Store) AssignReview(reviewID, workerID string) (ReviewRequest, error) {
 	ctx := context.Background()
 	now := timeText(time.Now().UTC())
 	result, err := s.db.ExecContext(ctx, `
-		UPDATE review_requests SET status = 'reviewing', worker_id = ?, updated_at = ? WHERE id = ? AND status = 'pending'
+		UPDATE review_requests SET status = 'reviewing', worker_id = ?, verdict = '', summary = '', updated_at = ? WHERE id = ? AND status = 'pending'
 	`, workerID, now, reviewID)
 	if err != nil {
 		return ReviewRequest{}, err

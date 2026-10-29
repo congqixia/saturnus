@@ -27,9 +27,12 @@ type Config struct {
 	Tool            string
 	CommandTemplate string
 	MaxConcurrent   int
-	Timeout         time.Duration
-	CreateTask      bool
-	TaskDueHours    int
+	// DisableLocalFallback keeps reviews pending when no remote worker is
+	// available, without removing checkout mappings shared with Tasks.
+	DisableLocalFallback bool
+	Timeout              time.Duration
+	CreateTask           bool
+	TaskDueHours         int
 	// TaskGroup is the name of the Feishu task group (任务分组) tasks are
 	// filed under. When set, Saturnus looks it up and creates it if missing.
 	TaskGroup string
@@ -352,21 +355,42 @@ func (s *Service) enqueueLocal(kind, id string) {
 
 // IngestResult stores a machine-readable review result POSTed by the review
 // tool while a review is running. It validates the verdict and findings,
-// records the verdict/summary on the review (and, via finish, on its run) and
+// records the verdict/summary on the review and its run atomically, and
 // persists the findings. Findings carrying an id reference a finding from a
 // previous round and update its status/content in place; findings without an
 // id are new. The tool is expected to POST once per run; a second submission
 // against an already-recorded result is rejected.
 func (s *Service) IngestResult(reviewID, verdict, summary string, findings []Finding) error {
+	return s.IngestRunResult(reviewID, "", verdict, summary, findings)
+}
+
+// IngestRunResult fences callbacks from reset/retried executions. Empty runID
+// remains supported for legacy clients; newly dispatched callbacks carry it.
+func (s *Service) IngestRunResult(reviewID, runID, verdict, summary string, findings []Finding) error {
 	if !s.cfg.Enabled {
 		return errors.New("PR review is disabled")
 	}
 	if reviewID == "" {
 		return errors.New("empty review id")
 	}
+	unlock, err := s.syncLocks.Lock(context.Background(), reviewID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	req, err := s.store.GetReview(reviewID)
 	if err != nil {
 		return err
+	}
+	run, runErr := s.store.LatestRun(reviewID)
+	if runErr != nil && !errors.Is(runErr, store.ErrNotFound) {
+		return runErr
+	}
+	if runID != "" && (runErr != nil || run.ID != runID || (run.Status != "running" && run.Status != "succeeded")) {
+		return ErrStaleResult
+	}
+	if runID != "" && run.Verdict != "" {
+		return fmt.Errorf("review run %s already has a structured result", runID)
 	}
 	switch req.Status {
 	case "reviewing":
@@ -423,12 +447,8 @@ func (s *Service) IngestResult(reviewID, verdict, summary string, findings []Fin
 			return fmt.Errorf("finding #%d has invalid status %q; must be open, addressed or commented", i+1, f.Status)
 		}
 	}
-	runID := ""
-	if run, err := s.store.CurrentRun(reviewID); err == nil {
+	if runErr == nil {
 		runID = run.ID
-	}
-	if err := s.store.SetReviewResult(reviewID, verdict, summary); err != nil {
-		return err
 	}
 	storeFindings := make([]store.ReviewFinding, 0, len(findings))
 	for _, f := range findings {
@@ -443,7 +463,7 @@ func (s *Service) IngestResult(reviewID, verdict, summary string, findings []Fin
 			Suggestion: f.Suggestion,
 		})
 	}
-	if err := s.store.SaveFindings(reviewID, runID, storeFindings); err != nil {
+	if err := s.store.SaveReviewResult(reviewID, runID, verdict, summary, storeFindings); err != nil {
 		return err
 	}
 	logf("ingested structured review result for %s: verdict=%s findings=%d", reviewID, verdict, len(findings))
@@ -533,8 +553,8 @@ func (s *Service) submit(ctx MessageContext, requireUser bool) (store.ReviewRequ
 }
 
 // Retry resets a finished review and queues another run. Failed reviews are
-// always retried; successful reviews are retried only when the PR head commit
-// moved since the recorded one. The previous tool session (if any) is kept so
+// always retried; successful reviews are retried when the PR head moved or a
+// required structured result is missing. The previous tool session is kept so
 // the new run continues the existing review conversation.
 func (s *Service) Retry(id string, ctx MessageContext) (store.ReviewRequest, error) {
 	if !s.cfg.Enabled {
@@ -554,7 +574,9 @@ func (s *Service) Retry(id string, ctx MessageContext) (store.ReviewRequest, err
 		return req, ErrArchived
 	}
 	var reason string
-	if req.Status == "succeeded" {
+	if req.Status == "succeeded" && s.cfg.ResultAPIURL != "" && req.Verdict == "" {
+		reason = "retry after missing structured review result"
+	} else if req.Status == "succeeded" {
 		changed, head := s.headChanged(&req)
 		if !changed {
 			return req, ErrReviewUnchanged
@@ -1352,32 +1374,28 @@ func taskMembers(reviewerOpenID, requesterOpenID string) []string {
 	return out
 }
 
-func (s *Service) process(id string) {
-	req, err := s.store.GetReview(id)
+func (s *Service) startLocal(id string) (store.ReviewRequest, store.ReviewRun, error) {
+	unlock, err := s.syncLocks.Lock(context.Background(), id)
 	if err != nil {
-		logf("load %s: %v", id, err)
-		return
+		return store.ReviewRequest{}, store.ReviewRun{}, err
 	}
-	if req.Status != "pending" {
-		return
+	defer unlock()
+	req, err := s.store.AssignReview(id, "")
+	if err != nil {
+		return store.ReviewRequest{}, store.ReviewRun{}, err
 	}
-	req.Status = "reviewing"
-	req.WorkerID = "" // local fallback must not retain a previous remote owner
-	if _, err := s.store.UpdateReview(req); err != nil {
-		logf("mark reviewing: %v", err)
-		return
+	run, err := s.store.CreateReviewRun(store.ReviewRun{ReviewID: req.ID, Status: "running", RetryReason: req.RetryReason, Tool: s.cfg.Tool})
+	if err != nil {
+		_ = s.store.UpdateReviewOutcome(req.ID, "failed", "", "create review run: "+err.Error(), time.Now().UTC())
 	}
+	return req, run, err
+}
 
-	// Record this execution as an append-only run so every review attempt
-	// (initial + retries) is traceable, including the head commit it reviewed.
-	run, runErr := s.store.CreateReviewRun(store.ReviewRun{
-		ReviewID:    req.ID,
-		Status:      "running",
-		RetryReason: req.RetryReason,
-		Tool:        s.cfg.Tool,
-	})
-	if runErr != nil {
-		logf("create review run %s: %v", req.ID, runErr)
+func (s *Service) process(id string) {
+	req, run, err := s.startLocal(id)
+	if err != nil {
+		logf("start local review %s: %v", id, err)
+		return
 	}
 	reviewlog.Event{Name: "started", Component: "server", Kind: "review", ReviewID: req.ID, RunID: run.ID, WorkerID: "local", Repo: req.Repo, PRNumber: req.PRNumber, Status: "reviewing"}.Log()
 
@@ -1438,10 +1456,7 @@ func (s *Service) process(id string) {
 		}
 	}
 
-	resultAPIURL := ""
-	if s.cfg.ResultAPIURL != "" {
-		resultAPIURL = strings.ReplaceAll(s.cfg.ResultAPIURL, "{review_id}", req.ID)
-	}
+	resultAPIURL := s.resultCallbackURL(req.ID, run.ID)
 	args, err := RenderCommand(s.cfg.CommandTemplate, ToolArgs{
 		Repo:          req.Repo,
 		PRNumber:      req.PRNumber,
@@ -1557,33 +1572,29 @@ func openReviewLog(logDir, id string) (*os.File, error) {
 }
 
 func (s *Service) finish(req *store.ReviewRequest, status, result, errText string) {
+	unlock, lockErr := s.syncLocks.Lock(context.Background(), req.ID)
+	if lockErr != nil {
+		logf("lock review completion %s: %v", req.ID, lockErr)
+		return
+	}
+	defer unlock()
+	status, errText = s.completionResult(req, status, result, errText)
 	req.Status = status
 	req.ResultText = result
 	req.Error = errText
 	req.CompletedAt = time.Now().UTC()
-	// Update only the outcome columns so verdict/summary written by
-	// SetReviewResult (the tool's POST) are never clobbered here.
-	finishErr := s.store.UpdateReviewOutcome(req.ID, status, result, errText, req.CompletedAt)
-	if finishErr != nil {
-		logf("update status %s: %v", status, finishErr)
-	}
-	// Record the terminal outcome on the in-flight run (head commit, session,
-	// verdict/summary, result/error) so each run's history is preserved for
-	// traceability.
 	runID := ""
 	if run, err := s.store.CurrentRun(req.ID); err == nil {
 		runID = run.ID
-		run.Status = status
-		run.HeadCommit = req.HeadCommit
-		run.SessionID = req.SessionID
-		run.ResultText = result
-		run.Error = errText
-		run.Verdict = req.Verdict
-		run.Summary = req.Summary
-		run.CompletedAt = req.CompletedAt
-		if err := s.store.UpdateReviewRun(run); err != nil {
-			logf("update review run %s: %v", run.ID, err)
-		}
+	}
+	// Publish the review and run outcome in one transaction, preserving the
+	// structured result previously committed by the tool's callback.
+	applied, finishErr := s.store.CompleteReviewRun(*req, runID)
+	if finishErr == nil && !applied {
+		finishErr = errors.New("review completion no longer matches the active owner or run")
+	}
+	if finishErr != nil {
+		logf("update status %s: %v", status, finishErr)
 	}
 	event := reviewlog.Event{Name: "completed", Component: "server", Kind: "review", ReviewID: req.ID, RunID: runID, WorkerID: "local", Repo: req.Repo, PRNumber: req.PRNumber, Status: status, Error: errText}
 	if finishErr != nil {
@@ -1636,6 +1647,9 @@ func (s *Service) FormatResult(req store.ReviewRequest) string {
 			fmt.Fprintf(&b, "\n\nlog=%s", filepath.Join(s.cfg.LogDir, req.ID+".log"))
 		}
 		return b.String()
+	}
+	if rendered := FormatFindings(s.ListFindings(req.ID)); rendered != "" {
+		fmt.Fprintf(&b, "\n\nPrevious findings (current run has no verdict):\n%s", rendered)
 	}
 	clean := stripANSI(req.ResultText)
 	if summary := ExtractSummary(clean); summary != "" {

@@ -72,7 +72,7 @@ Additionally submit the machine-readable review result to the review service so 
   ]
 }
 
-Severity meanings: P0 = must fix before merge (correctness/security/data loss); P1 = should fix before merge (significant bug or design flaw); P2 = nice-to-have or nit (style, refactor, minor). Verdict: lgtm = approve as-is; request_change = one or more blocking (P0/P1) issues; nit_comments = no blockers but P2 comments worth addressing. Findings may be an empty array for a clean lgtm. Submitting the result is mandatory for the server to record the verdict and findings.{{if .PriorFindings}}
+Severity meanings: P0 = must fix before merge (correctness/security/data loss); P1 = should fix before merge (significant bug or design flaw); P2 = nice-to-have or nit (style, refactor, minor). Verdict: lgtm = approve as-is; request_change = one or more blocking (P0/P1) issues; nit_comments = no blockers but P2 comments worth addressing. Findings may be an empty array for a clean lgtm. Submitting the result is mandatory for the server to record the verdict and findings. Use the callback URL exactly as provided, including its query parameters. Complete the POST and verify HTTP success before exiting.{{if .PriorFindings}}
 
 Previous findings from the earlier round(s) of this review are listed below. Reference each one by its id in your result and set its status: \"addressed\" if the PR head now fixes it, \"commented\" if it needs no code change, \"open\" if it still stands. Only include content fields when the finding's location or wording changed. Do not re-report addressed findings as new ones.{{.PriorFindings}}{{end}}{{end}}"`
 

@@ -79,7 +79,7 @@ done
 case "$title" in
   *-ctx_*) printf '[{"id":"ses-reset","title":"%s","directory":"%s","updated":1}]\n' "$title" "$PWD" > "$state" ;;
 esac
-url=$(printf '%s\n' "$@" | grep -oE 'https?://[^ ]*/api/reviews/[^ ]*/result' | head -n1)
+url=$(printf '%s\n' "$@" | grep -oE 'https?://[^ ]*/api/reviews/[^ ]*/result[^ ]*' | head -n1)
 echo "FAKE-TOOL ARGS: $*"
 echo "REVIEW SUMMARY:"
 echo "PR summary: fake PR adds tests"
@@ -193,7 +193,7 @@ exit 0
 		if err != nil {
 			return false
 		}
-		if req.Status == "succeeded" {
+		if req.Status == "succeeded" && hub.InFlightCount("wrk-test") == 0 {
 			final = req
 			return true
 		}
@@ -254,7 +254,7 @@ exit 0
 		if err != nil {
 			return false
 		}
-		if r.Status == "succeeded" {
+		if r.Status == "succeeded" && hub.InFlightCount("wrk-test") == 0 {
 			reacFinal = r
 			return true
 		}
@@ -285,7 +285,7 @@ exit 0
 	}
 	waitFor(t, 15*time.Second, func() bool {
 		req, err := svc.Get(created.ID)
-		return err == nil && req.Status == "succeeded"
+		return err == nil && req.Status == "succeeded" && hub.InFlightCount("wrk-test") == 0
 	})
 	final2, err := svc.Get(created.ID)
 	if err != nil {
@@ -312,7 +312,7 @@ exit 0
 	}
 	waitFor(t, 15*time.Second, func() bool {
 		req, err := svc.Get(created.ID)
-		return err == nil && req.Status == "succeeded" && req.SessionID == "ses-reset"
+		return err == nil && req.Status == "succeeded" && hub.InFlightCount("wrk-test") == 0 && req.SessionID == "ses-reset"
 	})
 	fresh, err := svc.Get(created.ID)
 	if err != nil {

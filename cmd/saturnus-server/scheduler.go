@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"sort"
+	"sync"
 	"time"
 
 	"saturnus/internal/review"
@@ -27,7 +28,14 @@ type scheduler struct {
 	reconcileEvery    time.Duration
 	onWorkerHeartbeat func()
 
-	jobs chan jobRef
+	jobs      chan jobRef
+	backoffMu sync.Mutex
+	backoffs  map[string]workerBackoff
+}
+
+type workerBackoff struct {
+	delay time.Duration
+	until time.Time
 }
 
 type jobRef struct {
@@ -92,6 +100,12 @@ func (s *scheduler) handle(j jobRef) {
 // --- worker.Handler implementation ---
 
 func (s *scheduler) OnConnect(workerID string) {
+	s.backoffMu.Lock()
+	delete(s.backoffs, workerID)
+	s.backoffMu.Unlock()
+	if err := s.st.Heartbeat(workerID); err != nil {
+		log.Printf("scheduler: connected worker %s heartbeat: %v", workerID, err)
+	}
 	log.Printf("scheduler: worker %s connected", workerID)
 	s.Notify(jobKindReconcile, "")
 }
@@ -138,19 +152,11 @@ func (s *scheduler) OnEvent(ctx context.Context, workerID string, frame workerpr
 	case workerproto.EvComplete:
 		var p workerproto.CompletePayload
 		if err := frame.Decode(&p); err == nil {
-			if p.RunID != "" && p.ReactionID == "" {
-				run, err := s.st.CurrentRun(frame.ReviewID)
-				if err != nil || run.ID != p.RunID || run.WorkerID != workerID {
-					reviewlog.Event{Name: "completion_rejected", Component: "server", Kind: "review", ReviewID: frame.ReviewID, RunID: p.RunID, WorkerID: workerID, Error: "completion does not match the current review run"}.Log()
-					return nil
-				}
-			}
-			s.hub.ClearInFlight(workerID, frame.ReviewID)
 			var cErr error
 			if p.ReactionID != "" {
 				cErr = s.svc.CompleteRemoteReaction(p.ReactionID, workerID, p.OK, p.SessionID, p.ResultText, p.Error)
 			} else {
-				cErr = s.svc.CompleteRemote(frame.ReviewID, workerID, p.OK, p.HeadCommit, p.SessionID, p.ResultText, p.Error)
+				cErr = s.svc.CompleteRemoteRun(frame.ReviewID, p.RunID, workerID, p.OK, p.HeadCommit, p.SessionID, p.ResultText, p.Error)
 			}
 			if cErr != nil {
 				event := reviewlog.Event{Name: "completion_rejected", Component: "server", Kind: "review", ReviewID: frame.ReviewID, RunID: p.RunID, ReactionID: p.ReactionID, WorkerID: workerID, Error: cErr.Error()}
@@ -158,6 +164,8 @@ func (s *scheduler) OnEvent(ctx context.Context, workerID string, frame workerpr
 					event.Kind = "reaction"
 				}
 				event.Log()
+			} else {
+				s.hub.ClearInFlight(workerID, frame.ReviewID)
 			}
 		}
 	case workerproto.EvCancelAck:
@@ -167,6 +175,7 @@ func (s *scheduler) OnEvent(ctx context.Context, workerID string, frame workerpr
 		_ = frame.Decode(&p)
 		s.hub.ClearInFlight(workerID, frame.ReviewID)
 		if p.Code == "busy" {
+			s.backoffWorker(workerID)
 			if err := s.svc.RequeueForOrphan(frame.ReviewID, workerID, "worker at capacity"); err != nil {
 				log.Printf("scheduler: requeue busy %s: %v", frame.ReviewID, err)
 			}
@@ -234,8 +243,11 @@ func (s *scheduler) dispatchReview(id string) {
 	if err != nil || req.Status != "pending" {
 		return
 	}
-	workerID := s.pickReviewWorker(req)
+	workerID, waitRemote := s.pickReviewWorker(req)
 	if workerID == "" {
+		if waitRemote {
+			return // eligible workers are busy or backing off; keep the job pending
+		}
 		// No online worker serves this repo: fall back to the local executor
 		// when the server has the checkout, otherwise leave pending for the
 		// next sweep (a worker may register later).
@@ -255,6 +267,7 @@ func (s *scheduler) dispatchReview(id string) {
 	s.hub.AddInFlight(workerID, req.ID)
 	s.jobEvent("dispatch", "reviewing", workerID, payload).Log()
 	if err := s.hub.Send(workerID, workerproto.NewFrame(workerproto.CmdClaim, req.ID, payload)); err != nil {
+		s.backoffWorker(workerID)
 		s.hub.ClearInFlight(workerID, req.ID)
 		event := s.jobEvent("dispatch_failed", "reviewing", workerID, payload)
 		event.Error = err.Error()
@@ -279,7 +292,7 @@ func (s *scheduler) dispatchReaction(id string) {
 	// A reaction resumes the review's tool session, so it must run on the host
 	// that produced that session: the worker that ran the review.
 	if req.WorkerID != "" {
-		if !s.hub.Online(req.WorkerID) {
+		if !s.workerHealthy(req.WorkerID, time.Now()) || s.workerBackingOff(req.WorkerID) {
 			return // wait; the sweep retries when the worker returns
 		}
 		payload, err := s.svc.StartRemoteReaction(reac, req, req.WorkerID)
@@ -292,6 +305,7 @@ func (s *scheduler) dispatchReaction(id string) {
 		s.hub.AddInFlight(req.WorkerID, req.ID)
 		s.jobEvent("dispatch", "running", req.WorkerID, payload).Log()
 		if err := s.hub.Send(req.WorkerID, workerproto.NewFrame(workerproto.CmdClaim, req.ID, payload)); err != nil {
+			s.backoffWorker(req.WorkerID)
 			s.hub.ClearInFlight(req.WorkerID, req.ID)
 			event := s.jobEvent("dispatch_failed", "running", req.WorkerID, payload)
 			event.Error = err.Error()
@@ -314,11 +328,11 @@ func (s *scheduler) dispatchReaction(id string) {
 // pickReviewWorker chooses an online worker that serves the review's repo and
 // has capacity, preferring the worker that ran the previous run (session
 // affinity for retries) and otherwise the least loaded.
-func (s *scheduler) pickReviewWorker(req store.ReviewRequest) string {
+func (s *scheduler) pickReviewWorker(req store.ReviewRequest) (string, bool) {
 	contextID, err := s.svc.ContextID(req.ID)
 	if err != nil {
 		log.Printf("scheduler: read review context review_id=%s: %v", req.ID, err)
-		return ""
+		return "", true
 	}
 	workers := s.st.ListOnlineWorkers(s.onlineWindow)
 	type candidate struct {
@@ -326,7 +340,11 @@ func (s *scheduler) pickReviewWorker(req store.ReviewRequest) string {
 		load int
 	}
 	var cands []candidate
+	hasRemote := false
 	for _, w := range workers {
+		if !s.workerHealthy(w.ID, time.Now()) {
+			continue
+		}
 		caps, err := w.CapabilitiesDecoded()
 		if err != nil {
 			continue
@@ -335,6 +353,10 @@ func (s *scheduler) pickReviewWorker(req store.ReviewRequest) string {
 			continue
 		}
 		if contextID != "" && !caps.ContextReset {
+			continue
+		}
+		hasRemote = true
+		if s.workerBackingOff(w.ID) {
 			continue
 		}
 		max := caps.MaxConcurrent
@@ -347,13 +369,13 @@ func (s *scheduler) pickReviewWorker(req store.ReviewRequest) string {
 		cands = append(cands, candidate{id: w.ID, load: s.hub.InFlightCount(w.ID)})
 	}
 	if len(cands) == 0 {
-		return ""
+		return "", hasRemote
 	}
 	// Session affinity: resume the previous run on the same host when possible.
 	if affinity := s.st.LastRunWorkerID(req.ID); affinity != "" {
 		for _, c := range cands {
 			if c.id == affinity {
-				return c.id
+				return c.id, true
 			}
 		}
 	}
@@ -363,7 +385,33 @@ func (s *scheduler) pickReviewWorker(req store.ReviewRequest) string {
 		}
 		return cands[i].id < cands[j].id
 	})
-	return cands[0].id
+	return cands[0].id, true
+}
+
+// Failed writes and busy replies must not immediately claim the same worker
+// again. The regular sweep retries after backoff; a new connection clears it.
+func (s *scheduler) backoffWorker(id string) {
+	s.backoffMu.Lock()
+	defer s.backoffMu.Unlock()
+	if s.backoffs == nil {
+		s.backoffs = make(map[string]workerBackoff)
+	}
+	b := s.backoffs[id]
+	b.delay *= 2
+	if b.delay == 0 {
+		b.delay = time.Second
+	}
+	if b.delay > 30*time.Second {
+		b.delay = 30 * time.Second
+	}
+	b.until = time.Now().Add(b.delay)
+	s.backoffs[id] = b
+}
+
+func (s *scheduler) workerBackingOff(id string) bool {
+	s.backoffMu.Lock()
+	defer s.backoffMu.Unlock()
+	return time.Now().Before(s.backoffs[id].until)
 }
 
 // --- recovery ---

@@ -14,6 +14,10 @@ import (
 	"saturnus/internal/ghinfo"
 )
 
+// MaxMessageBytes includes JSON escaping and the envelope around a tool's
+// bounded 512 KiB transcript. Use the same limit on both ends of the channel.
+const MaxMessageBytes = 8 * 1024 * 1024
+
 // Command types sent from the server to a worker.
 const (
 	CmdClaim  = "claim"
@@ -83,7 +87,7 @@ type JobPayload struct {
 	// Review-run fields.
 	RetryReason     string `json:"retry_reason,omitempty"`
 	SessionID       string `json:"session_id,omitempty"`
-	ContextID string `json:"context_id,omitempty"`
+	ContextID       string `json:"context_id,omitempty"`
 	PriorFindings   string `json:"prior_findings,omitempty"`
 	CommandTemplate string `json:"command_template,omitempty"`
 	Guide           string `json:"guide,omitempty"`

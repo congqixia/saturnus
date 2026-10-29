@@ -496,11 +496,11 @@ func (s *server) submitReviewResult(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &body) {
 		return
 	}
-	if err := s.reviews.IngestResult(r.PathValue("review_id"), body.Verdict, body.Summary, body.Findings); err != nil {
+	if err := s.reviews.IngestRunResult(r.PathValue("review_id"), r.URL.Query().Get("run_id"), body.Verdict, body.Summary, body.Findings); err != nil {
 		switch {
 		case errors.Is(err, store.ErrNotFound):
 			writeStoreError(w, err)
-		case strings.Contains(err.Error(), "not running"), strings.Contains(err.Error(), "already has a structured result"):
+		case errors.Is(err, review.ErrStaleResult), errors.Is(err, store.ErrNotPending), strings.Contains(err.Error(), "not running"), strings.Contains(err.Error(), "already has a structured result"):
 			writeError(w, http.StatusConflict, err)
 		default:
 			writeError(w, http.StatusBadRequest, err)
@@ -2126,27 +2126,30 @@ func formatReviewMarkdown(req store.ReviewRequest, tool string, findings []store
 		if req.Summary != "" {
 			fmt.Fprintf(&b, "**Summary**: %s\n", escapeMarkdown(req.Summary))
 		}
-		if len(findings) > 0 {
-			b.WriteString("\n**Findings**:\n")
-			for _, f := range findings {
-				loc := f.Path
-				if f.Line > 0 {
-					loc = fmt.Sprintf("%s:%d", loc, f.Line)
-				}
-				if loc == "" {
-					loc = "-"
-				}
-				title := f.Title
-				if title == "" {
-					title = f.Message
-				}
-				fmt.Fprintf(&b, "- `%s` **%s** (%s)\n", f.Severity, escapeMarkdown(truncateText(title, 200)), escapeMarkdown(loc))
-				if f.Message != "" && f.Message != title {
-					fmt.Fprintf(&b, "  %s\n", escapeMarkdown(truncateText(f.Message, 600)))
-				}
-				if f.Suggestion != "" {
-					fmt.Fprintf(&b, "  Fix: %s\n", escapeMarkdown(truncateText(f.Suggestion, 300)))
-				}
+	}
+	if len(findings) > 0 {
+		b.WriteString("\n**Findings**:\n")
+		if req.Verdict == "" {
+			b.WriteString("Previous findings; the current run has no verdict.\n")
+		}
+		for _, f := range findings {
+			loc := f.Path
+			if f.Line > 0 {
+				loc = fmt.Sprintf("%s:%d", loc, f.Line)
+			}
+			if loc == "" {
+				loc = "-"
+			}
+			title := f.Title
+			if title == "" {
+				title = f.Message
+			}
+			fmt.Fprintf(&b, "- `%s` **%s** (%s)\n", f.Severity, escapeMarkdown(truncateText(title, 200)), escapeMarkdown(loc))
+			if f.Message != "" && f.Message != title {
+				fmt.Fprintf(&b, "  %s\n", escapeMarkdown(truncateText(f.Message, 600)))
+			}
+			if f.Suggestion != "" {
+				fmt.Fprintf(&b, "  Fix: %s\n", escapeMarkdown(truncateText(f.Suggestion, 300)))
 			}
 		}
 	}
@@ -2580,6 +2583,7 @@ func reviewConfig(repos map[string]string) review.Config {
 		Tool:                  os.Getenv("SATURNUS_REVIEW_TOOL"),
 		CommandTemplate:       os.Getenv("SATURNUS_REVIEW_COMMAND_TEMPLATE"),
 		MaxConcurrent:         envInt("SATURNUS_REVIEW_MAX_CONCURRENT", 1),
+		DisableLocalFallback:  os.Getenv("SATURNUS_REVIEW_LOCAL_FALLBACK") == "0",
 		Timeout:               envDuration("SATURNUS_REVIEW_TIMEOUT", 15*time.Minute),
 		CreateTask:            os.Getenv("SATURNUS_REVIEW_CREATE_TASK") == "1",
 		TaskDueHours:          envInt("SATURNUS_REVIEW_TASK_DUE_HOURS", 24),

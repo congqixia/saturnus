@@ -525,27 +525,28 @@ import { h } from 'vue'
                   <p v-if="store.selectedReview.summary" class="review-summary">
                     {{ store.selectedReview.summary }}
                   </p>
-                  <div v-if="store.selectedReviewFindings.length" class="review-findings">
-                    <strong>Findings</strong>
-                    <ul>
-                      <li v-for="f in store.selectedReviewFindings" :key="f.id" class="finding">
-                        <span class="finding-head">
-                          <NTag :size="'tiny'" :type="severityTagType(f.severity)" round>
-                            {{ f.severity }}
-                          </NTag>
-                          <NTag v-if="f.status && f.status !== 'open'" :size="'tiny'" :type="statusTagType(f.status)" round>
-                            {{ f.status }}
-                          </NTag>
-                          <strong>{{ f.title || f.message }}</strong>
-                          <code v-if="f.path">{{ f.path }}{{ f.line > 0 ? ':' + f.line : '' }}</code>
-                        </span>
-                        <span v-if="f.github_comment_id" class="finding-comment">gh comment #{{ f.github_comment_id }}</span>
-                        <span v-if="f.message && f.message !== f.title" class="finding-msg">{{ f.message }}</span>
-                        <span v-if="f.suggestion" class="finding-suggestion">Fix: {{ f.suggestion }}</span>
-                      </li>
-                    </ul>
-                  </div>
                 </template>
+                <div v-if="store.selectedReviewFindings.length" class="review-findings">
+                  <strong>Findings</strong>
+                  <p v-if="!store.selectedReview.verdict">Previous findings; the current run has no verdict.</p>
+                  <ul>
+                    <li v-for="f in store.selectedReviewFindings" :key="f.id" class="finding">
+                      <span class="finding-head">
+                        <NTag :size="'tiny'" :type="severityTagType(f.severity)" round>
+                          {{ f.severity }}
+                        </NTag>
+                        <NTag v-if="f.status && f.status !== 'open'" :size="'tiny'" :type="statusTagType(f.status)" round>
+                          {{ f.status }}
+                        </NTag>
+                        <strong>{{ f.title || f.message }}</strong>
+                        <code v-if="f.path">{{ f.path }}{{ f.line > 0 ? ':' + f.line : '' }}</code>
+                      </span>
+                      <span v-if="f.github_comment_id" class="finding-comment">gh comment #{{ f.github_comment_id }}</span>
+                      <span v-if="f.message && f.message !== f.title" class="finding-msg">{{ f.message }}</span>
+                      <span v-if="f.suggestion" class="finding-suggestion">Fix: {{ f.suggestion }}</span>
+                    </li>
+                  </ul>
+                </div>
                 <pre v-if="store.selectedReview.result_text" class="review-result">{{ store.selectedReview.result_text }}</pre>
               </template>
             </section>

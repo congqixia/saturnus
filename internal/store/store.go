@@ -1484,6 +1484,13 @@ func (s *Store) SaveFindings(reviewID, runIDParam string, findings []ReviewFindi
 		return err
 	}
 	defer rollback(tx)
+	if err := saveFindingsTx(ctx, tx, reviewID, runIDParam, findings); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func saveFindingsTx(ctx context.Context, tx *sql.Tx, reviewID, runIDParam string, findings []ReviewFinding) error {
 	for _, f := range findings {
 		var runID any
 		if runIDParam != "" {
@@ -1556,7 +1563,7 @@ func (s *Store) SaveFindings(reviewID, runIDParam string, findings []ReviewFindi
 			return err
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 // getFindingTx returns one finding of a review inside a transaction.

@@ -8,8 +8,26 @@ import (
 	"strings"
 	"testing"
 
+	"saturnus/internal/lark"
 	"saturnus/internal/repoconfig"
+	"saturnus/internal/review"
 )
+
+func TestDisableLocalReviewFallbackKeepsRepoMappings(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	repos := map[string]string{"owner/repo": root}
+	for _, value := range []string{"", "0", "1"} {
+		t.Setenv("SATURNUS_REVIEW_LOCAL_FALLBACK", value)
+		cfg := reviewConfig(repos)
+		svc := review.New(nil, lark.New(lark.Config{}), cfg)
+		if svc.LocalAvailable("owner/repo") != (value != "0") || cfg.Repos["owner/repo"] != root {
+			t.Fatalf("local fallback setting %q lost its mapping or was ignored", value)
+		}
+	}
+}
 
 func TestSharedRepoFileConfig(t *testing.T) {
 	base := t.TempDir()

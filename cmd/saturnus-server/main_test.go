@@ -376,7 +376,7 @@ func TestFormatReviewMarkdown(t *testing.T) {
 		Error:         "timeout [repo#1]",
 		ResultText:    "found an issue\n- line 1",
 	}
-	md := formatReviewMarkdown(req, "opencode", nil, review.WorkerLabel(req.Status, req.WorkerID))
+	md := formatReviewMarkdown(req, "opencode", nil, nil, review.WorkerLabel(req.Status, req.WorkerID))
 	for _, want := range []string{
 		"**Status**: `failed`",
 		"[owner/repo#42](https://github.com/owner/repo/pull/42)",
@@ -506,7 +506,7 @@ func TestFormatReviewMarkdownCompletedShowsFullSummary(t *testing.T) {
 		PRNumber:   1,
 		ResultText: "line1\nline2\n...\nREVIEW SUMMARY:\nPR summary: fix the race\nIssues:\n- shared err\nReview suggestions: LGTM after fix",
 	}
-	md := formatReviewMarkdown(req, "opencode", nil, review.WorkerLabel(req.Status, req.WorkerID))
+	md := formatReviewMarkdown(req, "opencode", nil, nil, review.WorkerLabel(req.Status, req.WorkerID))
 	for _, want := range []string{"PR summary: fix the race", "shared err", "Review suggestions: LGTM after fix"} {
 		if !strings.Contains(md, want) {
 			t.Fatalf("completed markdown missing summary %q:\n%s", want, md)
@@ -527,7 +527,7 @@ func TestFormatReviewMarkdownRunningShowsTail(t *testing.T) {
 		PRNumber:   1,
 		ResultText: head + "\nlatest progress here",
 	}
-	md := formatReviewMarkdown(req, "opencode", nil, review.WorkerLabel(req.Status, req.WorkerID))
+	md := formatReviewMarkdown(req, "opencode", nil, nil, review.WorkerLabel(req.Status, req.WorkerID))
 	if !strings.Contains(md, "[earlier output omitted]") {
 		t.Fatalf("expected tail marker for running review:\n%s", md)
 	}

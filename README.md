@@ -372,6 +372,15 @@ worker. Local execution is labeled `server (local)`. A pending retry is labeled
 `unassigned (previous: <worker>)` rather than implying it is already running on
 the previous host.
 
+`/sat reviews` includes the latest available verdict in Status: `LGTM`, `NIT`
+(nit comments), or `RC` (request change), for example `succeeded / RC`. A retry
+or reset without a new result still shows the previous round's verdict.
+`/sat describe review <id>` displays findings in a table with severity, status,
+last-updated run, location, details and suggested fix. The run number matches
+the `#` column in Runs; it identifies the round that created or last updated
+the finding, not necessarily the first round that discovered it. Legacy findings
+without a run reference show `-`; unresolved references retain their raw run ID.
+
 Result messages sent to the reviewer contain a concise conclusion, not the raw
 log. When `SATURNUS_REVIEW_RESULT_API_URL` is set, the review prompt asks the
 tool to POST a machine-readable result to that endpoint (with the `{review_id}`

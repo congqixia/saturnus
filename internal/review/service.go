@@ -1009,6 +1009,44 @@ func (s *Service) WorkerDescription(req store.ReviewRequest) string {
 	return label
 }
 
+func VerdictAbbreviation(verdict string) string {
+	switch verdict {
+	case "lgtm":
+		return "LGTM"
+	case "nit_comments":
+		return "NIT"
+	case "request_change":
+		return "RC"
+	default:
+		return ""
+	}
+}
+
+// LastVerdict preserves the last conclusion in lists while retry/reset has
+// cleared the current result or a later execution has not produced one.
+func (s *Service) LastVerdict(req store.ReviewRequest) string {
+	if req.Verdict != "" || s.store == nil {
+		return req.Verdict
+	}
+	verdict, err := s.store.LatestReviewVerdict(req.ID)
+	if err != nil {
+		logf("load last verdict review_id=%s: %v", req.ID, err)
+	}
+	return verdict
+}
+
+// ReviewStatusLabel is shared by the list card and its text fallback.
+func ReviewStatusLabel(req store.ReviewRequest, verdict string) string {
+	status := req.Status
+	if short := VerdictAbbreviation(verdict); short != "" {
+		status += " / " + short
+	}
+	if ReviewOutdated(req) {
+		status += " / OUTDATED"
+	}
+	return status
+}
+
 func (s *Service) FormatList(reqs []store.ReviewRequest) string {
 	if len(reqs) == 0 {
 		return "No reviews."
@@ -1018,10 +1056,7 @@ func (s *Service) FormatList(reqs []store.ReviewRequest) string {
 		if i >= 10 {
 			break
 		}
-		status := req.Status
-		if ReviewOutdated(req) {
-			status += " OUTDATED"
-		}
+		status := ReviewStatusLabel(req, s.LastVerdict(req))
 		fmt.Fprintf(&b, "%s %s %s#%d worker=%s %s\n", req.ID, status, req.Repo, req.PRNumber, WorkerLabel(req.Status, req.WorkerID), req.CreatedAt.Format(time.RFC3339))
 	}
 	return strings.TrimSpace(b.String())

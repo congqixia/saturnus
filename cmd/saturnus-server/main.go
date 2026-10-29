@@ -1308,7 +1308,11 @@ func (s *server) reviewsReply(mode string) botReply {
 	s.resolveRequesterNames(reqs)
 
 	rows := make([]map[string]any, 0, len(reqs))
-	for _, req := range reqs {
+	for i := range reqs {
+		// These are display copies; do not persist a previous run's verdict as
+		// the result of the current pending/running review.
+		reqs[i].Verdict = s.reviews.LastVerdict(reqs[i])
+		req := reqs[i]
 		rows = append(rows, map[string]any{
 			"id":        req.ID,
 			"status":    reviewStatusCell(req),
@@ -1328,9 +1332,9 @@ func (s *server) reviewsReply(mode string) botReply {
 			Title: title,
 			Columns: []lark.TableColumn{
 				{Name: "id", Display: "ID", DataType: lark.ColumnText, Width: "17%"},
-				{Name: "status", Display: "Status", DataType: lark.ColumnOption, Width: "14%"},
-				{Name: "repo", Display: "Repo#PR", DataType: lark.ColumnText, Width: "20%"},
-				{Name: "worker", Display: "Worker", DataType: lark.ColumnText, Width: "20%"},
+				{Name: "status", Display: "Status", DataType: lark.ColumnOption, Width: "18%"},
+				{Name: "repo", Display: "Repo#PR", DataType: lark.ColumnText, Width: "18%"},
+				{Name: "worker", Display: "Worker", DataType: lark.ColumnText, Width: "18%"},
 				{Name: "requester", Display: "Requester", DataType: lark.ColumnText, Width: "16%"},
 				{Name: "createdAt", Display: "Created", DataType: lark.ColumnDate, DateFormat: "YYYY-MM-DD HH:mm", Width: "13%"},
 			},
@@ -1661,14 +1665,10 @@ func (s *server) taskRefreshReply(target string) botReply {
 	}
 }
 
-// reviewStatusCell renders a review's status as a colored tag, appending an
-// OUTDATED marker (keeping the status color) when the last reviewed head is
-// behind the PR's current head.
+// reviewStatusCell retains the lifecycle status color while displaying the
+// last verdict abbreviation and the reviewed-head freshness marker.
 func reviewStatusCell(req store.ReviewRequest) any {
-	if review.ReviewOutdated(req) {
-		return optionTag(req.Status+" / OUTDATED", statusColor(req.Status))
-	}
-	return statusOption(req.Status)
+	return optionTag(review.ReviewStatusLabel(req, req.Verdict), statusColor(req.Status))
 }
 
 // prsReply lists the open pull requests authored by the current gh user in the
@@ -1970,11 +1970,13 @@ func (s *server) describeReviewReply(id string) botReply {
 	if err := s.reviews.ResolveRequesterName(&req); err != nil {
 		logRequesterResolveFailure(req, err)
 	}
-	content := formatReviewMarkdown(req, s.reviews.Tool(), s.reviews.ListFindings(req.ID), s.reviews.WorkerDescription(req))
+	findings := s.reviews.ListFindings(req.ID)
+	runs := s.reviews.ListRuns(req.ID)
+	content := formatReviewMarkdown(req, s.reviews.Tool(), findings, runs, s.reviews.WorkerDescription(req))
 	if contextID, err := s.reviews.ContextID(req.ID); err == nil && contextID != "" {
 		content += "\n\n**Context**: " + escapeMarkdown(contextID)
 	}
-	if runs := s.reviews.ListRuns(req.ID); len(runs) > 0 {
+	if len(runs) > 0 {
 		content += "\n\n" + formatReviewRuns(runs)
 	}
 	if reacs := s.reviews.ListReactions(req.ID); len(reacs) > 0 {
@@ -1983,8 +1985,15 @@ func (s *server) describeReviewReply(id string) botReply {
 	if threads := s.reviews.ListThreads(req.ID); len(threads) > 0 {
 		content += "\n\n" + formatReviewThreads(threads)
 	}
+	text := s.reviews.FormatOne(req)
+	if table := formatReviewFindings(findings, runs); table != "" {
+		text += "\n\n" + table
+		if len(runs) > 0 {
+			text += "\n\n" + formatReviewRuns(runs)
+		}
+	}
 	return botReply{
-		text: s.reviews.FormatOne(req),
+		text: text,
 		md: &lark.MarkdownCard{
 			Title:   "Review " + req.ID,
 			Content: content,
@@ -2062,7 +2071,7 @@ func markdownTableCell(s string) string {
 //     progress is visible without scrolling through the whole transcript;
 //   - for a completed review the full REVIEW SUMMARY block is shown instead
 //     (falling back to the output tail when the tool omitted the marker).
-func formatReviewMarkdown(req store.ReviewRequest, tool string, findings []store.ReviewFinding, worker string) string {
+func formatReviewMarkdown(req store.ReviewRequest, tool string, findings []store.ReviewFinding, runs []store.ReviewRun, worker string) string {
 	var b strings.Builder
 	status := req.Status
 	if review.ReviewOutdated(req) {
@@ -2127,31 +2136,12 @@ func formatReviewMarkdown(req store.ReviewRequest, tool string, findings []store
 			fmt.Fprintf(&b, "**Summary**: %s\n", escapeMarkdown(req.Summary))
 		}
 	}
-	if len(findings) > 0 {
-		b.WriteString("\n**Findings**:\n")
+	if table := formatReviewFindings(findings, runs); table != "" {
+		b.WriteString("\n")
 		if req.Verdict == "" {
-			b.WriteString("Previous findings; the current run has no verdict.\n")
+			b.WriteString("Previous findings; the current run has no verdict.\n\n")
 		}
-		for _, f := range findings {
-			loc := f.Path
-			if f.Line > 0 {
-				loc = fmt.Sprintf("%s:%d", loc, f.Line)
-			}
-			if loc == "" {
-				loc = "-"
-			}
-			title := f.Title
-			if title == "" {
-				title = f.Message
-			}
-			fmt.Fprintf(&b, "- `%s` **%s** (%s)\n", f.Severity, escapeMarkdown(truncateText(title, 200)), escapeMarkdown(loc))
-			if f.Message != "" && f.Message != title {
-				fmt.Fprintf(&b, "  %s\n", escapeMarkdown(truncateText(f.Message, 600)))
-			}
-			if f.Suggestion != "" {
-				fmt.Fprintf(&b, "  Fix: %s\n", escapeMarkdown(truncateText(f.Suggestion, 300)))
-			}
-		}
+		b.WriteString(table)
 	}
 	if req.ResultText != "" {
 		b.WriteString("\n---\n\n")

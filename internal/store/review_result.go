@@ -19,6 +19,18 @@ func (s *Store) LatestRun(reviewID string) (ReviewRun, error) {
 	return run, err
 }
 
+// LatestReviewVerdict reads only the last available conclusion, without
+// loading potentially large transcripts from the run history.
+func (s *Store) LatestReviewVerdict(reviewID string) (string, error) {
+	var verdict string
+	err := s.db.QueryRow(`SELECT verdict FROM review_runs
+ WHERE review_id=? AND verdict!='' ORDER BY seq DESC LIMIT 1`, reviewID).Scan(&verdict)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return verdict, err
+}
+
 // SaveReviewResult commits the result and its findings together. A run's
 // verdict is recorded immediately, so completion can require a result from
 // this execution rather than accept a verdict left over from a prior run.

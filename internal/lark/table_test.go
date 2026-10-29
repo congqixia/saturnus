@@ -72,6 +72,11 @@ func TestBuildTableCard(t *testing.T) {
 	if status["text"] != "failed" || status["color"] != "red" {
 		t.Fatalf("unexpected status cell: %v", rows[0]["status"])
 	}
+	withDescription := buildTableCard(TableCard{Title: "CI", Description: "Some repositories could not be refreshed.", Columns: []TableColumn{{Name: "ci"}}, Rows: []map[string]any{{"ci": "UNKNOWN"}}})
+	parts := withDescription["body"].(map[string]any)["elements"].([]map[string]any)
+	if len(parts) != 2 || parts[0]["tag"] != "markdown" || parts[1]["tag"] != "table" {
+		t.Fatalf("description must not wrap or replace the native table: %+v", parts)
+	}
 }
 
 func TestSendTablePayloadIsValidJSONCard(t *testing.T) {

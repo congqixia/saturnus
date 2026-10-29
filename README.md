@@ -116,7 +116,10 @@ Supported text commands:
 - `/sat threads <review_id>` — list every chat thread a review was requested in
 - `/sat describe review <review_id>` — show full details of one review (as a card), including the run history
 - `/sat repos` — show the configured repo whitelist
-- `/sat prs` — list open PRs authored by the current `gh` user in the whitelisted repos, showing each PR's base branch
+- `/sat prs [refresh|all]` — list tracked PRs with CI status and bypass counts; refresh discovers and polls PRs
+- `/sat pr <pr-url|owner/repo#number|pr_id>` — track/refresh a PR and inspect checks, including bypass rules
+- `/sat pr pause|resume <ref>` — pause/resume CI polling for one PR
+- `/sat describe pr <ref>` — show a PR and its CI check details
 - `/sat groups` — list groups the bot has joined and their modes
 - `/sat group [chat_id]` — show a group's mode (defaults to the current group)
 - `/sat group mode <flags> [chat_id]` — set a group's mode flags (review, report, or report|review); omit `chat_id` when running inside the group
@@ -934,3 +937,15 @@ With review/Lark enabled, existing review refresh effects also apply, including
 Feishu task completion and incremental submitted-review descriptions. The
 scheduler is cancelled and joined before SQLite closes during server shutdown.
 See [Task Background Refresh](docs/plan/task-auto-refresh.md) for design details.
+
+## PR CI monitoring
+
+`/sat prs` shows persisted PR and CI summaries. Use `/sat prs refresh` to scan,
+`/sat pr owner/repo#123` for individual checks, and `/sat pr pause|resume <ref>`
+to control background monitoring. The server polls configured repositories every
+five minutes using its own GitHub CLI credentials.
+
+Optional checks can be excluded from the local CI aggregate by exact name using
+`SATURNUS_PRS_BYPASS_FILE`. Their original results remain visible. See
+[PR CI monitoring and bypass](docs/pr-ci-monitoring.md) for configuration,
+commands, API behavior, and the [example policy](pr-check-bypass.example.json).

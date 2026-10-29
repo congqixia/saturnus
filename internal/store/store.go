@@ -655,6 +655,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_task_prs_task ON task_prs(task_id)`,
 	}
+	statements = append(statements, pullRequestSchema...)
 	for _, stmt := range statements {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
 			return err

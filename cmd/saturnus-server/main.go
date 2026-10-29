@@ -24,6 +24,7 @@ import (
 	"saturnus/internal/cloudops"
 	"saturnus/internal/lark"
 	"saturnus/internal/policy"
+	"saturnus/internal/prs"
 	"saturnus/internal/repoconfig"
 	"saturnus/internal/review"
 	"saturnus/internal/store"
@@ -37,6 +38,7 @@ type server struct {
 	lark      *lark.Client
 	reviews   *review.Service
 	tasks     *tasks.Service
+	prs       *prs.Service
 	cloudops  *cloudops.Client
 	botUsers  []string
 	botOpenID string
@@ -75,6 +77,10 @@ func run(ctx context.Context, addr, data, staticDir string) (err error) {
 	if err != nil {
 		return err
 	}
+	prCfg, err := prsConfig(repos)
+	if err != nil {
+		return err
+	}
 	st, err := store.Open(data)
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
@@ -107,6 +113,8 @@ func run(ctx context.Context, addr, data, staticDir string) (err error) {
 		return s.reviews.SyncPR(ctx, repo, num, review.PRInfo{Title: info.Title, BaseBranch: info.BaseBranch, HeadCommit: info.HeadCommit, State: info.State})
 	}
 	s.tasks = tasks.New(st, taskCfg)
+	prCfg.Context = ctx
+	s.prs = prs.New(st, prCfg)
 	s.workerAlerts = workermonitor.New(st, larkClient, workermonitor.Config{
 		ReviewerOpenID: os.Getenv("SATURNUS_REVIEW_REVIEWER_OPEN_ID"),
 		ReviewerChatID: os.Getenv("SATURNUS_REVIEW_REVIEWER_CHAT_ID"),
@@ -134,6 +142,8 @@ func run(ctx context.Context, addr, data, staticDir string) (err error) {
 	go sched.Run(ctx)
 	stopRefresh := s.tasks.Start(ctx)
 	defer stopRefresh()
+	stopPRs := s.prs.Start(ctx)
+	defer stopPRs()
 	stopWorkerAlerts := s.workerAlerts.Start(ctx)
 	defer stopWorkerAlerts()
 
@@ -157,6 +167,11 @@ func run(ctx context.Context, addr, data, staticDir string) (err error) {
 	mux.HandleFunc("POST /api/reviews", s.createReview)
 	mux.HandleFunc("POST /api/reviews/{review_id}/result", s.submitReviewResult)
 	mux.HandleFunc("POST /api/reviews/{review_id}/post-comments", s.postReviewComments)
+	mux.HandleFunc("GET /api/prs", s.listPRs)
+	mux.HandleFunc("GET /api/prs/{pr_id}", s.getPR)
+	mux.HandleFunc("POST /api/prs", s.trackPR)
+	mux.HandleFunc("POST /api/prs/{pr_id}/refresh", s.refreshPR)
+	mux.HandleFunc("PATCH /api/prs/{pr_id}", s.updatePRMonitoring)
 	mux.HandleFunc("GET /api/tasks", s.listTasks)
 	mux.HandleFunc("GET /api/tasks/{task_id}", s.getTask)
 	mux.HandleFunc("POST /api/tasks", s.createTask)
@@ -837,7 +852,7 @@ func isReviewRequest(text string) bool {
 	fields := strings.Fields(strings.TrimSpace(text))
 	if len(fields) >= 2 && fields[0] == "/sat" {
 		switch fields[1] {
-		case "review", "retry", "reset", "refresh", "act", "threads", "describe", "reply", "post":
+		case "review", "retry", "reset", "refresh", "act", "threads", "describe", "reply", "post", "pr", "prs":
 			return true
 		}
 	}
@@ -1675,7 +1690,7 @@ func reviewStatusCell(req store.ReviewRequest) any {
 // whitelisted review repos. Each PR's base branch is shown so the merge target
 // is distinguishable at a glance. Repos whose gh lookup fails are reported
 // instead of hiding the results of the others.
-func (s *server) prsReply() botReply {
+func (s *server) legacyPRsReply() botReply {
 	repos := s.reviews.RepoList()
 	if len(repos) == 0 {
 		return botReply{text: "No repos whitelisted. Set SATURNUS_REVIEW_REPOS_FILE to a JSON mapping file, or SATURNUS_REVIEW_REPOS=owner/repo=/path/to/checkout,..."}
@@ -2222,7 +2237,10 @@ var satCommandList = []struct {
 	{"/sat threads <review_id>", "list all chat threads a review was requested in"},
 	{"/sat describe review <review_id>", "show full details of one review"},
 	{"/sat repos", "show the configured review repos"},
-	{"/sat prs", "list open PRs (authored by the current gh user) in the whitelisted repos, with base branch"},
+	{"/sat prs [refresh|all]", "list tracked PRs with CI and bypass counts; refresh discovers and polls all whitelisted PRs"},
+	{"/sat pr <pr-url|owner/repo#number|pr_id>", "track/refresh a PR and show CI check details, including bypass policy"},
+	{"/sat pr pause|resume <pr-url|owner/repo#number|pr_id>", "pause or resume local CI polling for one PR"},
+	{"/sat describe pr <pr-url|owner/repo#number|pr_id>", "show a PR and its CI checks"},
 	{"/sat groups", "list groups the bot has joined and their modes"},
 	{"/sat group [chat_id]", "show a group's mode (defaults to the current group)"},
 	{"/sat group mode <flags> [chat_id]", "set a group's mode flags (review, report, or report|review); omit chat_id when running inside the group"},
@@ -2375,7 +2393,21 @@ func (s *server) handleBotCommand(text string, msg review.MessageContext) botRep
 	case "repos":
 		return botReply{text: s.reviews.FormatRepos()}
 	case "prs":
-		return s.prsReply()
+		if len(fields) == 2 {
+			return s.prsReply()
+		}
+		if len(fields) == 3 && (fields[2] == "refresh" || fields[2] == "all") {
+			return s.prListReply(fields[2] == "refresh", fields[2] == "all")
+		}
+		return botReply{text: "Usage: /sat prs [refresh|all]"}
+	case "pr":
+		if len(fields) == 4 && (fields[2] == "pause" || fields[2] == "resume") {
+			return s.prMonitoringReply(fields[3], fields[2] == "resume")
+		}
+		if len(fields) != 3 {
+			return botReply{text: "Usage: /sat pr <pr-url|owner/repo#number|pr_id>"}
+		}
+		return s.prDetailReply(fields[2])
 	case "groups":
 		return s.groupsReply()
 	case "group":
@@ -2469,8 +2501,11 @@ func (s *server) handleBotCommand(text string, msg review.MessageContext) botRep
 		}
 		return s.threadsReply(fields[2])
 	case "describe":
+		if len(fields) == 4 && fields[2] == "pr" {
+			return s.prDetailReply(fields[3])
+		}
 		if len(fields) < 4 || fields[2] != "review" {
-			return botReply{text: "Usage: /sat describe review <review_id>"}
+			return botReply{text: "Usage: /sat describe review <review_id> or /sat describe pr <pr-url|owner/repo#number|pr_id>"}
 		}
 		return s.describeReviewReply(fields[3])
 	case "reply":

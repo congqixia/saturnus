@@ -1,0 +1,8 @@
+{
+  "global": [],
+  "repos": {
+    "milvus-io/milvus": [
+      "devops-v2-label-manager"
+    ]
+  }
+}

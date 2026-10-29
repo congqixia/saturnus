@@ -56,9 +56,10 @@ type TableColumn struct {
 // TableCard is a native Feishu card 2.0 table. Rows map column names to
 // cell values (string, number, or option/person tag objects).
 type TableCard struct {
-	Title   string
-	Columns []TableColumn
-	Rows    []map[string]any
+	Title       string
+	Description string // optional markdown, rendered above the native table
+	Columns     []TableColumn
+	Rows        []map[string]any
 }
 
 // OptionTag builds an option-tag cell value for an "options" column.
@@ -110,6 +111,11 @@ func buildTableCard(card TableCard) map[string]any {
 		}
 		columns = append(columns, column)
 	}
+	elements := []map[string]any{}
+	if card.Description != "" {
+		elements = append(elements, map[string]any{"tag": "markdown", "content": card.Description})
+	}
+	elements = append(elements, map[string]any{"tag": "table", "page_size": 10, "columns": columns, "rows": card.Rows})
 	return map[string]any{
 		"schema": "2.0",
 		"config": map[string]any{"width_mode": "fill"},
@@ -118,14 +124,7 @@ func buildTableCard(card TableCard) map[string]any {
 			"title":    map[string]any{"tag": "plain_text", "content": card.Title},
 		},
 		"body": map[string]any{
-			"elements": []map[string]any{
-				{
-					"tag":       "table",
-					"page_size": 10,
-					"columns":   columns,
-					"rows":      card.Rows,
-				},
-			},
+			"elements": elements,
 		},
 	}
 }

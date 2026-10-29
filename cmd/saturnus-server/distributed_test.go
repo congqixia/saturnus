@@ -215,6 +215,9 @@ exit 0
 	if final.ResultText == "" || !contains(final.ResultText, "REVIEW SUMMARY") {
 		t.Fatalf("result text missing summary block: %q", final.ResultText)
 	}
+	if !contains(final.ResultText, "FAKE-TOOL ARGS: run --auto ") {
+		t.Fatal("remote review did not enable automatic permission approval")
+	}
 	runs := svc.ListRuns(created.ID)
 	if len(runs) != 1 || runs[0].WorkerID != "wrk-test" || runs[0].Status != "succeeded" {
 		t.Fatalf("run record not persisted for worker: %#v", runs)
@@ -265,6 +268,9 @@ exit 0
 	}
 	if reacFinal.WorkerID != "wrk-test" {
 		t.Fatalf("reaction executed by %q, want wrk-test", reacFinal.WorkerID)
+	}
+	if !contains(reacFinal.ResultText, "FAKE-TOOL ARGS: run --auto --session ") {
+		t.Fatal("remote reaction did not enable automatic permission approval")
 	}
 	if !recorder.hasStart("", reac.ID) {
 		t.Fatal("worker did not report the reaction starting")

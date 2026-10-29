@@ -265,7 +265,7 @@ opt in.
 
 `/sat act <review_id> <instruction>` records a reaction (status `pending`) and
 enqueues it on the same worker pool. A worker resolves the review's checkout,
-resumes the review's tool session (`opencode run --session <session_id>`; the
+resumes the review's tool session (`opencode run --auto --session <session_id>`; the
 stored `session_id`, falling back to `captureSessionID`), and runs the tool
 with the instruction passed as a single argv element (no shell quoting issues).
 Output is streamed into `review_reactions.result_text` (~5s flush), the
@@ -311,7 +311,7 @@ check out anything.
   `Repo`, `PRNumber`, `PRURL`, `Title`, `BaseBranch`, `Worktree`, `Guide`,
   `ResultAPIURL`, `ResultToken`.
   Default:
-  `run "Review GitHub PR {{.Repo}}#{{.PRNumber}} ({{.PRURL}}). The repository
+  `run --auto "Review GitHub PR {{.Repo}}#{{.PRNumber}} ({{.PRURL}}). The repository
   is already checked out at {{.Worktree}}. Fetch and check out the PR head
   yourself, then review the changes. Focus on correctness, security and style;
   be concise with file:line references.{{if .Guide}} Review guidelines:

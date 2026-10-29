@@ -491,7 +491,7 @@ when its head commit moved, otherwise the request is reported as already up to
 date (`ErrReviewUnchanged`). `/sat retry <review_id>` forces another run: failed
 reviews always retry, successful ones only when the head changed. Retries keep
 the previous tool session (`session_id`), so the run resumes the same review
-conversation via `opencode run --session <id> --title ...`.
+conversation via `opencode run --auto --session <id> --title ...`.
 
 ### Reset a review's tool context
 
@@ -619,7 +619,7 @@ manually shelling into the tool session:
 /sat act <review_id> 针对 issue 2, 给出具体代码
 ```
 
-`/sat act` resumes the review's tool session (`opencode run --session <id>`,
+`/sat act` resumes the review's tool session (`opencode run --auto --session <id>`,
 same session captured for the review), passes the instruction as-is, and runs
 it in the background inside the mapped checkout. The agent's output is streamed
 into a persisted reaction record and delivered back to the chat where the
@@ -650,13 +650,18 @@ created per PR: re-running an already-reviewed PR reuses the existing
 The default command template is:
 
 ```text
-run "Review GitHub PR {{.Repo}}#{{.PRNumber}} ({{.PRURL}}). The repository is already checked out at {{.Worktree}}. Fetch and check out the PR head yourself, then review the changes. Focus on correctness, security and style; be concise with file:line references. Finish with a structured review. The very last block must be exactly:
+run --auto "Review GitHub PR {{.Repo}}#{{.PRNumber}} ({{.PRURL}}). The repository is already checked out at {{.Worktree}}. Fetch and check out the PR head yourself, then review the changes. Focus on correctness, security and style; be concise with file:line references. Finish with a structured review. The very last block must be exactly:
 
 REVIEW SUMMARY:
 PR summary: <what the PR does in 2-3 sentences>
 Issues: <each concrete problem with file:line references, one per line, or None>
 Review suggestions: <verdict and next steps: LGTM, or the specific changes required, or a design/refactor suggestion>"
 ```
+
+The default review template and local/remote `/sat act` commands include `--auto`
+for unattended OpenCode permission approval. Retries and context resets use the
+same review template. Custom `SATURNUS_REVIEW_COMMAND_TEMPLATE` values control
+their own arguments; include `--auto` when using OpenCode with a custom template.
 
 Placeholders available in the template: `Repo`, `PRNumber`, `PRURL`, `Title`,
 `BaseBranch`, `Worktree` (the mapped checkout path), `Guide` (per-repo review

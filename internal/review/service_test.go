@@ -1477,7 +1477,7 @@ func TestProcessReactionRunsToolResumingSession(t *testing.T) {
 	if got.Status != "succeeded" {
 		t.Fatalf("status = %q, want succeeded; error=%q result=%q", got.Status, got.Error, got.ResultText)
 	}
-	for _, want := range []string{"run", "--session", "ses_9", "--title", "saturnus-review-rvw_a", "用inline comment 回复 issue 1,3"} {
+	for _, want := range []string{"run", "--auto", "--session", "ses_9", "--title", "saturnus-review-rvw_a", "用inline comment 回复 issue 1,3"} {
 		if !strings.Contains(got.ResultText, want) {
 			t.Fatalf("tool output missing %q: %q", want, got.ResultText)
 		}

@@ -2083,7 +2083,7 @@ func (s *Service) processReaction(id string) {
 		s.notifyReaction(reac)
 		return
 	}
-	args := []string{"run", "--session", sessionID, "--title", SessionTitle(req.ID, contextID), reac.Instruction}
+	args := []string{"run", "--auto", "--session", sessionID, "--title", SessionTitle(req.ID, contextID), reac.Instruction}
 
 	var mu sync.Mutex
 	var progress string

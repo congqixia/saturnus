@@ -46,7 +46,7 @@ type ToolArgs struct {
 
 const maxResultBytes = 512 * 1024
 
-var DefaultCommandTemplate = `run {{if .SessionID}}--session {{.SessionID}} {{end}}--title "saturnus-review-{{.ReviewID}}" "{{if .RetryNote}}{{.RetryNote | shellquote}}{{else}}Review GitHub PR {{.Repo}}#{{.PRNumber}} ({{.PRURL}}). The repository is already checked out at {{.Worktree}}. Fetch and check out the PR head yourself, then review the changes. Focus on correctness, security and style; be concise with file:line references.{{if .Guide}} Review guidelines: {{.Guide | shellquote}}{{end}}{{end}} Finish with a structured review. The very last block must be exactly:
+var DefaultCommandTemplate = `run --auto {{if .SessionID}}--session {{.SessionID}} {{end}}--title "saturnus-review-{{.ReviewID}}" "{{if .RetryNote}}{{.RetryNote | shellquote}}{{else}}Review GitHub PR {{.Repo}}#{{.PRNumber}} ({{.PRURL}}). The repository is already checked out at {{.Worktree}}. Fetch and check out the PR head yourself, then review the changes. Focus on correctness, security and style; be concise with file:line references.{{if .Guide}} Review guidelines: {{.Guide | shellquote}}{{end}}{{end}} Finish with a structured review. The very last block must be exactly:
 
 REVIEW SUMMARY:
 PR summary: <what the PR does in 2-3 sentences>

@@ -398,7 +398,7 @@ func (w *Worker) runReaction(ctx context.Context, p workerproto.JobPayload) {
 	}
 	// The instruction is passed as a single argv element so arbitrary reviewer
 	// text (quotes, backslashes, whitespace) survives verbatim.
-	args := []string{"run", "--session", p.SessionID, "--title", review.SessionTitle(p.ReviewID, p.ContextID), p.Instruction}
+	args := []string{"run", "--auto", "--session", p.SessionID, "--title", review.SessionTitle(p.ReviewID, p.ContextID), p.Instruction}
 
 	logFile, err := openLog(w.cfg.LogDir, p.ReactionID)
 	if err != nil {

@@ -175,6 +175,9 @@ func run(ctx context.Context, addr, data, staticDir string) (err error) {
 	mux.HandleFunc("GET /api/tasks", s.listTasks)
 	mux.HandleFunc("GET /api/tasks/{task_id}", s.getTask)
 	mux.HandleFunc("POST /api/tasks", s.createTask)
+	mux.HandleFunc("PUT /api/tasks/{task_id}/issue", s.bindTaskIssue)
+	mux.HandleFunc("POST /api/tasks/{task_id}/sessions", s.addTaskSession)
+	mux.HandleFunc("DELETE /api/tasks/{task_id}/sessions/{link_id}", s.removeTaskSession)
 	mux.HandleFunc("POST /api/tasks/{task_id}/docs", s.addTaskDoc)
 	mux.HandleFunc("DELETE /api/tasks/{task_id}/docs/{doc_id}", s.removeTaskDoc)
 	mux.HandleFunc("POST /api/tasks/{task_id}/prs", s.addTaskPR)
@@ -610,30 +613,85 @@ func (s *server) getTask(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
+	links, err := s.store.ListTaskSessions(task.ID)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"task": task,
-		"docs": s.tasks.Docs(task.ID),
-		"prs":  s.tasks.PRs(task.ID),
+		"task":     task,
+		"docs":     s.tasks.Docs(task.ID),
+		"prs":      s.tasks.PRs(task.ID),
+		"sessions": links,
 	})
 }
 
 func (s *server) createTask(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		IssueURL    string `json:"issue_url"`
+		Title       string `json:"title"`
+		Description string `json:"description"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	var task store.Task
+	var err error
+	if req.IssueURL != "" {
+		task, err = s.tasks.Create(req.IssueURL)
+	} else {
+		task, err = s.tasks.CreateIndependent(req.Title, req.Description)
+	}
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"task": task})
+}
+
+func (s *server) bindTaskIssue(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		IssueURL string `json:"issue_url"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if req.IssueURL == "" {
-		writeError(w, http.StatusBadRequest, errors.New("issue_url is required"))
-		return
-	}
-	task, err := s.tasks.Create(req.IssueURL)
+	task, err := s.tasks.BindIssue(r.PathValue("task_id"), req.IssueURL)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"task": task})
+	writeJSON(w, http.StatusOK, map[string]any{"task": task})
+}
+
+func (s *server) addTaskSession(w http.ResponseWriter, r *http.Request) {
+	if !s.tasks.Enabled() {
+		writeError(w, http.StatusBadRequest, tasks.ErrDisabled)
+		return
+	}
+	var link store.TaskSession
+	if !decodeJSON(w, r, &link) {
+		return
+	}
+	link.TaskID = r.PathValue("task_id")
+	link, err := s.store.AddTaskSession(link)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"session": link})
+}
+
+func (s *server) removeTaskSession(w http.ResponseWriter, r *http.Request) {
+	if !s.tasks.Enabled() {
+		writeError(w, http.StatusBadRequest, tasks.ErrDisabled)
+		return
+	}
+	if err := s.store.RemoveTaskSession(r.PathValue("task_id"), r.PathValue("link_id")); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *server) updateTask(w http.ResponseWriter, r *http.Request) {
@@ -1456,10 +1514,53 @@ func issueRef(task store.Task) string {
 // taskCommand dispatches the /sat task subcommands.
 func (s *server) taskCommand(fields []string, text string) botReply {
 	if len(fields) < 3 {
-		return botReply{text: "Usage: /sat task <task_id> or /sat task <create|add-doc|rm-doc|add-pr|rm-pr|refresh|close> ..."}
+		return botReply{text: "Usage: /sat task <task_id> or /sat task <create|create-title|bind-issue|add-session|rm-session|add-doc|rm-doc|add-pr|rm-pr|refresh|close> ..."}
 	}
 	sub := fields[2]
 	switch sub {
+	case "create-title":
+		title := strings.TrimSpace(strings.TrimPrefix(text, strings.Join(fields[:3], " ")))
+		task, err := s.tasks.CreateIndependent(title, "")
+		if err != nil {
+			return botReply{text: "Task create failed: " + err.Error()}
+		}
+		return botReply{text: "Task created " + task.ID + " (" + task.Title + ")"}
+	case "bind-issue":
+		if len(fields) < 5 {
+			return botReply{text: "Usage: /sat task bind-issue <task_id> <issue-url>"}
+		}
+		task, err := s.tasks.BindIssue(fields[3], fields[4])
+		if err != nil {
+			return botReply{text: "Bind issue failed: " + err.Error()}
+		}
+		return botReply{text: "Issue bound to " + task.ID + ": " + task.IssueURL}
+	case "add-session":
+		if !s.tasks.Enabled() {
+			return botReply{text: "Tasks module is disabled."}
+		}
+		if len(fields) < 6 {
+			return botReply{text: "Usage: /sat task add-session <task_id> <tool> <session_id> [purpose]"}
+		}
+		link := store.TaskSession{TaskID: fields[3], Tool: fields[4], SessionID: fields[5]}
+		if len(fields) > 6 {
+			link.Purpose = strings.Join(fields[6:], " ")
+		}
+		link, err := s.store.AddTaskSession(link)
+		if err != nil {
+			return botReply{text: "Add session failed: " + err.Error()}
+		}
+		return botReply{text: "Session linked " + link.ID}
+	case "rm-session":
+		if !s.tasks.Enabled() {
+			return botReply{text: "Tasks module is disabled."}
+		}
+		if len(fields) < 5 {
+			return botReply{text: "Usage: /sat task rm-session <task_id> <link_id>"}
+		}
+		if err := s.store.RemoveTaskSession(fields[3], fields[4]); err != nil {
+			return botReply{text: "Remove session failed: " + err.Error()}
+		}
+		return botReply{text: "Session link removed " + fields[4]}
 	case "create":
 		if len(fields) < 4 {
 			return botReply{text: "Usage: /sat task create <issue-url>"}
@@ -1524,7 +1625,7 @@ func (s *server) taskCommand(fields []string, text string) botReply {
 	default:
 		task, err := s.tasks.Get(sub)
 		if err != nil {
-			return botReply{text: "Task not found. Usage: /sat task <task_id> or /sat task <create|add-doc|rm-doc|add-pr|rm-pr|refresh|close> ..."}
+			return botReply{text: "Task not found. Use /sat task <task_id> or /sat help for task commands."}
 		}
 		return s.taskDetailReply(task)
 	}
@@ -1533,11 +1634,21 @@ func (s *server) taskCommand(fields []string, text string) botReply {
 func (s *server) taskDetailReply(task store.Task) botReply {
 	docs := s.tasks.Docs(task.ID)
 	prs := s.tasks.PRs(task.ID)
+	links, err := s.store.ListTaskSessions(task.ID)
+	sessionText := ""
+	if err != nil {
+		sessionText = "\nSessions unavailable: " + err.Error()
+	} else if len(links) > 0 {
+		sessionText = "\n\nSessions:"
+		for _, link := range links {
+			sessionText += fmt.Sprintf("\n- %s %s %s %s", link.ID, link.Tool, link.SessionID, link.Purpose)
+		}
+	}
 	return botReply{
-		text: s.tasks.FormatOne(task, docs, prs),
+		text: s.tasks.FormatOne(task, docs, prs) + sessionText,
 		md: &lark.MarkdownCard{
 			Title:   "Task " + task.ID,
-			Content: formatTaskMarkdown(task, docs, prs),
+			Content: formatTaskMarkdown(task, docs, prs) + escapeMarkdown(sessionText),
 		},
 	}
 }
@@ -2262,6 +2373,10 @@ var satCommandList = []struct {
 	{"/sat tasks all|archived", "list tasks including archived, or only archived"},
 	{"/sat task <task_id>", "show one task: issue, docs, and per-PR progress"},
 	{"/sat task create <issue-url>", "create a task from a GitHub issue"},
+	{"/sat task create-title <title>", "create a task without an issue"},
+	{"/sat task bind-issue <task_id> <issue-url>", "bind an issue to a task"},
+	{"/sat task add-session <task_id> <tool> <session_id> [purpose]", "link a tool session"},
+	{"/sat task rm-session <task_id> <link_id>", "unlink a tool session"},
 	{"/sat task add-doc <task_id> <owner/repo:path>", "attach a local design doc to a task"},
 	{"/sat task rm-doc <task_id> <doc_id>", "detach a design doc"},
 	{"/sat task add-pr <task_id> <pr-url>", "attach a PR and snapshot its review/Feishu-task state"},

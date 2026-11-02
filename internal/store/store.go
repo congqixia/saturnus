@@ -665,6 +665,13 @@ func (s *Store) migrate(ctx context.Context) error {
 			UNIQUE(task_id, repo, pr_number)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_task_prs_task ON task_prs(task_id)`,
+		`CREATE TABLE IF NOT EXISTS task_sessions (
+			id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+			tool TEXT NOT NULL, session_id TEXT NOT NULL, purpose TEXT NOT NULL DEFAULT '',
+			note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+			UNIQUE(task_id, tool, session_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_task_sessions_task ON task_sessions(task_id)`,
 	}
 	statements = append(statements, pullRequestSchema...)
 	for _, stmt := range statements {

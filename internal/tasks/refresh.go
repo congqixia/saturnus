@@ -128,7 +128,9 @@ func (s *Service) refresh(parent context.Context, id string, activeOnly bool, sc
 	task.RefreshAttemptedAt = time.Now().UTC()
 	successes := 0
 	addError := func(stage string, err error) { result.Errors = append(result.Errors, stage+": "+err.Error()) }
-	if _, ok := s.cfg.Repos[task.IssueRepo]; !ok {
+	if task.IssueNumber == 0 {
+		// An independent task has no issue to refresh.
+	} else if _, ok := s.cfg.Repos[task.IssueRepo]; !ok {
 		addError("issue", fmt.Errorf("repo is not in the task whitelist: %s", task.IssueRepo))
 	} else if task.IssueNumber > 0 {
 		info, err := FetchIssueInfo(ctx, s.cfg.GHCli, task.IssueRepo, task.IssueNumber)

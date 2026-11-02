@@ -117,6 +117,41 @@ func (s *Service) Create(issueURL string) (store.Task, error) {
 	return s.store.CreateTask(task)
 }
 
+// CreateIndependent creates a task without requiring a GitHub issue.
+func (s *Service) CreateIndependent(title, description string) (store.Task, error) {
+	if !s.cfg.Enabled {
+		return store.Task{}, ErrDisabled
+	}
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return store.Task{}, errors.New("title is required")
+	}
+	return s.store.CreateTask(store.Task{Title: title, Description: description})
+}
+
+// BindIssue attaches an issue without replacing the task's own title.
+func (s *Service) BindIssue(id, issueURL string) (store.Task, error) {
+	if !s.cfg.Enabled {
+		return store.Task{}, ErrDisabled
+	}
+	req, err := FindIssueRequest(issueURL)
+	if err != nil {
+		return store.Task{}, err
+	}
+	if _, ok := s.cfg.Repos[req.Repo]; !ok {
+		return store.Task{}, fmt.Errorf("repo is not in the task whitelist: %s", req.Repo)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.RefreshTimeout)
+	defer cancel()
+	unlock, err := s.locks.Lock(ctx, "task:"+id)
+	if err != nil {
+		return store.Task{}, err
+	}
+	defer unlock()
+	info := ResolveIssueInfo(ctx, s.cfg.GHCli, req.Repo, req.IssueNumber)
+	return s.store.BindTaskIssue(id, req.Repo, req.IssueNumber, req.IssueURL, info.Title, info.State)
+}
+
 func (s *Service) Get(id string) (store.Task, error) {
 	return s.store.GetTask(id)
 }

@@ -127,6 +127,16 @@ export type TaskDoc = {
   created_at: string
 }
 
+export type TaskSession = {
+  id: string
+  task_id: string
+  tool: string
+  session_id: string
+  purpose: string
+  note: string
+  created_at: string
+}
+
 export type TaskPR = {
  sync_attempted_at?: string
  sync_error: string

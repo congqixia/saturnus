@@ -1,6 +1,7 @@
 package tasks
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -78,6 +79,36 @@ func TestServiceCreateStoresTask(t *testing.T) {
 	}
 	if task.Title == "" {
 		t.Fatal("expected a fallback title")
+	}
+}
+
+func TestIndependentTaskRefreshAndBindIssue(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	svc := New(st, Config{Enabled: true, GHCli: "no-such-gh", Repos: map[string]string{"a/b": "/tmp/a"}})
+	task, err := svc.CreateIndependent(" Investigate ", "context")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Title != "Investigate" || task.Description != "context" || task.IssueNumber != 0 {
+		t.Fatalf("unexpected task: %#v", task)
+	}
+	result, err := svc.RefreshContext(context.Background(), task.ID)
+	if err != nil || result.Outcome != "success" || result.Task.RefreshError != "" {
+		t.Fatalf("refresh: %#v, %v", result, err)
+	}
+	task, err = svc.BindIssue(task.ID, "https://github.com/a/b/issues/10")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Title != "Investigate" || task.IssueNumber != 10 {
+		t.Fatalf("unexpected bound task: %#v", task)
+	}
+	if _, err := svc.BindIssue(task.ID, "https://github.com/other/repo/issues/1"); err == nil {
+		t.Fatal("expected whitelist error")
 	}
 }
 

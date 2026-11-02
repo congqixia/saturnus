@@ -851,9 +851,8 @@ read scope to list and resolve chats.
 
 ## Tasks
 
-The Tasks module tracks a feature/effort end to end by binding it to **one
-GitHub issue**, the **local design docs** that define it, and the **PRs** that
-implement it. For every linked PR it tracks progress independently: PR state
+The Tasks module tracks a feature/effort with an optional GitHub issue, local
+design docs, tool session references, and PRs. For every linked PR it tracks progress independently: PR state
 (open/closed/merged), review status, and the Feishu task created for the PR's
 review. Everything is queryable from the bot (`/sat task ...`) and the web UI
 (Tasks panel).
@@ -875,6 +874,11 @@ Workflow:
 
 ```text
 /sat task create https://github.com/acme/foo/issues/42   # bind the issue
+/sat task create-title Investigate a production issue      # no issue required
+/sat task bind-issue <task_id> https://github.com/acme/foo/issues/42
+/sat task add-session <task_id> codex <session_id> analyze
+/sat task add-session <task_id> opencode <session_id> coding
+/sat task rm-session <task_id> <link_id>
 /sat task add-doc <task_id> acme/foo:docs/plan/feature.md  # attach a design doc
 /sat task add-pr <task_id> https://github.com/acme/foo/pull/5  # attach a PR
 /sat task refresh <task_id>     # re-sync issue/PR/review/Feishu-task state
@@ -887,6 +891,14 @@ copied from the linked `review_requests` row when a review exists (via
 `review_id`), so it never depends on a live review lookup to render. Attaching a
 PR never starts a review; use `/sat review <pr-url>` as usual, then refresh the
 task to pick up the review status and its Feishu task.
+
+Task sessions are explicit references to tool-native session IDs; adding one
+does not launch or resume the tool, validate the ID, or import its transcript.
+The task detail shows the links in the bot and web UI. The HTTP API supports
+`POST /api/tasks` with `title` and optional `description` (or `issue_url`),
+`PUT /api/tasks/{id}/issue` with `issue_url`, and `POST`/`DELETE` on
+`/api/tasks/{id}/sessions` (DELETE uses the link ID as a path suffix). A session
+link accepts `tool`, `session_id`, and optional `purpose` and `note`.
 
 Environment variables:
 

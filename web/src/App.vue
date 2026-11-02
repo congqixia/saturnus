@@ -605,6 +605,16 @@ import { h } from 'vue'
                     </li>
                   </ul>
                 </div>
+                <div v-if="store.selectedTaskSessions.length" class="task-docs">
+                  <strong>Sessions</strong>
+                  <ul>
+                    <li v-for="session in store.selectedTaskSessions" :key="session.id">
+                      <code>{{ session.tool }}:{{ session.session_id }}</code>
+                      <span v-if="session.purpose"> — {{ session.purpose }}</span>
+                      <span v-if="session.note"> — {{ session.note }}</span>
+                    </li>
+                  </ul>
+                </div>
                 <div v-if="store.selectedTaskPrs.length" class="task-prs">
                   <strong>Linked PRs</strong>
                   <NDataTable

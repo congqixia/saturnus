@@ -484,7 +484,12 @@ func (s *server) getReview(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"review": req, "context_id": contextID, "runs": s.reviews.ListRuns(req.ID), "reactions": s.reviews.ListReactions(req.ID), "threads": s.reviews.ListThreads(req.ID), "findings": s.reviews.ListFindings(req.ID)})
+	notifications, err := s.reviews.ListRequesterNotifications(req.ID)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"review": req, "context_id": contextID, "runs": s.reviews.ListRuns(req.ID), "reactions": s.reviews.ListReactions(req.ID), "threads": s.reviews.ListThreads(req.ID), "findings": s.reviews.ListFindings(req.ID), "requester_notifications": notifications})
 }
 
 // submitReviewResult receives the machine-readable review result the review
@@ -852,7 +857,7 @@ func isReviewRequest(text string) bool {
 	fields := strings.Fields(strings.TrimSpace(text))
 	if len(fields) >= 2 && fields[0] == "/sat" {
 		switch fields[1] {
-		case "review", "retry", "reset", "refresh", "act", "threads", "describe", "findings", "reply", "post", "pr", "prs":
+		case "review", "retry", "reset", "refresh", "act", "threads", "describe", "findings", "notifications", "reply", "post", "pr", "prs":
 			return true
 		}
 	}
@@ -2240,6 +2245,7 @@ var satCommandList = []struct {
 	{"/sat threads <review_id>", "list all chat threads a review was requested in"},
 	{"/sat describe review <review_id>", "show review details with finding counts"},
 	{"/sat findings <review_id> [page]", "show findings with status and review round (5 per page)"},
+	{"/sat notifications <review_id> [page]", "show requester result notifications and delivery status (one per page)"},
 	{"/sat repos", "show the configured review repos"},
 	{"/sat prs [refresh|all]", "list tracked PRs with CI and bypass counts; refresh discovers and polls all whitelisted PRs"},
 	{"/sat pr <pr-url|owner/repo#number|pr_id>", "track/refresh a PR and show CI check details, including bypass policy"},
@@ -2517,6 +2523,19 @@ func (s *server) handleBotCommand(text string, msg review.MessageContext) botRep
 			}
 		}
 		return s.reviewFindingsReply(fields[2], page)
+	case "notifications":
+		if len(fields) < 3 || len(fields) > 4 {
+			return botReply{text: "Usage: /sat notifications <review_id> [page]"}
+		}
+		page := 1
+		if len(fields) == 4 {
+			var err error
+			page, err = strconv.Atoi(fields[3])
+			if err != nil || page < 1 {
+				return botReply{text: "Notification page must be a positive integer."}
+			}
+		}
+		return s.reviewNotificationsReply(fields[2], page)
 	case "describe":
 		if len(fields) == 4 && fields[2] == "pr" {
 			return s.prDetailReply(fields[3])

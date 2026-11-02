@@ -991,6 +991,10 @@ func (s *Service) ListRuns(reviewID string) []store.ReviewRun {
 	return s.store.ListRuns(reviewID)
 }
 
+func (s *Service) ListRequesterNotifications(reviewID string) ([]store.ReviewRequesterNotification, error) {
+	return s.store.ListRequesterNotifications(reviewID)
+}
+
 // ReviewOutdated reports whether a review's last run reviewed an older PR head
 // than the PR's current head as recorded by the last refresh (pr_head_commit).
 // A review with no recorded head on either side is never flagged.
@@ -1590,7 +1594,7 @@ func (s *Service) process(id string) {
 			}
 		}
 	}
-	s.notifyReviewer(req)
+	s.notifyReviewer(req, run.ID)
 }
 
 func openReviewLog(logDir, id string) (*os.File, error) {
@@ -1992,7 +1996,7 @@ func (s *Service) clearNameFailure(openID string) {
 	delete(s.nameFailures, openID)
 }
 
-func (s *Service) notifyReviewer(req store.ReviewRequest) {
+func (s *Service) notifyReviewer(req store.ReviewRequest, runIDs ...string) {
 	if err := s.resolveRequesterName(&req); err != nil {
 		logf("notifyReviewer: %v", err)
 	}
@@ -2015,7 +2019,7 @@ func (s *Service) notifyReviewer(req store.ReviewRequest) {
 			}
 		}
 	}
-	s.notifyRequesterResult(req)
+	s.notifyRequesterResult(req, runIDs...)
 }
 
 // notifyRequesterResult DMs the requester a short summary once a review
@@ -2023,7 +2027,7 @@ func (s *Service) notifyReviewer(req store.ReviewRequest) {
 // severity, and how many findings were already posted as inline comments on
 // the PR (per SATURNUS_REVIEW_POST_INLINE_COMMENTS). Deliberately minimal so
 // the full detail stays with the reviewer.
-func (s *Service) notifyRequesterResult(req store.ReviewRequest) {
+func (s *Service) notifyRequesterResult(req store.ReviewRequest, runIDs ...string) {
 	if !s.cfg.NotifyRequester || req.RequesterOpenID == "" || req.Status != "succeeded" || req.Verdict == "" || !s.lark.Enabled() {
 		return
 	}
@@ -2044,8 +2048,24 @@ func (s *Service) notifyRequesterResult(req store.ReviewRequest) {
 		fmt.Fprintf(&b, "已发布 %d 条 inline comment 到 PR\n", posted)
 	}
 	fmt.Fprintf(&b, "review: %s", req.ID)
-	if err := s.lark.SendTextToUser(req.RequesterOpenID, b.String()); err != nil {
-		logf("notify requester of result: %v", err)
+	runID := ""
+	if len(runIDs) > 0 {
+		runID = runIDs[0]
+	}
+	n, saveErr := s.store.CreateRequesterNotification(store.ReviewRequesterNotification{ReviewID: req.ID, RunID: runID, RequesterOpenID: req.RequesterOpenID, Message: b.String()})
+	if saveErr != nil {
+		logf("record requester notification for %s: %v", req.ID, saveErr)
+	}
+	deliveryErr := s.lark.SendTextToUser(req.RequesterOpenID, b.String())
+	status, errText := "sent", ""
+	if deliveryErr != nil {
+		status, errText = "failed", deliveryErr.Error()
+		logf("notify requester of result: %v", deliveryErr)
+	}
+	if saveErr == nil {
+		if err := s.store.FinishRequesterNotification(n.ID, status, errText); err != nil {
+			logf("update requester notification %s: %v", n.ID, err)
+		}
 	}
 }
 

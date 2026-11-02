@@ -222,7 +222,7 @@ func (s *Service) CompleteRemoteRun(reviewID, runID, workerID string, ok bool, h
 			}
 		}
 	}
-	s.notifyReviewer(req)
+	s.notifyReviewer(req, runID)
 	return nil
 }
 

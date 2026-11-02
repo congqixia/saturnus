@@ -501,6 +501,15 @@ Findings: 3 项 (P0: 1, P1: 1, P2: 1)
 review: rvw_xxx
 ```
 
+The same notification is sent after each successful retry with a structured
+verdict. `GET /api/reviews/{id}` returns `requester_notifications`, containing
+the message snapshot, recipient, run ID, timestamp, and delivery status (`pending`,
+`sent`, or `failed`, with an error when available). A pending record means the
+delivery outcome was not recorded, for example if the server stopped mid-send.
+Notifications sent before this history was introduced cannot be reconstructed.
+Use `/sat notifications <review_id> [page]` to inspect the same delivery
+history in chat, one complete message per page.
+
 The count of posted comments reflects findings whose inline comment was
 recorded (`github_comment_id`). The full detail still goes to the reviewer.
 

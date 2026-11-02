@@ -2511,7 +2511,11 @@ func TestNotifyRequesterResult(t *testing.T) {
 	fake := svc.lark.(*fakeLark)
 	fake.sent = nil
 
-	svc.notifyRequesterResult(req)
+	run, err := st.CreateReviewRun(store.ReviewRun{ReviewID: req.ID, Status: "succeeded"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.notifyRequesterResult(req, run.ID)
 
 	if len(fake.sent) != 1 {
 		t.Fatalf("expected 1 requester DM, got %#v", fake.sent)
@@ -2524,6 +2528,28 @@ func TestNotifyRequesterResult(t *testing.T) {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("requester message missing %q: %s", want, msg)
 		}
+	}
+	notifications, err := svc.ListRequesterNotifications(req.ID)
+	if err != nil || len(notifications) != 1 {
+		t.Fatalf("notifications: %#v, %v", notifications, err)
+	}
+	if n := notifications[0]; n.RunID != run.ID || n.Status != "sent" || n.RequesterOpenID != req.RequesterOpenID || !strings.Contains(fake.sent[0], n.Message) {
+		t.Fatalf("incorrect notification: %#v", n)
+	}
+
+	// A retry gets a separate immutable snapshot, including a failed delivery.
+	retry, err := st.CreateReviewRun(store.ReviewRun{ReviewID: req.ID, Status: "succeeded"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.lark = firstResultDeliveryFails{fakeLark: &fakeLark{enabled: true}}
+	svc.notifyRequesterResult(req, retry.ID)
+	notifications, err = svc.ListRequesterNotifications(req.ID)
+	if err != nil || len(notifications) != 2 {
+		t.Fatalf("notifications: %#v, %v", notifications, err)
+	}
+	if n := notifications[1]; n.RunID != retry.ID || n.Status != "failed" || n.Error != "delivery failed" {
+		t.Fatalf("retry notification: %#v", n)
 	}
 }
 

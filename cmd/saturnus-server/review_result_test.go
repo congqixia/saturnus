@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +11,39 @@ import (
 	"saturnus/internal/review"
 	"saturnus/internal/store"
 )
+
+func TestGetReviewIncludesRequesterNotifications(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/saturnus.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	newReviewingReviewForResult(t, st, "rvw_notice")
+	n, err := st.CreateRequesterNotification(store.ReviewRequesterNotification{ReviewID: "rvw_notice", RequesterOpenID: "ou_test", Message: "Findings: 1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.FinishRequesterNotification(n.ID, "sent", ""); err != nil {
+		t.Fatal(err)
+	}
+	srv := &server{reviews: review.New(st, lark.New(lark.Config{}), review.Config{Enabled: true})}
+	req := httptest.NewRequest(http.MethodGet, "/api/reviews/rvw_notice", nil)
+	req.SetPathValue("review_id", "rvw_notice")
+	rr := httptest.NewRecorder()
+	srv.getReview(rr, req)
+	var body struct {
+		Notifications []store.ReviewRequesterNotification `json:"requester_notifications"`
+	}
+	if rr.Code != http.StatusOK {
+		t.Fatalf("response: %d %s", rr.Code, rr.Body.String())
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Notifications) != 1 || body.Notifications[0].Message != "Findings: 1" || body.Notifications[0].Status != "sent" {
+		t.Fatalf("notifications: %#v", body.Notifications)
+	}
+}
 
 func TestReviewResultHTTPRunFenceAndDuplicate(t *testing.T) {
 	st, err := store.Open(t.TempDir() + "/saturnus.db")

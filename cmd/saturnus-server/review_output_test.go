@@ -129,7 +129,7 @@ func TestFindingCommandPaginatesAndKeepsDescribeCompact(t *testing.T) {
 			t.Fatalf("description grew with findings: %s", output)
 		}
 	}
-	if !isReviewRequest("/sat findings rvw_many") || !strings.Contains(helpText(), "/sat findings <review_id> [page]") {
+	if !isReviewRequest("/sat findings rvw_many") || !strings.Contains(helpReply([]string{"review"}).text, "/sat findings <review_id> [page]") {
 		t.Fatal("finding command missing from group routing/help")
 	}
 	empty, err := st.CreateReview(store.ReviewRequest{ID: "rvw_empty", ThreadID: thread.ID, Status: "succeeded"})

@@ -2396,98 +2396,14 @@ func truncateText(value string, max int) string {
 	return value[:max] + "\n...[truncated]"
 }
 
-// satCommandList is the single source of truth for /sat commands, used by both
-// /sat help and the plain "/sat" reply. Keep it in sync with the "case" arms of
-// handleBotCommand below and with the README.
-var satCommandList = []struct {
-	command     string
-	description string
-}{
-	{"/sat help", "show this help"},
-	{"/sat sessions", "list recent sessions"},
-	{"/sat pending", "list pending approvals"},
-	{"/sat session <session_id>", "show one session"},
-	{"/sat approve <request_id>", "approve a pending request"},
-	{"/sat deny <request_id> <reason>", "deny a pending request"},
-	{"/sat autopass on|off <session_id>", "toggle auto-approve for a session"},
-	{"/sat reviews", "list recent PR reviews (archived reviews are hidden)"},
-	{"/sat reviews all|archived", "list PR reviews including archived, or only archived"},
-	{"/sat review <pr-url|review_id> [@user]", "start a review (optionally attribute the requester to @user), or show one review by id"},
-	{"/sat retry <review_id>", "retry a failed review, or re-run after the PR head changed"},
-	{"/sat reset <review_id>", "reset the tool session and queue a fresh review context, even when the PR head is unchanged"},
-	{"/sat post <review_id>", "publish the review's findings as GitHub inline comments (plus the verdict review); for reviews whose findings were never posted"},
-	{"/sat refresh <review_id|all>", "sync PR/task state: archive merged/closed PRs, complete their task, append reviewer comments to the task"},
-	{"/sat act <review_id> <instruction>", "resume the review session to act on the PR (e.g. inline comments for selected issues, concrete code for an issue)"},
-	{"/sat threads <review_id>", "list all chat threads a review was requested in"},
-	{"/sat describe review <review_id>", "show review details with finding counts"},
-	{"/sat findings <review_id> [page]", "show findings with status and review round (5 per page)"},
-	{"/sat notifications <review_id> [page]", "show requester result notifications and delivery status (one per page)"},
-	{"/sat repos", "show the configured review repos"},
-	{"/sat prs [refresh|all]", "list tracked PRs with CI and bypass counts; refresh discovers and polls all whitelisted PRs"},
-	{"/sat pr <pr-url|owner/repo#number|pr_id>", "track/refresh a PR and show CI check details, including bypass policy"},
-	{"/sat pr pause|resume <pr-url|owner/repo#number|pr_id>", "pause or resume local CI polling for one PR"},
-	{"/sat describe pr <pr-url|owner/repo#number|pr_id>", "show a PR and its CI checks"},
-	{"/sat groups", "list groups the bot has joined and their modes"},
-	{"/sat group [chat_id]", "show a group's mode (defaults to the current group)"},
-	{"/sat group mode <flags> [chat_id]", "set a group's mode flags (review, report, or report|review); omit chat_id when running inside the group"},
-	{"/sat whoami", "show your open_id"},
-	{"/sat whois <name|email|mobile>", "resolve a user to open_id"},
-	{"/sat reply <review_id> <message>", "reviewer replies to the requester"},
-	{"/sat requester <review_id> @user|ou_xxx", "update a review's requester (mention the user, or pass an open_id)"},
-	{"/sat tasks", "list feature tasks (archived tasks are hidden)"},
-	{"/sat tasks all|archived", "list tasks including archived, or only archived"},
-	{"/sat task <task_id> [page]", "show task details and related items"},
-	{"/sat task add-ref <task_id> <url> [title]", "attach a reference URL"},
-	{"/sat task rm-ref <task_id> <ref_id>", "detach a reference URL"},
-	{"/sat task create <issue-url>", "create a task from a GitHub issue"},
-	{"/sat task create-title <title>", "create a task without an issue"},
-	{"/sat task bind-issue <task_id> <issue-url>", "bind an issue to a task"},
-	{"/sat task add-session <task_id> <tool> <session_id> [purpose]", "link a tool session"},
-	{"/sat task rm-session <task_id> <link_id>", "unlink a tool session"},
-	{"/sat task add-doc <task_id> <owner/repo:path>", "attach a local design doc to a task"},
-	{"/sat task rm-doc <task_id> <doc_id>", "detach a design doc"},
-	{"/sat task add-pr <task_id> <pr-url>", "attach a PR and snapshot its review/Feishu-task state"},
-	{"/sat task rm-pr <task_id> <pr_id>", "detach a PR"},
-	{"/sat task refresh <task_id|all>", "re-sync issue/PR/review/Feishu-task state"},
-	{"/sat task close <task_id>", "archive a task"},
-}
-
-func helpText() string {
-	var b strings.Builder
-	for i, c := range satCommandList {
-		if i > 0 {
-			b.WriteString("\n")
-		}
-		fmt.Fprintf(&b, "%s - %s", c.command, c.description)
-	}
-	return b.String()
-}
-
-func helpMarkdown() string {
-	var b strings.Builder
-	for i, c := range satCommandList {
-		if i > 0 {
-			b.WriteString("\n")
-		}
-		fmt.Fprintf(&b, "**%s** — %s", c.command, c.description)
-	}
-	return b.String()
-}
-
 func (s *server) handleBotCommand(text string, msg review.MessageContext) botReply {
 	fields := strings.Fields(text)
 	if len(fields) < 2 {
-		return botReply{
-			text: helpText(),
-			md:   &lark.MarkdownCard{Title: "Saturnus Commands", Content: helpMarkdown()},
-		}
+		return helpReply(nil)
 	}
 	switch fields[1] {
 	case "help":
-		return botReply{
-			text: helpText(),
-			md:   &lark.MarkdownCard{Title: "Saturnus Commands", Content: helpMarkdown()},
-		}
+		return helpReply(fields[2:])
 	case "sessions":
 		return s.sessionsReply()
 	case "pending":
@@ -2752,7 +2668,7 @@ func (s *server) handleBotCommand(text string, msg review.MessageContext) botRep
 		}
 		return s.clusterActionsReply(fields[2], hours)
 	default:
-		return botReply{text: "Unknown command. Type /sat help to see all commands."}
+		return botReply{text: "Unknown command. Type /sat help to see command modules."}
 	}
 }
 

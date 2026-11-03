@@ -50,7 +50,7 @@ func TestResetReviewCommand(t *testing.T) {
 	if !strings.Contains(description.text, "context=ctx_") || !strings.Contains(description.md.Content, "**Context**:") {
 		t.Fatal("reset context missing from describe")
 	}
-	if !isReviewRequest("/sat reset "+req.ID) || !strings.Contains(helpText(), "/sat reset <review_id>") {
+	if !isReviewRequest("/sat reset "+req.ID) || !strings.Contains(helpReply([]string{"review"}).text, "/sat reset <review_id>") {
 		t.Fatal("reset command missing from routing/help")
 	}
 }

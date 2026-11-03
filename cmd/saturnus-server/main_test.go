@@ -439,26 +439,6 @@ func TestPRsReplyNoWhitelistedRepos(t *testing.T) {
 	}
 }
 
-func TestHelpCoversAllCommands(t *testing.T) {
-	text := helpText()
-	for _, c := range satCommandList {
-		if !strings.Contains(text, c.command) {
-			t.Fatalf("help text missing command %q", c.command)
-		}
-	}
-	md := helpMarkdown()
-	if !strings.Contains(md, "**/sat help**") {
-		t.Fatalf("help markdown missing bold command:\n%s", md)
-	}
-	if len(satCommandList) != len(helpMarkdownLines(md)) {
-		t.Fatalf("markdown line count mismatch")
-	}
-}
-
-func helpMarkdownLines(md string) []string {
-	return strings.Split(strings.TrimRight(md, "\n"), "\n")
-}
-
 func TestTruncateText(t *testing.T) {
 	if got := truncateText("abc", 5); got != "abc" {
 		t.Fatalf("expected no truncation, got %q", got)

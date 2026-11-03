@@ -93,9 +93,18 @@ Configure the Lark event callback URL to:
 https://<public-domain>/lark/events
 ```
 
+`/sat` and `/sat help` show a short module directory. Use a module's help
+command to view its command syntax:
+
+- `/sat help review` — PR reviews, findings, notifications, and follow-up
+- `/sat help pr` — PR tracking and CI checks
+- `/sat help task` — feature tasks and related items
+- `/sat help session` — tool sessions and approvals
+- `/sat help admin` — groups and user lookup
+
 Supported text commands:
 
-- `/sat help` — show all available commands
+- `/sat help [module]` — show the module directory or one module's commands
 - `/sat sessions`
 - `/sat pending`
 - `/sat session <session_id>`

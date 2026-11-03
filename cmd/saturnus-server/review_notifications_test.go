@@ -53,7 +53,7 @@ func TestRequesterNotificationsCommand(t *testing.T) {
 			}
 		}
 	}
-	if !isReviewRequest("/sat notifications rvw_notice") || !strings.Contains(helpText(), "/sat notifications <review_id> [page]") {
+	if !isReviewRequest("/sat notifications rvw_notice") || !strings.Contains(helpReply([]string{"review"}).text, "/sat notifications <review_id> [page]") {
 		t.Fatal("command missing from group routing or help")
 	}
 }

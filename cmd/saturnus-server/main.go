@@ -1529,9 +1529,21 @@ func (s *server) tasksReply(mode string) botReply {
 		tasks = tasks[:10]
 	}
 	rows := make([]map[string]any, 0, len(tasks))
+	var taskLinks strings.Builder
 	for _, task := range tasks {
+		idCell := taskDetailText(task.ID, 100)
+		if link, err := s.store.GetTaskLarkLink(task.ID); err == nil {
+			if link.GUID != "" && link.URL != "" {
+				idCell = taskDetailLink(task.ID, link.URL)
+				if strings.HasPrefix(idCell, "[") {
+					fmt.Fprintf(&taskLinks, "\n%s: %s", task.ID, link.URL)
+				}
+			}
+		} else if !errors.Is(err, store.ErrNotFound) {
+			log.Printf("saturnus: unable to load Lark task link for %s: %v", task.ID, err)
+		}
 		rows = append(rows, map[string]any{
-			"id":        task.ID,
+			"id":        idCell,
 			"status":    taskStatusOption(task.Status),
 			"title":     task.Title,
 			"issue":     issueRef(task),
@@ -1544,11 +1556,11 @@ func (s *server) tasksReply(mode string) botReply {
 		title = "Archived Tasks"
 	}
 	return botReply{
-		text: s.tasks.FormatList(tasks),
+		text: s.tasks.FormatList(tasks) + taskLinks.String(),
 		table: &lark.TableCard{
 			Title: title,
 			Columns: []lark.TableColumn{
-				{Name: "id", Display: "ID", DataType: lark.ColumnText, Width: "18%"},
+				{Name: "id", Display: "ID", DataType: lark.ColumnMD, Width: "18%"},
 				{Name: "status", Display: "Status", DataType: lark.ColumnOption, Width: "14%"},
 				{Name: "title", Display: "Title", DataType: lark.ColumnText, Width: "34%"},
 				{Name: "issue", Display: "Issue", DataType: lark.ColumnText, Width: "16%"},

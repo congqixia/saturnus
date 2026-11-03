@@ -137,7 +137,7 @@ Supported text commands:
 - `/sat whois <name|email|mobile>` — resolve a user to open_id via the contact API
 - `/sat reply <review_id> <message>` — reviewer replies to the requester via DM
 - `/sat requester <review_id> @user|ou_xxx` — update an existing review's requester (mention the user, or pass an open_id); archived reviews are rejected
-- `/sat tasks` — list feature tasks (archived tasks are hidden)
+- `/sat tasks` — list feature tasks (archived tasks are hidden); linked task IDs open their Feishu tasks
 - `/sat tasks all|archived` — list tasks including archived, or only archived
 - `/sat task <task_id> [page]` — show task details; paginate related items
 - `/sat task add-ref <task_id> <url> [title]` — attach an HTTP(S) reference URL

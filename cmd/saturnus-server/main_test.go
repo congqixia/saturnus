@@ -1008,6 +1008,64 @@ func TestTasksReplyListsAndFilters(t *testing.T) {
 	}
 }
 
+func TestTasksReplyLinksTaskIDToLark(t *testing.T) {
+	srv, st := newTasksTestServer(t, nil)
+	defer st.Close()
+	linked, err := srv.tasks.CreateIndependent("Linked", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlinked, err := srv.tasks.CreateIndependent("Unlinked", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := srv.tasks.CreateIndependent("Pending", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid, err := srv.tasks.CreateIndependent("Invalid URL", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ReserveTaskLarkCreation(linked.ID, "{}"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetTaskLarkRemote(linked.ID, "guid", "https://applink.feishu.cn/client/todo/detail?guid=guid"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ReserveTaskLarkCreation(pending.ID, "{}"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ReserveTaskLarkCreation(invalid.ID, "{}"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetTaskLarkRemote(invalid.ID, "bad-guid", "javascript:alert(1)"); err != nil {
+		t.Fatal(err)
+	}
+	reply := srv.tasksReply("")
+	if reply.table == nil || reply.table.Columns[0].DataType != lark.ColumnMD {
+		t.Fatalf("missing markdown ID column: %#v", reply.table)
+	}
+	rows := map[string]any{}
+	for _, row := range reply.table.Rows {
+		rows[row["title"].(string)] = row["id"]
+	}
+	want := taskDetailLink(linked.ID, "https://applink.feishu.cn/client/todo/detail?guid=guid")
+	if rows["Linked"] != want || rows["Unlinked"] != taskDetailText(unlinked.ID, 100) || rows["Pending"] != taskDetailText(pending.ID, 100) || rows["Invalid URL"] != taskDetailText(invalid.ID, 100) {
+		t.Fatalf("unexpected rows: %#v", rows)
+	}
+	if !strings.Contains(reply.text, linked.ID+": https://applink.feishu.cn/") {
+		t.Fatalf("fallback missing link: %q", reply.text)
+	}
+	if _, err := st.CloseTask(linked.ID); err != nil {
+		t.Fatal(err)
+	}
+	archived := srv.tasksReply("archived")
+	if archived.table == nil || len(archived.table.Rows) != 1 || archived.table.Rows[0]["id"] != want {
+		t.Fatalf("archived link missing: %#v", archived.table)
+	}
+}
+
 func TestTaskCommandCreateAndDetail(t *testing.T) {
 	srv, _ := newTasksTestServer(t, map[string]string{"a/b": "/tmp/a"})
 	reply := srv.taskCommand([]string{"/sat", "task", "create", "https://github.com/a/b/issues/9"}, "/sat task create https://github.com/a/b/issues/9")

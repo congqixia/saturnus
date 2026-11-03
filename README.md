@@ -130,7 +130,9 @@ Supported text commands:
 - `/sat requester <review_id> @user|ou_xxx` — update an existing review's requester (mention the user, or pass an open_id); archived reviews are rejected
 - `/sat tasks` — list feature tasks (archived tasks are hidden)
 - `/sat tasks all|archived` — list tasks including archived, or only archived
-- `/sat task <task_id>` — show one task: issue, design docs, and per-PR progress
+- `/sat task <task_id> [page]` — show task details; paginate related items
+- `/sat task add-ref <task_id> <url> [title]` — attach an HTTP(S) reference URL
+- `/sat task rm-ref <task_id> <ref_id>` — detach a reference URL
 - `/sat task create <issue-url>` — create a task from a GitHub issue
 - `/sat task add-doc <task_id> <owner/repo:path>` — attach a local design doc (a repo-relative path inside the whitelisted checkout) to a task
 - `/sat task rm-doc <task_id> <doc_id>` — detach a design doc
@@ -878,12 +880,20 @@ Workflow:
 /sat task bind-issue <task_id> https://github.com/acme/foo/issues/42
 /sat task add-session <task_id> codex <session_id> analyze
 /sat task add-session <task_id> opencode <session_id> coding
+/sat task add-ref <task_id> https://example.com/design Design proposal
+/sat task rm-ref <task_id> <ref_id>
 /sat task rm-session <task_id> <link_id>
 /sat task add-doc <task_id> acme/foo:docs/plan/feature.md  # attach a design doc
 /sat task add-pr <task_id> https://github.com/acme/foo/pull/5  # attach a PR
 /sat task refresh <task_id>     # re-sync issue/PR/review/Feishu-task state
 /sat task <task_id>             # show the full picture
 ```
+
+Task details use a bounded card and show up to three items per category on each
+page; use `/sat task <task_id> 2` for the next page. The card displays reference
+IDs for removal. The task detail API also returns all references in `refs`;
+references can be added or removed through `POST /api/tasks/{id}/refs` and
+`DELETE /api/tasks/{id}/refs/{ref_id}`. URLs are stored, not fetched.
 
 Per-PR progress is tracked **standalone**: each `task_prs` row keeps its own
 snapshot of PR state, review status, and Feishu task id/url. The snapshot is
@@ -899,6 +909,21 @@ The task detail shows the links in the bot and web UI. The HTTP API supports
 `PUT /api/tasks/{id}/issue` with `issue_url`, and `POST`/`DELETE` on
 `/api/tasks/{id}/sessions` (DELETE uses the link ID as a path suffix). A session
 link accepts `tool`, `session_id`, and optional `purpose` and `note`.
+
+The Tasks panel can also create tasks, bind issues, link PRs, and link or unlink
+sessions. To link a Codex session when its Saturnus hook starts, set the task ID
+in the Codex process environment before starting or resuming it:
+
+```sh
+export SATURNUS_TASK_ID=tsk_example
+export SATURNUS_TASK_PURPOSE=coding  # optional
+codex
+```
+
+This requires the Codex hook and a server with Tasks enabled. On resume the hook
+keeps an existing link unchanged. If linking fails, it logs the error and reports
+the failure in hook context; Codex continues and the session can be linked
+manually. OpenCode session links remain manual.
 
 Environment variables:
 

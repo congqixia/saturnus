@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -179,6 +180,32 @@ func (s *Service) Docs(taskID string) []store.TaskDoc {
 // PRs returns the linked PRs of a task.
 func (s *Service) PRs(taskID string) []store.TaskPR {
 	return s.store.ListTaskPRs(taskID)
+}
+
+// AddRef stores an explicit external reference; it does not fetch the URL.
+func (s *Service) AddRef(taskID, rawURL, title string) (store.TaskRef, error) {
+	if !s.cfg.Enabled {
+		return store.TaskRef{}, ErrDisabled
+	}
+	rawURL = strings.TrimSpace(rawURL)
+	title = strings.TrimSpace(title)
+	if len(rawURL) > 1024 || len(title) > 200 {
+		return store.TaskRef{}, errors.New("URL or title is too long")
+	}
+	u, err := url.ParseRequestURI(rawURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
+		return store.TaskRef{}, errors.New("reference must be an HTTP(S) URL without credentials")
+	}
+	return s.store.AddTaskRef(store.TaskRef{TaskID: taskID, URL: rawURL, Title: title})
+}
+
+func (s *Service) Refs(taskID string) ([]store.TaskRef, error) { return s.store.ListTaskRefs(taskID) }
+
+func (s *Service) RemoveRef(taskID, refID string) error {
+	if !s.cfg.Enabled {
+		return ErrDisabled
+	}
+	return s.store.RemoveTaskRef(taskID, refID)
 }
 
 // AddDoc attaches a local design doc. ref is "owner/repo:path" (repo-relative

@@ -321,6 +321,23 @@ pre {
   overflow: auto;
 }
 
+.task-actions {
+  display: grid;
+  gap: 12px;
+  margin-top: 18px;
+  justify-items: start;
+}
+
+.task-form {
+  display: grid;
+  gap: 8px;
+  width: 100%;
+}
+
+.task-form > .n-space { width: 100%; }
+.task-tool { min-width: 130px; }
+.task-session-row { display: flex; align-items: center; gap: 12px; overflow-wrap: anywhere; }
+
 .task-docs,
 .task-prs {
   margin-top: 12px;

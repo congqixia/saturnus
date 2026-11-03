@@ -21,9 +21,23 @@ import {
 import { Check, RefreshCw, X, Zap, ZapOff } from 'lucide-vue-next'
 import { formatTime, pretty, type Approval, type Event, type Review, type ReviewFinding, type Session, type Task, type TaskPR } from './api'
 import { useControlPlaneStore } from './stores/controlPlane'
+import TaskActions from './TaskActions.vue'
 
 const store = useControlPlaneStore()
 let timer: number | undefined
+
+async function taskCreated(id: string) {
+  store.selectedTaskId = id
+  store.selectedTask = null
+  store.selectedTaskDocs = []
+  store.selectedTaskPrs = []
+  store.selectedTaskSessions = []
+  await store.refresh()
+}
+
+async function taskChanged(id: string) {
+  if (store.selectedTaskId === id) await store.refresh()
+}
 
 onMounted(() => {
   void store.refresh()
@@ -568,6 +582,7 @@ import { h } from 'vue'
                 :row-props="(row: Task) => ({ onClick: () => store.selectTask(row.id), style: 'cursor: pointer' })"
               />
               <NEmpty v-else class="empty-state" description="No tasks" />
+              <TaskActions :key="store.selectedTaskId" :task="store.selectedTask" :sessions="store.selectedTaskSessions" @created="taskCreated" @changed="taskChanged" />
               <template v-if="store.selectedTask">
                 <NDescriptions bordered :column="2" label-placement="left" size="small" class="review-detail">
                   <NDescriptionsItem label="Task">
@@ -602,16 +617,6 @@ import { h } from 'vue'
                   <ul>
                     <li v-for="doc in store.selectedTaskDocs" :key="doc.id">
                       <code>{{ doc.repo }}:{{ doc.path }}</code>
-                    </li>
-                  </ul>
-                </div>
-                <div v-if="store.selectedTaskSessions.length" class="task-docs">
-                  <strong>Sessions</strong>
-                  <ul>
-                    <li v-for="session in store.selectedTaskSessions" :key="session.id">
-                      <code>{{ session.tool }}:{{ session.session_id }}</code>
-                      <span v-if="session.purpose"> — {{ session.purpose }}</span>
-                      <span v-if="session.note"> — {{ session.note }}</span>
                     </li>
                   </ul>
                 </div>

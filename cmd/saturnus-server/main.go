@@ -178,6 +178,8 @@ func run(ctx context.Context, addr, data, staticDir string) (err error) {
 	mux.HandleFunc("PUT /api/tasks/{task_id}/issue", s.bindTaskIssue)
 	mux.HandleFunc("POST /api/tasks/{task_id}/sessions", s.addTaskSession)
 	mux.HandleFunc("DELETE /api/tasks/{task_id}/sessions/{link_id}", s.removeTaskSession)
+	mux.HandleFunc("POST /api/tasks/{task_id}/refs", s.addTaskRef)
+	mux.HandleFunc("DELETE /api/tasks/{task_id}/refs/{ref_id}", s.removeTaskRef)
 	mux.HandleFunc("POST /api/tasks/{task_id}/docs", s.addTaskDoc)
 	mux.HandleFunc("DELETE /api/tasks/{task_id}/docs/{doc_id}", s.removeTaskDoc)
 	mux.HandleFunc("POST /api/tasks/{task_id}/prs", s.addTaskPR)
@@ -618,12 +620,42 @@ func (s *server) getTask(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
+	refs, err := s.tasks.Refs(task.ID)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"task":     task,
 		"docs":     s.tasks.Docs(task.ID),
 		"prs":      s.tasks.PRs(task.ID),
 		"sessions": links,
+		"refs":     refs,
 	})
+}
+
+func (s *server) addTaskRef(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		URL   string `json:"url"`
+		Title string `json:"title"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	ref, err := s.tasks.AddRef(r.PathValue("task_id"), req.URL, req.Title)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"ref": ref})
+}
+
+func (s *server) removeTaskRef(w http.ResponseWriter, r *http.Request) {
+	if err := s.tasks.RemoveRef(r.PathValue("task_id"), r.PathValue("ref_id")); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *server) createTask(w http.ResponseWriter, r *http.Request) {
@@ -1514,10 +1546,27 @@ func issueRef(task store.Task) string {
 // taskCommand dispatches the /sat task subcommands.
 func (s *server) taskCommand(fields []string, text string) botReply {
 	if len(fields) < 3 {
-		return botReply{text: "Usage: /sat task <task_id> or /sat task <create|create-title|bind-issue|add-session|rm-session|add-doc|rm-doc|add-pr|rm-pr|refresh|close> ..."}
+		return botReply{text: "Usage: /sat task <task_id> [page], or use /sat help for task commands."}
 	}
 	sub := fields[2]
 	switch sub {
+	case "add-ref":
+		if len(fields) < 5 {
+			return botReply{text: "Usage: /sat task add-ref <task_id> <url> [title]"}
+		}
+		ref, err := s.tasks.AddRef(fields[3], fields[4], strings.Join(fields[5:], " "))
+		if err != nil {
+			return botReply{text: "Add reference failed: " + err.Error()}
+		}
+		return botReply{text: "Reference added " + ref.ID}
+	case "rm-ref":
+		if len(fields) != 5 {
+			return botReply{text: "Usage: /sat task rm-ref <task_id> <ref_id>"}
+		}
+		if err := s.tasks.RemoveRef(fields[3], fields[4]); err != nil {
+			return botReply{text: "Remove reference failed: " + err.Error()}
+		}
+		return botReply{text: "Reference removed " + fields[4]}
 	case "create-title":
 		title := strings.TrimSpace(strings.TrimPrefix(text, strings.Join(fields[:3], " ")))
 		task, err := s.tasks.CreateIndependent(title, "")
@@ -1627,28 +1676,44 @@ func (s *server) taskCommand(fields []string, text string) botReply {
 		if err != nil {
 			return botReply{text: "Task not found. Use /sat task <task_id> or /sat help for task commands."}
 		}
-		return s.taskDetailReply(task)
+		page := 1
+		if len(fields) > 4 {
+			return botReply{text: "Usage: /sat task <task_id> [page]"}
+		}
+		if len(fields) == 4 {
+			page, err = strconv.Atoi(fields[3])
+			if err != nil || page < 1 {
+				return botReply{text: "Page must be a positive number."}
+			}
+		}
+		return s.taskDetailPage(task, page)
 	}
 }
 
 func (s *server) taskDetailReply(task store.Task) botReply {
+	return s.taskDetailPage(task, 1)
+}
+
+func (s *server) taskDetailPage(task store.Task, page int) botReply {
 	docs := s.tasks.Docs(task.ID)
 	prs := s.tasks.PRs(task.ID)
 	links, err := s.store.ListTaskSessions(task.ID)
-	sessionText := ""
 	if err != nil {
-		sessionText = "\nSessions unavailable: " + err.Error()
-	} else if len(links) > 0 {
-		sessionText = "\n\nSessions:"
-		for _, link := range links {
-			sessionText += fmt.Sprintf("\n- %s %s %s %s", link.ID, link.Tool, link.SessionID, link.Purpose)
-		}
+		return botReply{text: "Unable to load task sessions: " + err.Error()}
+	}
+	refs, err := s.tasks.Refs(task.ID)
+	if err != nil {
+		return botReply{text: "Unable to load task references: " + err.Error()}
+	}
+	content, pages := formatBoundedTaskDetail(task, docs, prs, links, refs, page)
+	if page > pages {
+		return botReply{text: fmt.Sprintf("Page %d is unavailable; this task has %d page(s).", page, pages)}
 	}
 	return botReply{
-		text: s.tasks.FormatOne(task, docs, prs) + sessionText,
+		text: strings.ReplaceAll(content, "**Docs**", "docs:"),
 		md: &lark.MarkdownCard{
 			Title:   "Task " + task.ID,
-			Content: formatTaskMarkdown(task, docs, prs) + escapeMarkdown(sessionText),
+			Content: content,
 		},
 	}
 }
@@ -2371,7 +2436,9 @@ var satCommandList = []struct {
 	{"/sat requester <review_id> @user|ou_xxx", "update a review's requester (mention the user, or pass an open_id)"},
 	{"/sat tasks", "list feature tasks (archived tasks are hidden)"},
 	{"/sat tasks all|archived", "list tasks including archived, or only archived"},
-	{"/sat task <task_id>", "show one task: issue, docs, and per-PR progress"},
+	{"/sat task <task_id> [page]", "show task details and related items"},
+	{"/sat task add-ref <task_id> <url> [title]", "attach a reference URL"},
+	{"/sat task rm-ref <task_id> <ref_id>", "detach a reference URL"},
 	{"/sat task create <issue-url>", "create a task from a GitHub issue"},
 	{"/sat task create-title <title>", "create a task without an issue"},
 	{"/sat task bind-issue <task_id> <issue-url>", "bind an issue to a task"},

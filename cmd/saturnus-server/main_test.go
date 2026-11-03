@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,6 +13,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"saturnus/internal/lark"
 	"saturnus/internal/review"
@@ -1042,6 +1045,114 @@ func TestTaskCommandCreateAndDetail(t *testing.T) {
 	missing := srv.taskCommand([]string{"/sat", "task", "tsk_missing"}, "/sat task tsk_missing")
 	if !strings.Contains(missing.text, "Task not found") {
 		t.Fatalf("expected not-found reply, got %q", missing.text)
+	}
+}
+
+func TestTaskReferencesAndDetailPagination(t *testing.T) {
+	srv, st := newTasksTestServer(t, nil)
+	defer st.Close()
+	task, err := srv.tasks.CreateIndependent("Demo", "A task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := srv.tasks.CreateIndependent("Other", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var refID string
+	for i := 0; i < 4; i++ {
+		url := fmt.Sprintf("https://example.com/doc/%d", i)
+		reply := srv.taskCommand([]string{"/sat", "task", "add-ref", task.ID, url, "Design", "notes"}, "")
+		if !strings.HasPrefix(reply.text, "Reference added trf_") {
+			t.Fatalf("add: %s", reply.text)
+		}
+		if i == 0 {
+			refID = strings.Fields(reply.text)[2]
+		}
+	}
+	reply := srv.taskCommand([]string{"/sat", "task", task.ID}, "")
+	if reply.md == nil || !strings.Contains(reply.md.Content, "**Title**: Demo") || !strings.Contains(reply.md.Content, "Design notes") || !strings.Contains(reply.md.Content, "Page 1/2") || !strings.Contains(reply.md.Content, refID) {
+		t.Fatalf("first page: %#v", reply.md)
+	}
+	second := srv.taskCommand([]string{"/sat", "task", task.ID, "2"}, "")
+	if second.md == nil || !strings.Contains(second.md.Content, "example.com/doc/3") || strings.Contains(second.md.Content, refID) {
+		t.Fatalf("second page: %#v", second.md)
+	}
+	if bad := srv.taskCommand([]string{"/sat", "task", task.ID, "0"}, ""); !strings.Contains(bad.text, "positive") {
+		t.Fatal(bad.text)
+	}
+	if bad := srv.taskCommand([]string{"/sat", "task", "rm-ref", other.ID, refID}, ""); !strings.Contains(bad.text, "failed") {
+		t.Fatal(bad.text)
+	}
+	if bad := srv.taskCommand([]string{"/sat", "task", "add-ref", task.ID, "javascript:alert(1)"}, ""); !strings.Contains(bad.text, "failed") {
+		t.Fatal(bad.text)
+	}
+	if ok := srv.taskCommand([]string{"/sat", "task", "rm-ref", task.ID, refID}, ""); !strings.Contains(ok.text, "removed") {
+		t.Fatal(ok.text)
+	}
+	if _, err := st.CloseTask(task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.tasks.AddRef(task.ID, "https://example.com/archived", ""); err == nil {
+		t.Fatal("added reference to archived task")
+	}
+}
+
+func TestTaskDetailBoundedAndUTF8(t *testing.T) {
+	huge := strings.Repeat("界\\\"", 10000)
+	task := store.Task{ID: "tsk_test", Title: huge, Description: huge, RefreshError: huge}
+	docs := []store.TaskDoc{{ID: "tdc_1", Repo: huge, Path: huge}}
+	prs := []store.TaskPR{{Repo: huge, PRNumber: 1, PRURL: "https://example.com/" + strings.Repeat("x", 3000), PRTitle: huge}}
+	sessions := []store.TaskSession{{ID: "tss_1", SessionID: huge, Note: huge}}
+	refs := []store.TaskRef{{ID: "trf_1", URL: "https://example.com/" + strings.Repeat("a", 1000), Title: huge}}
+	content, pages := formatBoundedTaskDetail(task, docs, prs, sessions, refs, 1)
+	if pages != 1 || !utf8.ValidString(content) {
+		t.Fatalf("bad content or pages %d", pages)
+	}
+	once, _ := json.Marshal(content)
+	twice, _ := json.Marshal(string(once))
+	if len(twice) > taskDetailEncodedBudget {
+		t.Fatalf("encoded content too long: %d", len(twice))
+	}
+	if strings.Contains(content, strings.Repeat("x", 1025)) {
+		t.Fatal("unsafe oversized URL shown")
+	}
+}
+
+func TestTaskReferenceAPI(t *testing.T) {
+	srv, st := newTasksTestServer(t, nil)
+	defer st.Close()
+	task, err := srv.tasks.CreateIndependent("Task", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"url":"https://example.com/design","title":"Design"}`))
+	req.SetPathValue("task_id", task.ID)
+	recorder := httptest.NewRecorder()
+	srv.addTaskRef(recorder, req)
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("add: %d %s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Ref store.TaskRef `json:"ref"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	get := httptest.NewRequest(http.MethodGet, "/", nil)
+	get.SetPathValue("task_id", task.ID)
+	recorder = httptest.NewRecorder()
+	srv.getTask(recorder, get)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), response.Ref.ID) {
+		t.Fatalf("get: %d %s", recorder.Code, recorder.Body.String())
+	}
+	del := httptest.NewRequest(http.MethodDelete, "/", nil)
+	del.SetPathValue("task_id", task.ID)
+	del.SetPathValue("ref_id", response.Ref.ID)
+	recorder = httptest.NewRecorder()
+	srv.removeTaskRef(recorder, del)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("delete: %d %s", recorder.Code, recorder.Body.String())
 	}
 }
 

@@ -90,8 +90,15 @@ export const useControlPlaneStore = defineStore('controlPlane', {
       this.selectedReviewFindings = detail.findings ?? []
     },
     async selectTask(id: string, updateSelectedId = true) {
-      if (updateSelectedId) this.selectedTaskId = id
+      if (updateSelectedId && this.selectedTaskId !== id) {
+        this.selectedTaskId = id
+        this.selectedTask = null
+        this.selectedTaskDocs = []
+        this.selectedTaskPrs = []
+        this.selectedTaskSessions = []
+      }
       const detail = await api<{ task: Task; docs: TaskDoc[]; prs: TaskPR[]; sessions: TaskSession[] }>(`/api/tasks/${encodeURIComponent(id)}`)
+      if (this.selectedTaskId !== id) return
       this.selectedTask = detail.task
       this.selectedTaskDocs = detail.docs ?? []
       this.selectedTaskPrs = detail.prs ?? []

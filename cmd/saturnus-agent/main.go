@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -152,10 +153,19 @@ func runCodexHook(client apiClient, agentID, sessionID string) {
 			printJSON(map[string]any{})
 			return
 		}
+		contextText := "Saturnus is tracking this Codex session as " + session.ID + "."
+		if taskID := strings.TrimSpace(os.Getenv("SATURNUS_TASK_ID")); taskID != "" {
+			if err := linkCodexTask(client, taskID, session.ID, os.Getenv("SATURNUS_TASK_PURPOSE")); err != nil {
+				hookLog("task association failed for %s: %v", taskID, err)
+				contextText += " Task association failed; check the hook log and link it manually."
+			} else {
+				contextText += " It is linked to task " + taskID + "."
+			}
+		}
 		printJSON(map[string]any{
 			"hookSpecificOutput": map[string]any{
 				"hookEventName":     "SessionStart",
-				"additionalContext": "Saturnus is tracking this Codex session as " + session.ID + ".",
+				"additionalContext": contextText,
 			},
 		})
 	case "PermissionRequest":
@@ -209,6 +219,26 @@ func runCodexHook(client apiClient, agentID, sessionID string) {
 		}
 		printJSON(map[string]any{})
 	}
+}
+
+// linkCodexTask leaves existing links untouched on session resume.
+func linkCodexTask(client apiClient, taskID, sessionID, purpose string) error {
+	path := "/api/tasks/" + url.PathEscape(taskID)
+	var detail struct {
+		Sessions []struct {
+			Tool      string `json:"tool"`
+			SessionID string `json:"session_id"`
+		} `json:"sessions"`
+	}
+	if err := client.getErr(path, &detail); err != nil {
+		return err
+	}
+	for _, link := range detail.Sessions {
+		if link.Tool == "codex" && link.SessionID == sessionID {
+			return nil
+		}
+	}
+	return client.postErr(path+"/sessions", map[string]string{"tool": "codex", "session_id": sessionID, "purpose": strings.TrimSpace(purpose)}, nil)
 }
 
 func runLarkBridge() {

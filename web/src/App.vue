@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, type Component } from 'vue'
+import { computed, onMounted, onUnmounted, ref, type Component } from 'vue'
 import {
   NButton,
+  NAlert,
   NConfigProvider,
   NDataTable,
   NDescriptions,
@@ -25,13 +26,16 @@ import TaskActions from './TaskActions.vue'
 
 const store = useControlPlaneStore()
 let timer: number | undefined
+const taskSyncWarning = ref('')
 
-async function taskCreated(id: string) {
+async function taskCreated(id: string, warning: string) {
+  taskSyncWarning.value = warning
   store.selectedTaskId = id
   store.selectedTask = null
   store.selectedTaskDocs = []
   store.selectedTaskPrs = []
   store.selectedTaskSessions = []
+  store.selectedTaskLark = null
   await store.refresh()
 }
 
@@ -582,6 +586,7 @@ import { h } from 'vue'
                 :row-props="(row: Task) => ({ onClick: () => store.selectTask(row.id), style: 'cursor: pointer' })"
               />
               <NEmpty v-else class="empty-state" description="No tasks" />
+              <NAlert v-if="taskSyncWarning" type="warning" title="Lark task sync failed" closable @close="taskSyncWarning = ''">{{ taskSyncWarning }}</NAlert>
               <TaskActions :key="store.selectedTaskId" :task="store.selectedTask" :sessions="store.selectedTaskSessions" @created="taskCreated" @changed="taskChanged" />
               <template v-if="store.selectedTask">
                 <NDescriptions bordered :column="2" label-placement="left" size="small" class="review-detail">
@@ -590,6 +595,16 @@ import { h } from 'vue'
                   </NDescriptionsItem>
                   <NDescriptionsItem label="Status">
                     {{ store.selectedTask.status }}
+                  </NDescriptionsItem>
+                  <NDescriptionsItem label="Lark task">
+                    <template v-if="store.selectedTaskLark?.guid">
+                      <a v-if="store.selectedTaskLark.url" :href="store.selectedTaskLark.url" target="_blank">{{ store.selectedTaskLark.guid }}</a>
+                      <span v-else>{{ store.selectedTaskLark.guid }}</span>
+                    </template>
+                    <span v-else>{{ store.selectedTaskLark ? 'Pending' : '-' }}</span>
+                  </NDescriptionsItem>
+                  <NDescriptionsItem label="Lark sync error">
+                    {{ store.selectedTaskLark?.last_error || '-' }}
                   </NDescriptionsItem>
                   <NDescriptionsItem label="Issue">
                     <template v-if="store.selectedTask.issue_url">

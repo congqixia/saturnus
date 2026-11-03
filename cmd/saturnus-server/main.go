@@ -109,6 +109,7 @@ func run(ctx context.Context, addr, data, staticDir string) (err error) {
 		workerOnlineWindow: envDuration("SATURNUS_WORKER_ONLINE_WINDOW", 90*time.Second),
 	}
 	taskCfg.Context = ctx
+	taskCfg.Lark = larkClient
 	taskCfg.SyncReview = func(ctx context.Context, repo string, num int, info tasks.PRInfo) error {
 		return s.reviews.SyncPR(ctx, repo, num, review.PRInfo{Title: info.Title, BaseBranch: info.BaseBranch, HeadCommit: info.HeadCommit, State: info.State})
 	}
@@ -185,6 +186,7 @@ func run(ctx context.Context, addr, data, staticDir string) (err error) {
 	mux.HandleFunc("POST /api/tasks/{task_id}/prs", s.addTaskPR)
 	mux.HandleFunc("DELETE /api/tasks/{task_id}/prs/{pr_id}", s.removeTaskPR)
 	mux.HandleFunc("POST /api/tasks/{task_id}/refresh", s.refreshTask)
+	mux.HandleFunc("POST /api/tasks/{task_id}/lark-sync", s.syncTaskLark)
 	mux.HandleFunc("PATCH /api/tasks/{task_id}", s.updateTask)
 	mux.HandleFunc("POST /lark/events", s.larkEvents)
 	mux.Handle("/", spaFileServer(staticDir))
@@ -625,12 +627,21 @@ func (s *server) getTask(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
+	var larkLink any
+	link, err := s.store.GetTaskLarkLink(task.ID)
+	if err == nil {
+		larkLink = link
+	} else if !errors.Is(err, store.ErrNotFound) {
+		writeStoreError(w, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"task":     task,
-		"docs":     s.tasks.Docs(task.ID),
-		"prs":      s.tasks.PRs(task.ID),
-		"sessions": links,
-		"refs":     refs,
+		"task":      task,
+		"docs":      s.tasks.Docs(task.ID),
+		"prs":       s.tasks.PRs(task.ID),
+		"sessions":  links,
+		"refs":      refs,
+		"lark_task": larkLink,
 	})
 }
 
@@ -660,9 +671,10 @@ func (s *server) removeTaskRef(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) createTask(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		IssueURL    string `json:"issue_url"`
-		Title       string `json:"title"`
-		Description string `json:"description"`
+		IssueURL       string `json:"issue_url"`
+		Title          string `json:"title"`
+		Description    string `json:"description"`
+		AssigneeOpenID string `json:"assignee_open_id"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
@@ -678,7 +690,30 @@ func (s *server) createTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"task": task})
+	var syncError string
+	if s.tasks.AutoLarkEnabled() {
+		_, err := s.tasks.SyncLark(r.Context(), task.ID, req.AssigneeOpenID, "")
+		if err != nil {
+			syncError = err.Error()
+		}
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"task": task, "lark_sync_error": syncError})
+}
+
+func (s *server) syncTaskLark(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		AssigneeOpenID string `json:"assignee_open_id"`
+		GroupID        string `json:"group_id"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	link, err := s.tasks.SyncLark(r.Context(), r.PathValue("task_id"), req.AssigneeOpenID, req.GroupID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"lark_task": link})
 }
 
 func (s *server) bindTaskIssue(w http.ResponseWriter, r *http.Request) {
@@ -747,7 +782,8 @@ func (s *server) updateTask(w http.ResponseWriter, r *http.Request) {
 				writeStoreError(w, err)
 				return
 			}
-			writeJSON(w, http.StatusOK, map[string]any{"task": updated})
+			syncError := s.syncExistingTaskLark(r.Context(), task.ID)
+			writeJSON(w, http.StatusOK, map[string]any{"task": updated, "lark_sync_error": syncError})
 			return
 		}
 	}
@@ -756,7 +792,25 @@ func (s *server) updateTask(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"task": updated})
+	syncError := s.syncExistingTaskLark(r.Context(), task.ID)
+	writeJSON(w, http.StatusOK, map[string]any{"task": updated, "lark_sync_error": syncError})
+}
+
+func (s *server) syncExistingTaskLark(ctx context.Context, id string) string {
+	link, err := s.store.GetTaskLarkLink(id)
+	if errors.Is(err, store.ErrNotFound) {
+		return ""
+	}
+	if err != nil {
+		return err.Error()
+	}
+	if link.GUID == "" {
+		return "Lark task creation is pending; use /sat task re-sync " + id
+	}
+	if _, err := s.tasks.SyncLark(ctx, id, "", ""); err != nil {
+		return err.Error()
+	}
+	return ""
 }
 
 func (s *server) addTaskDoc(w http.ResponseWriter, r *http.Request) {
@@ -1544,12 +1598,46 @@ func issueRef(task store.Task) string {
 }
 
 // taskCommand dispatches the /sat task subcommands.
-func (s *server) taskCommand(fields []string, text string) botReply {
+func (s *server) taskCommand(fields []string, text string, sender ...string) botReply {
 	if len(fields) < 3 {
 		return botReply{text: "Usage: /sat task <task_id> [page], or use /sat help for task commands."}
 	}
 	sub := fields[2]
+	assignee := ""
+	if len(sender) > 0 {
+		assignee = sender[0]
+	}
 	switch sub {
+	case "reset-lark-create":
+		if len(fields) != 4 {
+			return botReply{text: "Usage: /sat task reset-lark-create <task_id> (only after confirming no Lark task was created)"}
+		}
+		if err := s.tasks.ResetLarkCreation(context.Background(), fields[3]); err != nil {
+			return botReply{text: "Reset failed: " + err.Error()}
+		}
+		return botReply{text: "Pending creation reset; run /sat task re-sync " + fields[3]}
+	case "re-sync":
+		if len(fields) < 4 || len(fields) > 5 {
+			return botReply{text: "Usage: /sat task re-sync <task_id> [group_id]"}
+		}
+		groupID := ""
+		if len(fields) == 5 {
+			groupID = fields[4]
+		}
+		link, err := s.tasks.SyncLark(context.Background(), fields[3], assignee, groupID)
+		if err != nil {
+			return botReply{text: "Lark task sync failed: " + err.Error()}
+		}
+		return botReply{text: fmt.Sprintf("Lark task synced %s (%s) %s", fields[3], link.GUID, link.URL)}
+	case "link-lark":
+		if len(fields) != 5 {
+			return botReply{text: "Usage: /sat task link-lark <task_id> <lark_guid>"}
+		}
+		link, err := s.tasks.LinkLark(context.Background(), fields[3], fields[4])
+		if err != nil {
+			return botReply{text: "Lark task link failed: " + err.Error()}
+		}
+		return botReply{text: fmt.Sprintf("Lark task linked %s (%s) %s; run /sat task re-sync %s", fields[3], link.GUID, link.URL, fields[3])}
 	case "add-ref":
 		if len(fields) < 5 {
 			return botReply{text: "Usage: /sat task add-ref <task_id> <url> [title]"}
@@ -1573,7 +1661,7 @@ func (s *server) taskCommand(fields []string, text string) botReply {
 		if err != nil {
 			return botReply{text: "Task create failed: " + err.Error()}
 		}
-		return botReply{text: "Task created " + task.ID + " (" + task.Title + ")"}
+		return s.createdTaskReply(task, assignee)
 	case "bind-issue":
 		if len(fields) < 5 {
 			return botReply{text: "Usage: /sat task bind-issue <task_id> <issue-url>"}
@@ -1622,7 +1710,7 @@ func (s *server) taskCommand(fields []string, text string) botReply {
 		if err != nil {
 			return botReply{text: "Task create failed: " + err.Error()}
 		}
-		return botReply{text: "Task created " + task.ID + " (" + task.Title + ")"}
+		return s.createdTaskReply(task, assignee)
 	case "add-doc":
 		if len(fields) < 5 {
 			return botReply{text: "Usage: /sat task add-doc <task_id> <owner/repo:path>"}
@@ -1670,7 +1758,11 @@ func (s *server) taskCommand(fields []string, text string) botReply {
 		if err != nil {
 			return botReply{text: "Close failed: " + err.Error()}
 		}
-		return botReply{text: "Task closed " + task.ID}
+		text := "Task closed " + task.ID
+		if err := s.syncExistingTaskLark(context.Background(), task.ID); err != "" {
+			text += "\nLark task sync failed: " + err
+		}
+		return botReply{text: text}
 	default:
 		task, err := s.tasks.Get(sub)
 		if err != nil {
@@ -1690,6 +1782,19 @@ func (s *server) taskCommand(fields []string, text string) botReply {
 	}
 }
 
+func (s *server) createdTaskReply(task store.Task, assignee string) botReply {
+	text := "Task created " + task.ID + " (" + task.Title + ")"
+	if s.tasks.AutoLarkEnabled() {
+		link, err := s.tasks.SyncLark(context.Background(), task.ID, assignee, "")
+		if err != nil {
+			text += "\nLark task sync failed: " + err.Error()
+		} else {
+			text += "\nLark task: " + link.URL + " (" + link.GUID + ")"
+		}
+	}
+	return botReply{text: text}
+}
+
 func (s *server) taskDetailReply(task store.Task) botReply {
 	return s.taskDetailPage(task, 1)
 }
@@ -1705,7 +1810,30 @@ func (s *server) taskDetailPage(task store.Task, page int) botReply {
 	if err != nil {
 		return botReply{text: "Unable to load task references: " + err.Error()}
 	}
+	var linked *store.TaskLarkLink
+	link, err := s.store.GetTaskLarkLink(task.ID)
+	if err == nil {
+		linked = &link
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return botReply{text: "Unable to load Lark task: " + err.Error()}
+	}
 	content, pages := formatBoundedTaskDetail(task, docs, prs, links, refs, page)
+	if linked != nil {
+		line := "\n\n**Lark task**: " + taskDetailLink(linked.GUID, linked.URL)
+		if linked.GUID == "" {
+			line = "\n\n**Lark task**: pending"
+		}
+		if linked.GroupID != "" {
+			line += "\n**Lark task group**: " + taskDetailText(linked.GroupID, 100)
+		}
+		if linked.SyncedAt != "" {
+			line += "\n**Lark last sync**: " + taskDetailText(linked.SyncedAt, 50)
+		}
+		if linked.LastError != "" {
+			line += "\n**Lark sync error**: " + taskDetailText(linked.LastError, 300)
+		}
+		content += line
+	}
 	if page > pages {
 		return botReply{text: fmt.Sprintf("Page %d is unavailable; this task has %d page(s).", page, pages)}
 	}
@@ -2497,7 +2625,7 @@ func (s *server) handleBotCommand(text string, msg review.MessageContext) botRep
 		}
 		return s.tasksReply(mode)
 	case "task":
-		return s.taskCommand(fields, text)
+		return s.taskCommand(fields, text, msg.SenderOpenID)
 	case "repos":
 		return botReply{text: s.reviews.FormatRepos()}
 	case "prs":
@@ -2769,10 +2897,13 @@ func tasksConfig(repos map[string]string) (tasks.Config, error) {
 		return tasks.Config{}, err
 	}
 	return tasks.Config{
-		Enabled:         os.Getenv("SATURNUS_TASKS_ENABLED") == "1",
-		GHCli:           os.Getenv("SATURNUS_TASKS_GH_CLI"),
-		Repos:           repos,
-		RefreshInterval: interval, RefreshTimeout: timeout,
+		Enabled:            os.Getenv("SATURNUS_TASKS_ENABLED") == "1",
+		GHCli:              os.Getenv("SATURNUS_TASKS_GH_CLI"),
+		Repos:              repos,
+		CreateLarkTask:     os.Getenv("SATURNUS_TASKS_CREATE_LARK_TASK") == "1",
+		LarkTaskGroupID:    os.Getenv("SATURNUS_TASKS_LARK_TASK_GROUP_ID"),
+		LarkAssigneeOpenID: os.Getenv("SATURNUS_TASKS_LARK_ASSIGNEE_OPEN_ID"),
+		RefreshInterval:    interval, RefreshTimeout: timeout,
 	}, nil
 }
 

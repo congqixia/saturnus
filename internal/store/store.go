@@ -678,6 +678,12 @@ func (s *Store) migrate(ctx context.Context) error {
 			UNIQUE(task_id, url)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_task_refs_task ON task_refs(task_id, created_at)`,
+		`CREATE TABLE IF NOT EXISTS task_lark_links (
+			task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+			guid TEXT NOT NULL DEFAULT '', url TEXT NOT NULL DEFAULT '', group_id TEXT NOT NULL DEFAULT '',
+			request_json TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL DEFAULT '',
+			last_error TEXT NOT NULL DEFAULT '', synced_at TEXT NOT NULL DEFAULT ''
+		)`,
 	}
 	statements = append(statements, pullRequestSchema...)
 	for _, stmt := range statements {

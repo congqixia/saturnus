@@ -2,6 +2,7 @@ package lark
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -10,6 +11,26 @@ import (
 	"testing"
 	"time"
 )
+
+func TestCreateTaskIncludesIdempotencyToken(t *testing.T) {
+	client := New(Config{AppID: "id", AppSecret: "secret"})
+	client.token = "token"
+	client.tokenExp = time.Now().Add(time.Hour)
+	client.httpClient.Transport = refreshTransport(func(r *http.Request) (*http.Response, error) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload["client_token"] != "tsk_123" {
+			t.Fatalf("missing idempotency token: %v", payload)
+		}
+		return response(`{"code":0,"data":{"task":{"guid":"guid-1"}}}`), nil
+	})
+	task, err := client.CreateTask(CreateTaskInput{Summary: "task", ClientToken: "tsk_123"})
+	if err != nil || task.GUID != "guid-1" {
+		t.Fatalf("task=%+v err=%v", task, err)
+	}
+}
 
 type refreshTransport func(*http.Request) (*http.Response, error)
 

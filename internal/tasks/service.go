@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"saturnus/internal/keylock"
+	"saturnus/internal/lark"
 	"saturnus/internal/repoconfig"
 	"saturnus/internal/store"
 )
@@ -30,7 +31,19 @@ type Config struct {
 	SyncReview func(context.Context, string, int, PRInfo) error
 	// Repos maps owner/repo -> local checkout path, loaded from the shared
 	// SATURNUS_REVIEW_REPOS or SATURNUS_REVIEW_REPOS_FILE configuration.
-	Repos map[string]string
+	Repos              map[string]string
+	CreateLarkTask     bool
+	LarkTaskGroupID    string
+	LarkAssigneeOpenID string
+	Lark               LarkTasks
+}
+
+type LarkTasks interface {
+	Enabled() bool
+	CreateTask(lark.CreateTaskInput) (lark.Task, error)
+	GetTaskContext(context.Context, string) (lark.Task, error)
+	UpdateTaskContext(context.Context, string, lark.UpdateTaskInput) error
+	AddTaskToList(string, string) error
 }
 
 // ErrArchived is returned when operating on an archived (closed) task.

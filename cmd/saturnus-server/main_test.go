@@ -1028,6 +1028,52 @@ func TestTaskCommandCreateAndDetail(t *testing.T) {
 	}
 }
 
+type taskWorkflowLark struct {
+	input  lark.CreateTaskInput
+	remote lark.Task
+	group  string
+}
+
+func (f *taskWorkflowLark) Enabled() bool { return true }
+func (f *taskWorkflowLark) CreateTask(in lark.CreateTaskInput) (lark.Task, error) {
+	f.input = in
+	f.remote = lark.Task{GUID: "lark-guid", URL: "https://example.com/task", Summary: in.Summary, Description: in.Description}
+	return f.remote, nil
+}
+func (f *taskWorkflowLark) GetTaskContext(context.Context, string) (lark.Task, error) {
+	return f.remote, nil
+}
+func (f *taskWorkflowLark) UpdateTaskContext(_ context.Context, _ string, in lark.UpdateTaskInput) error {
+	if in.Completed != nil {
+		f.remote.Completed = *in.Completed
+	}
+	return nil
+}
+func (f *taskWorkflowLark) AddTaskToList(_, group string) error { f.group = group; return nil }
+
+func TestTaskBotCreatesAndResyncsLarkTask(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	remote := &taskWorkflowLark{}
+	srv := &server{store: st, tasks: tasks.New(st, tasks.Config{Enabled: true, Lark: remote, CreateLarkTask: true, LarkTaskGroupID: "default"})}
+	reply := srv.handleBotCommand("/sat task create-title Work", review.MessageContext{SenderOpenID: "ou_sender"})
+	if !strings.Contains(reply.text, "Lark task:") || len(remote.input.MemberOpenIDs) != 1 || remote.input.MemberOpenIDs[0] != "ou_sender" || remote.group != "default" {
+		t.Fatalf("reply=%s input=%+v group=%s", reply.text, remote.input, remote.group)
+	}
+	id := strings.Fields(reply.text)[2]
+	reply = srv.handleBotCommand("/sat task re-sync "+id+" group-other", review.MessageContext{SenderOpenID: "ou_sender"})
+	if !strings.Contains(reply.text, "Lark task synced") || remote.group != "group-other" {
+		t.Fatalf("reply=%s group=%s", reply.text, remote.group)
+	}
+	reply = srv.handleBotCommand("/sat task close "+id, review.MessageContext{SenderOpenID: "ou_sender"})
+	if !strings.Contains(reply.text, "Task closed") || !remote.remote.Completed {
+		t.Fatalf("reply=%s task=%+v", reply.text, remote.remote)
+	}
+}
+
 func TestTaskReferencesAndDetailPagination(t *testing.T) {
 	srv, st := newTasksTestServer(t, nil)
 	defer st.Close()

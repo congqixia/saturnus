@@ -892,6 +892,7 @@ Workflow:
 /sat task add-ref <task_id> https://example.com/design Design proposal
 /sat task rm-ref <task_id> <ref_id>
 /sat task rm-session <task_id> <link_id>
+/sat task re-sync <task_id> [group_id]  # create or synchronize its Feishu task
 /sat task add-doc <task_id> acme/foo:docs/plan/feature.md  # attach a design doc
 /sat task add-pr <task_id> https://github.com/acme/foo/pull/5  # attach a PR
 /sat task refresh <task_id>     # re-sync issue/PR/review/Feishu-task state
@@ -933,6 +934,42 @@ This requires the Codex hook and a server with Tasks enabled. On resume the hook
 keeps an existing link unchanged. If linking fails, it logs the error and reports
 the failure in hook context; Codex continues and the session can be linked
 manually. OpenCode session links remain manual.
+
+### Feishu task association
+
+To create a Feishu task automatically when a Saturnus task is created, set:
+
+```sh
+export SATURNUS_TASKS_CREATE_LARK_TASK=1
+export SATURNUS_TASKS_LARK_TASK_GROUP_ID=<tasklist-guid> # optional
+export SATURNUS_TASKS_LARK_ASSIGNEE_OPEN_ID=<open-id>  # for API-created tasks
+```
+
+`LARK_APP_ID`, `LARK_APP_SECRET`, task read/write permissions, and access to the
+chosen task group are required. Bot-created tasks use the command sender as
+assignee; API-created tasks can provide `assignee_open_id` or use the configured
+default. A Saturnus task is kept even when its Feishu sync fails; the error is
+returned and shown in task detail.
+
+For an existing Saturnus task run `/sat task re-sync <task_id> [group_id]`.
+The optional group ID overrides the default for that task. An override adds the
+task to that group; it does not remove it from any previous group. Repeated
+syncs reuse the linked GUID. The equivalent API is
+`POST /api/tasks/{id}/lark-sync` with an object containing optional `group_id`
+and `assignee_open_id`. Task details include `lark_task` and the bot shows the
+link. Background refresh updates already linked tasks; it does not create
+Feishu tasks for old records automatically.
+
+Sync updates the title and a marked section in the Feishu description containing
+the Saturnus status, description, issue, PRs and references. Text outside the
+marked section is preserved. Saturnus `done` or `archived` completes the Feishu
+task; an open Saturnus task does not reopen a task completed in Feishu. The
+reverse direction is not synchronized.
+
+If a create request times out, retries use the same saved request and token for
+four minutes. After that, check Feishu before taking action: if the task exists,
+run `/sat task link-lark <task_id> <lark_guid>` then re-sync. Only if no task
+exists, use `/sat task reset-lark-create <task_id>` and then re-sync.
 
 Environment variables:
 

@@ -4,7 +4,7 @@ import { NAlert, NButton, NInput, NSelect, NSpace } from 'naive-ui'
 import { api, type Task, type TaskSession } from './api'
 
 const props = defineProps<{ task: Task | null; sessions: TaskSession[] }>()
-const emit = defineEmits<{ created: [id: string]; changed: [id: string] }>()
+const emit = defineEmits<{ created: [id: string, warning: string]; changed: [id: string] }>()
 
 const showCreate = ref(false)
 const createMode = ref('title')
@@ -41,9 +41,9 @@ async function create() {
     const body = createMode.value === 'issue'
       ? { issue_url: issueURL.value.trim() }
       : { title: title.value.trim(), description: description.value }
-    const result = await api<{ task: Task }>('/api/tasks', { method: 'POST', body: JSON.stringify(body) })
+    const result = await api<{ task: Task; lark_sync_error?: string }>('/api/tasks', { method: 'POST', body: JSON.stringify(body) })
     title.value = ''; description.value = ''; issueURL.value = ''; showCreate.value = false
-    emit('created', result.task.id)
+    emit('created', result.task.id, result.lark_sync_error ?? '')
   })
 }
 

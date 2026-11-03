@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { api, type Approval, type Event, type Review, type ReviewFinding, type ReviewRun, type Session, type Task, type TaskDoc, type TaskPR, type TaskSession } from '../api'
+import { api, type Approval, type Event, type Review, type ReviewFinding, type ReviewRun, type Session, type Task, type TaskDoc, type TaskPR, type TaskSession, type TaskLarkLink } from '../api'
 
 type Health = {
   ok: boolean
@@ -25,6 +25,7 @@ export const useControlPlaneStore = defineStore('controlPlane', {
     selectedTaskDocs: [] as TaskDoc[],
     selectedTaskPrs: [] as TaskPR[],
     selectedTaskSessions: [] as TaskSession[],
+    selectedTaskLark: null as TaskLarkLink | null,
     events: [] as Event[],
     loading: false,
     error: ''
@@ -96,13 +97,15 @@ export const useControlPlaneStore = defineStore('controlPlane', {
         this.selectedTaskDocs = []
         this.selectedTaskPrs = []
         this.selectedTaskSessions = []
+        this.selectedTaskLark = null
       }
-      const detail = await api<{ task: Task; docs: TaskDoc[]; prs: TaskPR[]; sessions: TaskSession[] }>(`/api/tasks/${encodeURIComponent(id)}`)
+      const detail = await api<{ task: Task; docs: TaskDoc[]; prs: TaskPR[]; sessions: TaskSession[]; lark_task: TaskLarkLink | null }>(`/api/tasks/${encodeURIComponent(id)}`)
       if (this.selectedTaskId !== id) return
       this.selectedTask = detail.task
       this.selectedTaskDocs = detail.docs ?? []
       this.selectedTaskPrs = detail.prs ?? []
       this.selectedTaskSessions = detail.sessions ?? []
+      this.selectedTaskLark = detail.lark_task ?? null
     },
     async setAutoPass(enabled: boolean) {
       if (!this.selected) return

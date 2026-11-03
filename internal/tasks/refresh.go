@@ -245,6 +245,14 @@ func (s *Service) refresh(parent context.Context, id string, activeOnly bool, sc
 	checkpoint, stop := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
 	defer stop()
 	result.Task, err = s.store.SaveTaskRefresh(checkpoint, task, activeOnly)
+	if err == nil && s.cfg.Lark != nil && s.cfg.Lark.Enabled() {
+		if link, lookupErr := s.store.GetTaskLarkLink(id); lookupErr == nil && link.GUID != "" {
+			if _, syncErr := s.SyncLark(ctx, id, "", ""); syncErr != nil {
+				result.Errors = append(result.Errors, "lark task: "+syncErr.Error())
+				result.Outcome = "partial"
+			}
+		}
+	}
 	return result, err
 }
 

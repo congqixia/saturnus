@@ -110,6 +110,7 @@ func (c *Client) ReplyMessage(messageID, text string) error {
 }
 
 type CreateTaskInput struct {
+	ClientToken   string
 	Summary       string
 	Description   string
 	Due           time.Time
@@ -137,6 +138,9 @@ func (c *Client) CreateTask(input CreateTaskInput) (Task, error) {
 		"summary":     input.Summary,
 		"description": input.Description,
 		"members":     members,
+	}
+	if input.ClientToken != "" {
+		payload["client_token"] = input.ClientToken
 	}
 	if !input.Due.IsZero() {
 		payload["due"] = map[string]any{"timestamp": fmt.Sprintf("%d", input.Due.UnixMilli())}

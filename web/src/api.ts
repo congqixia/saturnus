@@ -137,6 +137,15 @@ export type TaskSession = {
   created_at: string
 }
 
+export type TaskLarkLink = {
+  task_id: string
+  guid: string
+  url: string
+  group_id: string
+  last_error: string
+  synced_at: string
+}
+
 export type TaskPR = {
  sync_attempted_at?: string
  sync_error: string

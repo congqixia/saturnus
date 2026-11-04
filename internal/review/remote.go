@@ -125,6 +125,10 @@ func (s *Service) JobPayload(req store.ReviewRequest) (workerproto.JobPayload, e
 	if tool == "" {
 		tool = "opencode"
 	}
+	priorFindings, err := s.priorFindingsForRun(s.ctx, req)
+	if err != nil {
+		return workerproto.JobPayload{}, err
+	}
 	return workerproto.JobPayload{
 		Kind:            workerproto.JobReview,
 		ReviewID:        req.ID,
@@ -137,7 +141,7 @@ func (s *Service) JobPayload(req store.ReviewRequest) (workerproto.JobPayload, e
 		RetryReason:     req.RetryReason,
 		SessionID:       req.SessionID,
 		ContextID:       contextID,
-		PriorFindings:   formatPriorFindings(s.store.ListFindings(req.ID)),
+		PriorFindings:   priorFindings,
 		CommandTemplate: s.cfg.CommandTemplate,
 		Guide:           guide,
 		ResultAPIURL:    resultAPIURL,

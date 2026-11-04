@@ -1495,6 +1495,12 @@ func (s *Service) process(id string) {
 		}
 	}
 
+	priorFindings, err := s.priorFindingsForRun(ctx, req)
+	if err != nil {
+		s.finish(&req, "failed", "", err.Error())
+		s.notifyReviewer(req)
+		return
+	}
 	resultAPIURL := s.resultCallbackURL(req.ID, run.ID)
 	args, err := RenderCommand(s.cfg.CommandTemplate, ToolArgs{
 		Repo:          req.Repo,
@@ -1511,7 +1517,7 @@ func (s *Service) process(id string) {
 		RetryNote:     retryNote,
 		ResultAPIURL:  resultAPIURL,
 		ResultToken:   s.cfg.ResultToken,
-		PriorFindings: formatPriorFindings(s.store.ListFindings(req.ID)),
+		PriorFindings: priorFindings,
 	})
 	if err != nil {
 		s.finish(&req, "failed", "", "render command: "+err.Error())

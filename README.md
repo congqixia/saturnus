@@ -464,6 +464,20 @@ New findings are submitted without an `id` (they default to `open`). On the
 next round a finding can also be resolved on GitHub (see below). The status is
 shown in `/sat findings` and the web UI; `/sat describe review` includes status counts.
 
+Before a run with previously posted findings, the server fetches all pages of
+GitHub inline comments and attaches each finding's original comment and replies
+(author, timestamp, body and link) to the review prompt. This also happens when
+resuming a session or resetting its context. The tool must evaluate the replies
+against the code: an accepted explanation needing no change can be `commented`,
+while a disagreement must explain why the finding remains `open`.
+
+The server needs authenticated `gh` access for this refresh. Fetch or decode
+failures prevent remote dispatch (the review stays pending with a
+`dispatch_failed` log) or fail a local run, rather than treating missing feedback
+as an empty discussion. Context exceeding 64 KiB is also rejected explicitly
+instead of silently omitting replies. Custom command templates must include
+`{{.PriorFindings | shellquote}}` to pass this context to the tool.
+
 ### Posting findings to GitHub
 
 When `SATURNUS_REVIEW_POST_INLINE_COMMENTS=1` and a review finishes with a

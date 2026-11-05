@@ -1,9 +1,11 @@
 package tasks
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
+	"log"
 	"reflect"
 	"strings"
 	"sync"
@@ -12,6 +14,64 @@ import (
 	"saturnus/internal/lark"
 	"saturnus/internal/store"
 )
+
+func TestLarkTaskGroupDiagnostics(t *testing.T) {
+	var logs bytes.Buffer
+	old := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(old) })
+	st, err := store.Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	remote := &fakeTaskLark{}
+	svc := New(st, Config{Enabled: true, Lark: remote, LarkDebug: true, LarkTaskGroupID: "group-1"})
+	task, err := svc.CreateIndependent("task", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.LogLarkAutoSync(task.ID, "bot")
+	if _, err := svc.SyncLark(context.Background(), task.ID, "owner", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.SyncLark(context.Background(), task.ID, "owner", ""); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"event=auto_sync_decision", "source=\"bot\"", "event=group_resolved", "source=\"configured\"", "event=group_add_start", "event=group_add_complete", "reason=\"already_recorded\"", "group_id=\"group-1\"", task.ID} {
+		if !strings.Contains(logs.String(), want) {
+			t.Fatalf("missing %q in logs: %s", want, logs.String())
+		}
+	}
+	logs.Reset()
+	remote2 := &fakeTaskLark{groupErr: errors.New("permission denied")}
+	svc2 := New(st, Config{Enabled: true, Lark: remote2, LarkTaskGroupID: "group-2"})
+	task2, err := svc2.CreateIndependent("task 2", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc2.SyncLark(context.Background(), task2.ID, "owner", ""); err == nil {
+		t.Fatal("expected group failure")
+	}
+	for _, want := range []string{"event=failed", "stage=\"add_to_group\"", "group_id=\"group-2\"", "permission denied"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Fatalf("missing %q in error log: %s", want, logs.String())
+		}
+	}
+	logs.Reset()
+	remote3 := &fakeTaskLark{}
+	svc3 := New(st, Config{Enabled: true, Lark: remote3, LarkDebug: true})
+	task3, err := svc3.CreateIndependent("task 3", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc3.SyncLark(context.Background(), task3.ID, "owner", ""); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(logs.String(), "reason=\"no_group_configured\"") {
+		t.Fatalf("missing no-group reason: %s", logs.String())
+	}
+}
 
 type fakeTaskLark struct {
 	mu        sync.Mutex

@@ -12,6 +12,21 @@ import (
 	"time"
 )
 
+func TestTaskGroupAPIErrorIncludesCodeAndRequestID(t *testing.T) {
+	client := New(Config{AppID: "id", AppSecret: "secret"})
+	client.token = "token"
+	client.tokenExp = time.Now().Add(time.Hour)
+	client.httpClient.Transport = refreshTransport(func(r *http.Request) (*http.Response, error) {
+		resp := response(`{"code":1470001,"msg":"permission denied"}`)
+		resp.Header.Set("X-Tt-Logid", "request-123")
+		return resp, nil
+	})
+	err := client.AddTaskToList("task-guid", "group-guid")
+	if err == nil || !strings.Contains(err.Error(), "code=1470001") || !strings.Contains(err.Error(), "request_id=request-123") {
+		t.Fatalf("missing diagnostic details: %v", err)
+	}
+}
+
 func TestCreateTaskIncludesIdempotencyToken(t *testing.T) {
 	client := New(Config{AppID: "id", AppSecret: "secret"})
 	client.token = "token"

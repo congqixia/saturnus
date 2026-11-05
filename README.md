@@ -957,6 +957,7 @@ To create a Feishu task automatically when a Saturnus task is created, set:
 export SATURNUS_TASKS_CREATE_LARK_TASK=1
 export SATURNUS_TASKS_LARK_TASK_GROUP_ID=<tasklist-guid> # optional
 export SATURNUS_TASKS_LARK_ASSIGNEE_OPEN_ID=<open-id>  # for API-created tasks
+export SATURNUS_TASKS_LARK_DEBUG=1  # optional: log task/group sync decisions
 ```
 
 `LARK_APP_ID`, `LARK_APP_SECRET`, task read/write permissions, and access to the
@@ -979,6 +980,16 @@ the Saturnus status, description, issue, PRs and references. Text outside the
 marked section is preserved. Saturnus `done` or `archived` completes the Feishu
 task; an open Saturnus task does not reopen a task completed in Feishu. The
 reverse direction is not synchronized.
+
+For group troubleshooting, enable `SATURNUS_TASKS_LARK_DEBUG=1` in the server
+environment and restart it. Search the server log for `task_lark_sync` and the
+Saturnus task ID. The log shows whether automatic sync was enabled, the
+requested, stored and configured group IDs, whether group addition was called
+or skipped (`no_group_configured` or `already_recorded`), and its outcome.
+`lark_task_group` records the HTTP status, Lark API code and request ID without
+logging credentials or task descriptions. Failures are logged even when debug
+is disabled. `already_recorded` means the local database records a successful
+addition; it does not verify current group membership in Lark.
 
 If a create request times out, retries use the same saved request and token for
 four minutes. After that, check Feishu before taking action: if the task exists,

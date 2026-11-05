@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -20,6 +21,7 @@ type Config struct {
 	AppID     string
 	AppSecret string
 	Enabled   bool
+	TaskDebug bool
 }
 
 type Client struct {
@@ -392,19 +394,32 @@ func (c *Client) AddTaskToList(taskGUID, taskListGUID string) error {
 		return err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	raw, readErr := io.ReadAll(resp.Body)
+	requestID := resp.Header.Get("X-Tt-Logid")
+	if requestID == "" {
+		requestID = resp.Header.Get("X-Request-Id")
+	}
+	if c.cfg.TaskDebug {
+		log.Printf("lark_task_group event=response lark_task_guid=%q group_id=%q http_status=%d request_id=%q", taskGUID, taskListGUID, resp.StatusCode, requestID)
+	}
+	if readErr != nil {
+		return fmt.Errorf("lark add task to tasklist: read response: %w", readErr)
+	}
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("lark add task to tasklist failed: %s (%s)", resp.Status, larkErrorDetail(raw))
+		return fmt.Errorf("lark add task to tasklist failed: %s (%s), request_id=%s", resp.Status, larkErrorDetail(raw), requestID)
 	}
 	var out struct {
 		Code int    `json:"code"`
 		Msg  string `json:"msg"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return err
+		return fmt.Errorf("lark add task to tasklist: decode response (request_id=%s): %w", requestID, err)
+	}
+	if c.cfg.TaskDebug {
+		log.Printf("lark_task_group event=api_result lark_task_guid=%q group_id=%q code=%d request_id=%q", taskGUID, taskListGUID, out.Code, requestID)
 	}
 	if out.Code != 0 {
-		return fmt.Errorf("lark add task to tasklist failed: %s", out.Msg)
+		return fmt.Errorf("lark add task to tasklist failed: code=%d msg=%q request_id=%s", out.Code, out.Msg, requestID)
 	}
 	return nil
 }

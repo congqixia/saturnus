@@ -35,6 +35,7 @@ type Config struct {
 	CreateLarkTask     bool
 	LarkTaskGroupID    string
 	LarkAssigneeOpenID string
+	LarkDebug          bool
 	Lark               LarkTasks
 }
 

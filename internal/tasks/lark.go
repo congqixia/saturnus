@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -17,6 +18,12 @@ const larkBegin = "[Saturnus task details]"
 const larkEnd = "[/Saturnus task details]"
 
 func (s *Service) AutoLarkEnabled() bool { return s.cfg.CreateLarkTask }
+
+func (s *Service) LogLarkAutoSync(taskID, source string) {
+	if s.cfg.LarkDebug {
+		log.Printf("task_lark_sync event=auto_sync_decision task_id=%q source=%q enabled=%t configured_group_id=%q lark_enabled=%t", taskID, source, s.cfg.CreateLarkTask, s.cfg.LarkTaskGroupID, s.cfg.Lark != nil && s.cfg.Lark.Enabled())
+	}
+}
 
 func (s *Service) ResetLarkCreation(ctx context.Context, id string) error {
 	if !s.cfg.Enabled {
@@ -69,21 +76,37 @@ func (s *Service) LinkLark(ctx context.Context, id, guid string) (store.TaskLark
 // SyncLark creates a missing task or updates an existing one. A persisted,
 // immutable create request makes immediate retries safe within Lark's token window.
 func (s *Service) SyncLark(ctx context.Context, id, assignee, groupID string) (link store.TaskLarkLink, retErr error) {
+	startedAt := time.Now()
+	stage := "check_configuration"
+	requestedGroup := groupID
+	if s.cfg.LarkDebug {
+		log.Printf("task_lark_sync event=start task_id=%q requested_group_id=%q configured_group_id=%q auto_create=%t lark_enabled=%t", id, requestedGroup, s.cfg.LarkTaskGroupID, s.cfg.CreateLarkTask, s.cfg.Lark != nil && s.cfg.Lark.Enabled())
+	}
+	defer func() {
+		if retErr != nil {
+			log.Printf("task_lark_sync event=failed task_id=%q stage=%q lark_task_guid=%q group_id=%q elapsed=%s error=%q", id, stage, link.GUID, groupID, time.Since(startedAt), retErr)
+		} else if s.cfg.LarkDebug {
+			log.Printf("task_lark_sync event=complete task_id=%q lark_task_guid=%q group_id=%q elapsed=%s", id, link.GUID, link.GroupID, time.Since(startedAt))
+		}
+	}()
 	if !s.cfg.Enabled {
 		return link, ErrDisabled
 	}
 	if s.cfg.Lark == nil || !s.cfg.Lark.Enabled() {
 		return link, errors.New("Lark task integration is unavailable")
 	}
+	stage = "lock"
 	unlock, err := s.locks.Lock(ctx, "lark:"+id)
 	if err != nil {
 		return link, err
 	}
 	defer unlock()
+	stage = "load_task"
 	task, err := s.store.GetTask(id)
 	if err != nil {
 		return link, err
 	}
+	stage = "load_link"
 	link, err = s.store.GetTaskLarkLink(id)
 	if errors.Is(err, store.ErrNotFound) {
 		if assignee == "" {
@@ -101,6 +124,7 @@ func (s *Service) SyncLark(ctx context.Context, id, assignee, groupID string) (l
 		if marshalErr != nil {
 			return link, marshalErr
 		}
+		stage = "reserve_creation"
 		if err := s.store.ReserveTaskLarkCreation(id, string(data)); err != nil {
 			return link, err
 		}
@@ -115,12 +139,27 @@ func (s *Service) SyncLark(ctx context.Context, id, assignee, groupID string) (l
 			groupID = s.cfg.LarkTaskGroupID
 		}
 	}
+	if s.cfg.LarkDebug {
+		source := "requested"
+		if requestedGroup == "" {
+			source = "configured"
+			if link.GroupID != "" {
+				source = "stored"
+			} else if groupID == "" {
+				source = "none"
+			}
+		}
+		log.Printf("task_lark_sync event=group_resolved task_id=%q lark_task_guid=%q requested_group_id=%q stored_group_id=%q effective_group_id=%q source=%q", id, link.GUID, requestedGroup, link.GroupID, groupID, source)
+	}
 	defer func() {
 		msg := ""
 		if retErr != nil {
 			msg = retErr.Error()
 		}
 		if err := s.store.SetTaskLarkSync(id, msg, retErr == nil); err != nil {
+			if retErr == nil {
+				stage = "persist_sync"
+			}
 			retErr = errors.Join(retErr, err)
 		}
 		if saved, err := s.store.GetTaskLarkLink(id); err == nil {
@@ -128,6 +167,7 @@ func (s *Service) SyncLark(ctx context.Context, id, assignee, groupID string) (l
 		}
 	}()
 	if link.GUID == "" {
+		stage = "create_task"
 		started, err := time.Parse(time.RFC3339Nano, link.StartedAt)
 		if err != nil || time.Since(started) >= 4*time.Minute {
 			return link, errors.New("Lark task creation outcome is uncertain; if it exists use /sat task link-lark <task_id> <lark_guid>, otherwise confirm it does not exist and use /sat task reset-lark-create <task_id>")
@@ -143,23 +183,43 @@ func (s *Service) SyncLark(ctx context.Context, id, assignee, groupID string) (l
 		if remote.GUID == "" {
 			return link, errors.New("Lark returned no task GUID")
 		}
+		stage = "persist_lark_task"
 		if err := s.store.SetTaskLarkRemote(id, remote.GUID, remote.URL); err != nil {
 			return link, fmt.Errorf("persist Lark task %s: %w", remote.GUID, err)
 		}
 		link.GUID, link.URL = remote.GUID, remote.URL
+		if s.cfg.LarkDebug {
+			log.Printf("task_lark_sync event=task_created task_id=%q lark_task_guid=%q", id, link.GUID)
+		}
 	}
 	if groupID != "" && groupID != link.GroupID {
+		stage = "add_to_group"
+		if s.cfg.LarkDebug {
+			log.Printf("task_lark_sync event=group_add_start task_id=%q lark_task_guid=%q group_id=%q", id, link.GUID, groupID)
+		}
 		if err := s.cfg.Lark.AddTaskToList(link.GUID, groupID); err != nil {
 			return link, fmt.Errorf("add Lark task to group: %w", err)
 		}
 		if err := s.store.SetTaskLarkGroup(id, groupID); err != nil {
+			stage = "persist_group"
 			return link, err
 		}
+		if s.cfg.LarkDebug {
+			log.Printf("task_lark_sync event=group_add_complete task_id=%q lark_task_guid=%q group_id=%q", id, link.GUID, groupID)
+		}
+	} else if s.cfg.LarkDebug {
+		reason := "already_recorded"
+		if groupID == "" {
+			reason = "no_group_configured"
+		}
+		log.Printf("task_lark_sync event=group_add_skipped task_id=%q lark_task_guid=%q group_id=%q reason=%q", id, link.GUID, groupID, reason)
 	}
+	stage = "get_task"
 	remote, err := s.cfg.Lark.GetTaskContext(ctx, link.GUID)
 	if err != nil {
 		return link, fmt.Errorf("get Lark task: %w", err)
 	}
+	stage = "build_description"
 	description, err := s.larkDescription(task, remote.Description)
 	if err != nil {
 		return link, err
@@ -176,6 +236,7 @@ func (s *Service) SyncLark(ctx context.Context, id, assignee, groupID string) (l
 		update.Completed = &completed
 	}
 	if update.Summary != nil || update.Description != nil || update.Completed != nil {
+		stage = "update_task"
 		if err := s.cfg.Lark.UpdateTaskContext(ctx, link.GUID, update); err != nil {
 			return link, fmt.Errorf("update Lark task: %w", err)
 		}

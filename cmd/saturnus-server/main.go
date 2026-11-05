@@ -93,6 +93,7 @@ func run(ctx context.Context, addr, data, staticDir string) (err error) {
 	larkClient := lark.New(lark.Config{
 		AppID:     os.Getenv("LARK_APP_ID"),
 		AppSecret: os.Getenv("LARK_APP_SECRET"),
+		TaskDebug: taskCfg.LarkDebug,
 	})
 	cloudopsClient, err := cloudopsFromEnv()
 	if err != nil {
@@ -691,6 +692,7 @@ func (s *server) createTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var syncError string
+	s.tasks.LogLarkAutoSync(task.ID, "api")
 	if s.tasks.AutoLarkEnabled() {
 		_, err := s.tasks.SyncLark(r.Context(), task.ID, req.AssigneeOpenID, "")
 		if err != nil {
@@ -1796,6 +1798,7 @@ func (s *server) taskCommand(fields []string, text string, sender ...string) bot
 
 func (s *server) createdTaskReply(task store.Task, assignee string) botReply {
 	text := "Task created " + task.ID + " (" + task.Title + ")"
+	s.tasks.LogLarkAutoSync(task.ID, "bot")
 	if s.tasks.AutoLarkEnabled() {
 		link, err := s.tasks.SyncLark(context.Background(), task.ID, assignee, "")
 		if err != nil {
@@ -2915,6 +2918,7 @@ func tasksConfig(repos map[string]string) (tasks.Config, error) {
 		CreateLarkTask:     os.Getenv("SATURNUS_TASKS_CREATE_LARK_TASK") == "1",
 		LarkTaskGroupID:    os.Getenv("SATURNUS_TASKS_LARK_TASK_GROUP_ID"),
 		LarkAssigneeOpenID: os.Getenv("SATURNUS_TASKS_LARK_ASSIGNEE_OPEN_ID"),
+		LarkDebug:          os.Getenv("SATURNUS_TASKS_LARK_DEBUG") == "1",
 		RefreshInterval:    interval, RefreshTimeout: timeout,
 	}, nil
 }

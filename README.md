@@ -203,6 +203,33 @@ Each mapped path must be a git checkout when a job runs. The server does not
 fetch or check out anything itself: it runs the review tool directly inside the
 mapped checkout and lets the tool fetch and check out the PR head on its own.
 
+Choose how each executor handles reviews of the same repo with
+`SATURNUS_REVIEW_REPO_COLLISION_POLICY` (restart after changing it):
+
+- `mutex` (default): at most one review, retry or reviewer action executes for a
+  repo on that executor at a time. Conflicting remote jobs stay pending; the
+  executor also holds a cancellable lock until the job finishes, including on
+  failure or timeout. Different repo mappings to the same checkout share a lock;
+  the executor resolves relative paths and symlink aliases.
+- `worktree`: allow same-repo concurrency up to the executor's concurrency limit.
+  Every initial review, retry and action prompt tells the tool to create/reuse a
+  detached worktree at `<checkout-parent>/.saturnus-worktrees/<checkout-name>/<review_id>`
+  and perform all review, build, test and edit operations there. Retries reuse
+  that review's worktree; different reviews get different paths. The prompt
+  forbids changing the shared checkout or other tasks' worktrees and requires
+  stopping if isolation cannot be established. Git operations are performed by
+  the tool, so this policy depends on the tool following these instructions.
+  Worktrees are retained for follow-up actions; remove them manually when the
+  review is no longer needed.
+
+Set this variable separately on each remote worker; the server's value controls
+only its local executor. Workers advertise their policy to the scheduler. Older
+workers without a policy are treated as `mutex` by the scheduler; upgrade workers
+for execution-side locking and worktree prompts. Locks are process-local: run one
+executor per shared checkout. The same review's session is always serialized,
+including in `worktree` mode. New session IDs come from the executing process's
+JSON output and are checked against the review title, context and checkout.
+
 Environment variables:
 
 | variable | default | note |
@@ -218,6 +245,7 @@ Environment variables:
 | `SATURNUS_REVIEW_TOOL` | opencode | review executable |
 | `SATURNUS_REVIEW_COMMAND_TEMPLATE` | see below | `text/template` for command args |
 | `SATURNUS_REVIEW_MAX_CONCURRENT` | 1 | worker count |
+| `SATURNUS_REVIEW_REPO_COLLISION_POLICY` | mutex | local executor policy: `mutex` or `worktree`; invalid values prevent startup |
 | `SATURNUS_REVIEW_LOCAL_FALLBACK` | 1 | set to `0` to keep reviews pending when remote workers are unavailable; repo mappings remain available to Tasks |
 | `SATURNUS_REVIEW_TIMEOUT` | 15m | per-review timeout |
 | `SATURNUS_REVIEW_CREATE_TASK` | 0 | create a Feishu task assigned to reviewer + requester |
@@ -281,6 +309,7 @@ Worker environment variables:
 | `SATURNUS_REVIEW_TOOL` | opencode | review executable on the worker host |
 | `SATURNUS_REVIEW_GH` | 1 | worker has `gh` available (used to resolve PR head/title) |
 | `SATURNUS_WORKER_MAX_CONCURRENT` | 1 | concurrent reviews per worker |
+| `SATURNUS_REVIEW_REPO_COLLISION_POLICY` | mutex | same-repo collision policy on this worker; CLI override: `-repo-collision-policy worktree` |
 | `SATURNUS_REVIEW_LOG_DIR` | `<tmp>/saturnus-review-logs` | per-review transcript logs on the worker |
 
 Workers also accept `-repos-file /path/to/repos.json` and the legacy `-repos`
@@ -704,7 +733,7 @@ created per PR: re-running an already-reviewed PR reuses the existing
 The default command template is:
 
 ```text
-run --auto "Review GitHub PR {{.Repo}}#{{.PRNumber}} ({{.PRURL}}). The repository is already checked out at {{.Worktree}}. Fetch and check out the PR head yourself, then review the changes. Focus on correctness, security and style; be concise with file:line references. Finish with a structured review. The very last block must be exactly:
+run --auto --format json "{{.IsolationPrompt | shellquote}}Review GitHub PR {{.Repo}}#{{.PRNumber}} ({{.PRURL}}). The shared repository checkout is {{.Worktree}}. {{if .IsolationPrompt}}Prepare the PR head in the isolated worktree as instructed above.{{else}}Fetch and check out the PR head yourself.{{end}} Review the changes. Focus on correctness, security and style; be concise with file:line references. Finish with a structured review. The very last block must be exactly:
 
 REVIEW SUMMARY:
 PR summary: <what the PR does in 2-3 sentences>
@@ -719,10 +748,40 @@ their own arguments; include `--auto` when using OpenCode with a custom template
 
 Placeholders available in the template: `Repo`, `PRNumber`, `PRURL`, `Title`,
 `BaseBranch`, `Worktree` (the mapped checkout path), `Guide` (per-repo review
-guidelines), and `ReviewID`. The default template passes
+guidelines), `ReviewID`, `RepoCollisionPolicy`, and `IsolationPrompt`. In worktree
+mode custom templates should embed `{{.IsolationPrompt | shellquote}}` in their
+prompt. If omitted, Saturnus prepends the rules to the final command argument;
+custom commands must therefore put the prompt last. `Worktree` still denotes the
+mapped shared checkout, not the tool-created isolated worktree. The default template passes
 `--title "saturnus-review-<id>"` so the opencode session can be located and
-surfaced after the run. Set `SATURNUS_REVIEW_TOOL` and
+surfaced after the run. Custom templates should use `--title "{{.SessionTitle}}"`
+to support session discovery and safe retries. Set `SATURNUS_REVIEW_TOOL` and
 `SATURNUS_REVIEW_COMMAND_TEMPLATE` together to swap in another tool.
+
+Session binding supports OpenCode 1.x and 2.x (including 2.2.5). The default
+review and action commands request `--format json`. Saturnus reads the root
+`sessionID` only from that process's stdout events and decodes assistant text
+into readable review output and progress. IDs in stderr, assistant text, nested
+tool output or another process's session list cannot establish a binding. Output
+truncation does not discard the captured ID. New runs no longer scan recent
+sessions after finishing, and different repos can run concurrently.
+
+Before any saved session is resumed, the execution host checks its explicit ID,
+root status, review/context title and canonical checkout directory. OpenCode's
+`--version` selects `export <id>` with `info.directory` for 1.x, or
+`session export <id>` with `info.location.directory` for 2.x. Verification failure
+stops execution and asks for `/sat reset <review_id>`; already incorrect stored
+IDs are never silently trusted or reassigned. Reset preserves historical runs.
+Legacy discovery for a local action without a saved ID requires one unambiguous
+title-and-directory match and validates that explicit ID before execution.
+
+Update both server and remote workers. Existing custom templates must add
+`--format json` to capture new IDs, use `--title "{{.SessionTitle}}"` and select
+`--session` only from `{{.SessionID}}`. Implicit `--continue`, `--fork`, hardcoded
+session IDs and remote `--attach`/`--server` overrides are rejected. Text-only
+custom commands still run but cannot establish a new session binding. Wrappers
+must forward `--version` and the appropriate metadata export command for retries
+and actions to work.
 
 ### Per-repo review guides
 

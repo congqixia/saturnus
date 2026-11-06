@@ -61,18 +61,18 @@ func TestRenderCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 5 || got[0] != "run" || got[1] != "--auto" || got[2] != "--title" {
+	if len(got) != 7 || got[0] != "run" || got[1] != "--auto" || got[2] != "--format" || got[3] != "json" || got[4] != "--title" {
 		t.Fatalf("unexpected args: %#v", got)
 	}
-	if got[3] != "saturnus-review-rvw_x" {
-		t.Fatalf("expected title arg, got %q", got[3])
+	if got[5] != "saturnus-review-rvw_x" {
+		t.Fatalf("expected title arg, got %q", got[5])
 	}
-	if got[4] == "" {
+	if got[len(got)-1] == "" {
 		t.Fatal("expected non-empty prompt")
 	}
 	for _, want := range []string{"REVIEW SUMMARY:", "PR summary:", "Issues:", "Review suggestions:"} {
-		if !strings.Contains(got[4], want) {
-			t.Fatalf("prompt missing %q: %q", want, got[4])
+		if !strings.Contains(got[len(got)-1], want) {
+			t.Fatalf("prompt missing %q: %q", want, got[len(got)-1])
 		}
 	}
 }
@@ -90,10 +90,10 @@ func TestRenderCommandWithGuide(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 5 {
-		t.Fatalf("expected 5 args, got %#v", got)
+	if len(got) != 7 {
+		t.Fatalf("expected 7 args, got %#v", got)
 	}
-	prompt := got[4]
+	prompt := got[len(got)-1]
 	if !strings.Contains(prompt, "Do NOT run compilation.\nKeep comments in \"English\".") {
 		t.Fatalf("guide not embedded correctly: %q", prompt)
 	}
@@ -115,13 +115,13 @@ func TestRenderCommandContinueSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 7 || got[0] != "run" || got[1] != "--auto" || got[2] != "--session" || got[3] != "ses_9" || got[4] != "--title" {
+	if len(got) != 9 || got[0] != "run" || got[1] != "--auto" || got[2] != "--format" || got[3] != "json" || got[4] != "--session" || got[5] != "ses_9" || got[6] != "--title" {
 		t.Fatalf("expected session continuation args, got %#v", got)
 	}
-	if got[5] != "saturnus-review-rvw_c" {
-		t.Fatalf("expected title arg, got %q", got[5])
+	if got[7] != "saturnus-review-rvw_c" {
+		t.Fatalf("expected title arg, got %q", got[7])
 	}
-	prompt := got[6]
+	prompt := got[len(got)-1]
 	if !strings.Contains(prompt, "Continue reviewing. Reason: retry after failure.") {
 		t.Fatalf("retry note missing from prompt: %q", prompt)
 	}
@@ -152,10 +152,10 @@ func TestRenderCommandWithResultAPI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 5 {
-		t.Fatalf("expected 5 args, got %#v", got)
+	if len(got) != 7 {
+		t.Fatalf("expected 7 args, got %#v", got)
 	}
-	prompt := got[4]
+	prompt := got[len(got)-1]
 	for _, want := range []string{
 		"http://127.0.0.1:8787/api/reviews/rvw_api/result",
 		`Authorization: Bearer s3cret`,
@@ -180,7 +180,7 @@ func TestRenderCommandWithoutResultAPIOmitsPostBlock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	prompt := got[4]
+	prompt := got[len(got)-1]
 	for _, absent := range []string{"machine-readable", "Authorization: Bearer", `\"verdict\"`, "Previous findings"} {
 		if strings.Contains(prompt, absent) {
 			t.Fatalf("prompt should not contain %q:\n%s", absent, prompt)
@@ -201,7 +201,7 @@ func TestRenderCommandCarriesPriorFindings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	prompt := got[4]
+	prompt := got[len(got)-1]
 	for _, want := range []string{
 		"Previous findings from the earlier round",
 		"- fnd_x [P0] blocking bug (a.go:1)",

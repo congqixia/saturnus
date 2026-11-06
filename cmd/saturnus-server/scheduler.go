@@ -3,10 +3,13 @@ package main
 import (
 	"context"
 	"log"
+	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
+	"saturnus/internal/repopolicy"
 	"saturnus/internal/review"
 	"saturnus/internal/reviewlog"
 	"saturnus/internal/store"
@@ -166,6 +169,7 @@ func (s *scheduler) OnEvent(ctx context.Context, workerID string, frame workerpr
 				event.Log()
 			} else {
 				s.hub.ClearInFlight(workerID, frame.ReviewID)
+				s.Notify(jobKindReconcile, "")
 			}
 		}
 	case workerproto.EvCancelAck:
@@ -295,6 +299,14 @@ func (s *scheduler) dispatchReaction(id string) {
 		if !s.workerHealthy(req.WorkerID, time.Now()) || s.workerBackingOff(req.WorkerID) {
 			return // wait; the sweep retries when the worker returns
 		}
+		agent, err := s.st.GetWorker(req.WorkerID)
+		if err != nil {
+			return
+		}
+		caps, err := agent.CapabilitiesDecoded()
+		if err != nil || !s.workerHasCapacity(req.WorkerID, caps, req) {
+			return
+		}
 		payload, err := s.svc.StartRemoteReaction(reac, req, req.WorkerID)
 		if err != nil {
 			event := s.jobEvent("dispatch_failed", "", req.WorkerID, workerproto.JobPayload{Kind: workerproto.JobReaction, ReviewID: req.ID, ReactionID: reac.ID, Repo: req.Repo, PRNumber: req.PRNumber})
@@ -359,11 +371,7 @@ func (s *scheduler) pickReviewWorker(req store.ReviewRequest) (string, bool) {
 		if s.workerBackingOff(w.ID) {
 			continue
 		}
-		max := caps.MaxConcurrent
-		if max <= 0 {
-			max = 1
-		}
-		if s.hub.InFlightCount(w.ID) >= max {
+		if !s.workerHasCapacity(w.ID, caps, req) {
 			continue
 		}
 		cands = append(cands, candidate{id: w.ID, load: s.hub.InFlightCount(w.ID)})
@@ -386,6 +394,47 @@ func (s *scheduler) pickReviewWorker(req store.ReviewRequest) (string, bool) {
 		return cands[i].id < cands[j].id
 	})
 	return cands[0].id, true
+}
+
+// Collision policy belongs to the executor, since hosts may choose different
+// tradeoffs. Keep conflicting jobs pending instead of generating busy retries.
+// Workers also enforce their policy locally, covering stale server state and
+// checkout aliases the server cannot resolve on the remote filesystem.
+func (s *scheduler) workerHasCapacity(workerID string, caps store.WorkerCapabilities, req store.ReviewRequest) bool {
+	if _, ok := caps.Repos[req.Repo]; !ok {
+		return false
+	}
+	policy, err := repopolicy.Parse(string(caps.RepoCollisionPolicy))
+	if err != nil {
+		return false
+	}
+	max := caps.MaxConcurrent
+	if max <= 0 {
+		max = 1
+	}
+	inFlight := s.hub.InFlightReviews(workerID)
+	if len(inFlight) >= max {
+		return false
+	}
+	for _, id := range inFlight {
+		if id == req.ID {
+			return false // the same review session/worktree is never concurrent
+		}
+		if policy == repopolicy.Worktree {
+			continue
+		}
+		busy, err := s.st.GetReview(id)
+		if err != nil {
+			return false // an unknown in-flight job may own this checkout
+		}
+		if strings.EqualFold(busy.Repo, req.Repo) {
+			return false
+		}
+		if dir := caps.Repos[busy.Repo]; dir != "" && filepath.Clean(dir) == filepath.Clean(caps.Repos[req.Repo]) {
+			return false
+		}
+	}
+	return true
 }
 
 // Failed writes and busy replies must not immediately claim the same worker

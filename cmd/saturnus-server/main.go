@@ -26,6 +26,7 @@ import (
 	"saturnus/internal/policy"
 	"saturnus/internal/prs"
 	"saturnus/internal/repoconfig"
+	"saturnus/internal/repopolicy"
 	"saturnus/internal/review"
 	"saturnus/internal/store"
 	"saturnus/internal/tasks"
@@ -69,6 +70,9 @@ func main() {
 }
 
 func run(ctx context.Context, addr, data, staticDir string) (err error) {
+	if _, err := repopolicy.Parse(os.Getenv("SATURNUS_REVIEW_REPO_COLLISION_POLICY")); err != nil {
+		return fmt.Errorf("SATURNUS_REVIEW_REPO_COLLISION_POLICY: %w", err)
+	}
 	repos, err := repoconfig.Load(os.Getenv("SATURNUS_REVIEW_REPOS"), os.Getenv("SATURNUS_REVIEW_REPOS_FILE"))
 	if err != nil {
 		return err
@@ -2885,6 +2889,7 @@ func reviewConfig(repos map[string]string) review.Config {
 		Tool:                  os.Getenv("SATURNUS_REVIEW_TOOL"),
 		CommandTemplate:       os.Getenv("SATURNUS_REVIEW_COMMAND_TEMPLATE"),
 		MaxConcurrent:         envInt("SATURNUS_REVIEW_MAX_CONCURRENT", 1),
+		RepoCollisionPolicy:   repopolicy.Policy(os.Getenv("SATURNUS_REVIEW_REPO_COLLISION_POLICY")),
 		DisableLocalFallback:  os.Getenv("SATURNUS_REVIEW_LOCAL_FALLBACK") == "0",
 		Timeout:               envDuration("SATURNUS_REVIEW_TIMEOUT", 15*time.Minute),
 		CreateTask:            os.Getenv("SATURNUS_REVIEW_CREATE_TASK") == "1",

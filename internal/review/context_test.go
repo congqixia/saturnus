@@ -212,8 +212,9 @@ func TestLocalResetCreatesAndThenResumesNewSession(t *testing.T) {
 	}
 	toolDir := t.TempDir()
 	sessions := filepath.Join(toolDir, "sessions.json")
+	metadata := filepath.Join(toolDir, "metadata.json")
 	tool := filepath.Join(toolDir, "tool")
-	script := "#!/bin/sh\nif [ \"$1 $2\" = \"session list\" ]; then cat '" + sessions + "'; else printf '%s\\n' \"$@\"; fi\n"
+	script := "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 1.19.0; elif [ \"$1\" = export ]; then cat '" + metadata + "'; elif [ \"$1 $2\" = \"session list\" ]; then cat '" + sessions + "'; else printf '%s\\n' \"$@\"; printf '%s\\n' '{\"type\":\"step_start\",\"sessionID\":\"ses-new\"}'; fi\n"
 	if err := os.WriteFile(tool, []byte(script), 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -228,6 +229,10 @@ func TestLocalResetCreatesAndThenResumesNewSession(t *testing.T) {
 		{"id": "ses-new", "title": SessionTitle("rvw_fresh", ctxID), "directory": root, "updated": 1},
 	})
 	if err := os.WriteFile(sessions, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	info, _ := json.Marshal(map[string]any{"info": map[string]string{"id": "ses-new", "title": SessionTitle("rvw_fresh", ctxID), "directory": root}})
+	if err := os.WriteFile(metadata, info, 0600); err != nil {
 		t.Fatal(err)
 	}
 	svc.process("rvw_fresh")

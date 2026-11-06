@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"saturnus/internal/ghinfo"
+	"saturnus/internal/repopolicy"
 	"saturnus/internal/review"
 	"saturnus/internal/reviewlog"
 	"saturnus/internal/worker"
@@ -22,29 +23,39 @@ import (
 
 // Config is the worker daemon's static configuration.
 type Config struct {
-	ServerURL     string
-	WorkerID      string
-	Token         string
-	Tool          string
-	Repos         map[string]string // owner/repo -> local checkout path
-	GH            bool
-	GitHub        *ghinfo.Info
-	MaxConcurrent int
-	LogDir        string
+	ServerURL           string
+	WorkerID            string
+	Token               string
+	Tool                string
+	Repos               map[string]string // owner/repo -> local checkout path
+	GH                  bool
+	GitHub              *ghinfo.Info
+	MaxConcurrent       int
+	RepoCollisionPolicy repopolicy.Policy
+	LogDir              string
 }
 
 // Worker executes jobs dispatched by the server.
 type Worker struct {
-	cfg      Config
-	client   *worker.Client
-	sem      chan struct{}
-	mu       sync.Mutex
-	inFlight map[string]context.CancelFunc
-	github   *ghinfo.Info
+	repoGuard repopolicy.Guard
+	cfg       Config
+	client    *worker.Client
+	sem       chan struct{}
+	mu        sync.Mutex
+	inFlight  map[string]runningJob
+	github    *ghinfo.Info
+}
+
+type runningJob struct {
+	cancel            context.CancelFunc
+	runID, reactionID string
 }
 
 // New builds a Worker from config, applying defaults.
 func New(cfg Config) *Worker {
+	if policy, err := repopolicy.Parse(string(cfg.RepoCollisionPolicy)); err == nil {
+		cfg.RepoCollisionPolicy = policy
+	}
 	if cfg.Tool == "" {
 		cfg.Tool = "opencode"
 	}
@@ -57,7 +68,7 @@ func New(cfg Config) *Worker {
 	return &Worker{
 		cfg:      cfg,
 		sem:      make(chan struct{}, cfg.MaxConcurrent),
-		inFlight: map[string]context.CancelFunc{},
+		inFlight: map[string]runningJob{},
 		github:   cfg.GitHub,
 	}
 }
@@ -166,33 +177,40 @@ func (w *Worker) onCommand(ctx context.Context, frame workerproto.Frame) error {
 // at capacity it replies with a "busy" error so the server can requeue.
 func (w *Worker) dispatch(ctx context.Context, p workerproto.JobPayload) {
 	w.jobEvent("received", "pending", p).Log()
-	select {
-	case w.sem <- struct{}{}:
-	default:
-		event := w.jobEvent("rejected", "busy", p)
-		event.Error = "worker at capacity"
-		event.Log()
-		if err := w.send(workerproto.NewFrame(workerproto.EvError, p.ReviewID, workerproto.ErrorPayload{
-			Code:    "busy",
-			Message: "worker at capacity",
-		})); err != nil {
-			event.Name, event.Error = "rejection_report_failed", err.Error()
-			event.Log()
+	w.mu.Lock()
+	if running, exists := w.inFlight[p.ReviewID]; exists {
+		// A reconnect may redeliver a claim. Never overwrite the cancel func or
+		// start a second tool against the same review session/worktree.
+		w.mu.Unlock()
+		if running.runID != p.RunID || running.reactionID != p.ReactionID {
+			w.rejectBusy(p, "another job for this review is still running")
 		}
 		return
 	}
+	select {
+	case w.sem <- struct{}{}:
+	default:
+		w.mu.Unlock()
+		w.rejectBusy(p, "worker at capacity")
+		return
+	}
 	jobCtx, cancel := context.WithCancel(ctx)
-	w.mu.Lock()
-	w.inFlight[p.ReviewID] = cancel
+	w.inFlight[p.ReviewID] = runningJob{cancel: cancel, runID: p.RunID, reactionID: p.ReactionID}
 	w.mu.Unlock()
 	go func() {
 		defer cancel()
 		defer func() {
-			<-w.sem
 			w.mu.Lock()
 			delete(w.inFlight, p.ReviewID)
+			<-w.sem
 			w.mu.Unlock()
 		}()
+		unlock, err := w.repoGuard.Lock(jobCtx, w.cfg.RepoCollisionPolicy, p.Repo, w.cfg.Repos[p.Repo], p.ReviewID)
+		if err != nil {
+			w.complete(p, false, "", p.SessionID, "", "wait for repo: "+err.Error())
+			return
+		}
+		defer unlock()
 		w.jobEvent("started", "running", p).Log()
 		if err := w.send(workerproto.NewFrame(workerproto.EvStarted, p.ReviewID, workerproto.StartedPayload{RunID: p.RunID, ReactionID: p.ReactionID})); err != nil {
 			event := w.jobEvent("start_report_failed", "running", p)
@@ -203,13 +221,25 @@ func (w *Worker) dispatch(ctx context.Context, p workerproto.JobPayload) {
 	}()
 }
 
+func (w *Worker) rejectBusy(p workerproto.JobPayload, message string) {
+	event := w.jobEvent("rejected", "busy", p)
+	event.Error = message
+	event.Log()
+	if err := w.send(workerproto.NewFrame(workerproto.EvError, p.ReviewID, workerproto.ErrorPayload{
+		Code: "busy", Message: message,
+	})); err != nil {
+		event.Name, event.Error = "rejection_report_failed", err.Error()
+		event.Log()
+	}
+}
+
 func (w *Worker) cancel(reviewID string) {
 	w.mu.Lock()
-	cancel, ok := w.inFlight[reviewID]
+	running, ok := w.inFlight[reviewID]
 	w.mu.Unlock()
 	if ok {
 		reviewlog.Event{Name: "cancel_requested", Component: "worker", ReviewID: reviewID, WorkerID: w.cfg.WorkerID, Status: "running"}.Log()
-		cancel()
+		running.cancel()
 		_ = w.send(workerproto.NewFrame(workerproto.EvCancelAck, reviewID, nil))
 	}
 }
@@ -307,21 +337,22 @@ func (w *Worker) runReview(ctx context.Context, p workerproto.JobPayload) {
 	}
 
 	args, err := review.RenderCommand(p.CommandTemplate, review.ToolArgs{
-		Repo:          p.Repo,
-		PRNumber:      p.PRNumber,
-		PRURL:         p.PRURL,
-		Title:         title,
-		BaseBranch:    base,
-		Worktree:      dir,
-		Guide:         guide,
-		ReviewID:      p.ReviewID,
-		HeadCommit:    head,
-		SessionID:     p.SessionID,
-		SessionTitle:  review.SessionTitle(p.ReviewID, p.ContextID),
-		RetryNote:     retryNote,
-		ResultAPIURL:  p.ResultAPIURL,
-		ResultToken:   p.ResultToken,
-		PriorFindings: p.PriorFindings,
+		RepoCollisionPolicy: w.cfg.RepoCollisionPolicy,
+		Repo:                p.Repo,
+		PRNumber:            p.PRNumber,
+		PRURL:               p.PRURL,
+		Title:               title,
+		BaseBranch:          base,
+		Worktree:            dir,
+		Guide:               guide,
+		ReviewID:            p.ReviewID,
+		HeadCommit:          head,
+		SessionID:           p.SessionID,
+		SessionTitle:        review.SessionTitle(p.ReviewID, p.ContextID),
+		RetryNote:           retryNote,
+		ResultAPIURL:        p.ResultAPIURL,
+		ResultToken:         p.ResultToken,
+		PriorFindings:       p.PriorFindings,
 	})
 	if err != nil {
 		w.complete(p, false, head, "", "", "render command: "+err.Error())
@@ -367,13 +398,12 @@ func (w *Worker) runReview(ctx context.Context, p workerproto.JobPayload) {
 	event := w.jobEvent("tool_started", "running", p)
 	event.Tool, event.LogPath = w.cfg.Tool, logFile.Name()
 	event.Log()
-	output, runErr := review.Run(jobCtx, w.cfg.Tool, args, dir, sink)
+	result, runErr := review.RunWithSession(jobCtx, w.cfg.Tool, args, dir, review.SessionIdentity{ReviewID: p.ReviewID, ContextID: p.ContextID, SessionID: p.SessionID}, sink)
+	output := result.Output
 	if runErr != nil && jobCtx.Err() != nil {
 		runErr = fmt.Errorf("%w: %v", jobCtx.Err(), runErr)
 	}
-	sessionCtx, scancel := context.WithTimeout(ctx, 15*time.Second)
-	sessionID := review.CaptureContextSessionID(sessionCtx, w.cfg.Tool, dir, p.ReviewID, p.ContextID)
-	scancel()
+	sessionID := result.SessionID
 	clean := review.StripANSI(output)
 	if runErr != nil {
 		w.complete(p, false, head, sessionID, clean, runErr.Error())
@@ -398,7 +428,7 @@ func (w *Worker) runReaction(ctx context.Context, p workerproto.JobPayload) {
 	}
 	// The instruction is passed as a single argv element so arbitrary reviewer
 	// text (quotes, backslashes, whitespace) survives verbatim.
-	args := []string{"run", "--auto", "--session", p.SessionID, "--title", review.SessionTitle(p.ReviewID, p.ContextID), p.Instruction}
+	args := []string{"run", "--auto", "--session", p.SessionID, "--format", "json", "--title", review.SessionTitle(p.ReviewID, p.ContextID), review.IsolationPrompt(w.cfg.RepoCollisionPolicy, dir, p.ReviewID) + p.Instruction}
 
 	logFile, err := openLog(w.cfg.LogDir, p.ReactionID)
 	if err != nil {
@@ -416,7 +446,8 @@ func (w *Worker) runReaction(ctx context.Context, p workerproto.JobPayload) {
 	event := w.jobEvent("tool_started", "running", p)
 	event.Tool, event.LogPath = w.cfg.Tool, logFile.Name()
 	event.Log()
-	output, runErr := review.Run(jobCtx, w.cfg.Tool, args, dir, sink)
+	result, runErr := review.RunWithSession(jobCtx, w.cfg.Tool, args, dir, review.SessionIdentity{ReviewID: p.ReviewID, ContextID: p.ContextID, SessionID: p.SessionID}, sink)
+	output := result.Output
 	if runErr != nil && jobCtx.Err() != nil {
 		runErr = fmt.Errorf("%w: %v", jobCtx.Err(), runErr)
 	}

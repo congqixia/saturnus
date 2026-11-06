@@ -10,6 +10,7 @@ import (
 	"github.com/coder/websocket"
 
 	"saturnus/internal/lark"
+	"saturnus/internal/repopolicy"
 	"saturnus/internal/review"
 	"saturnus/internal/store"
 	"saturnus/internal/worker"
@@ -32,6 +33,65 @@ func recoveryScheduler(t *testing.T) (*scheduler, *store.Store, *worker.Hub, *ht
 		t.Fatal(err)
 	}
 	return sched, st, hub, ts
+}
+
+func TestSchedulerRepoCollisionPolicies(t *testing.T) {
+	sched, st, hub, ts := recoveryScheduler(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ws, _, err := websocket.Dial(ctx, "ws"+ts.URL[4:]+"?worker_id=worker&token=test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ws.Close(websocket.StatusNormalClosure, "test complete")
+	waitFor(t, time.Second, func() bool { return hub.Online("worker") })
+	thread, err := st.GetOrCreateReviewThread("chat", "collision", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	busy, err := st.CreateReview(store.ReviewRequest{ID: "rvw_busy", ThreadID: thread.ID, Status: "reviewing", Repo: "a/b", PRNumber: 1, WorkerID: "worker"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := st.CreateReview(store.ReviewRequest{ID: "rvw_pending", ThreadID: thread.ID, Status: "pending", Repo: "a/b", PRNumber: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hub.AddInFlight("worker", busy.ID)
+	for _, policy := range []repopolicy.Policy{"", repopolicy.Mutex, repopolicy.Worktree} {
+		caps := store.WorkerCapabilities{Repos: map[string]string{"a/b": "/checkout", "alias/repo": "/checkout", "c/d": "/different"}, MaxConcurrent: 3, RepoCollisionPolicy: policy}
+		if _, err := st.RegisterWorker(store.Agent{ID: "worker"}, caps); err != nil {
+			t.Fatal(err)
+		}
+		id, wait := sched.pickReviewWorker(pending)
+		if policy == repopolicy.Worktree {
+			if id != "worker" {
+				t.Fatalf("worktree worker should allow same repo: id=%q wait=%v", id, wait)
+			}
+		} else {
+			if id != "" || !wait {
+				t.Fatalf("mutex should wait: id=%q wait=%v", id, wait)
+			}
+			sched.dispatchReview(pending.ID)
+			fresh, _ := st.GetReview(pending.ID)
+			if fresh.Status != "pending" || len(st.ListRuns(pending.ID)) != 0 {
+				t.Fatalf("collision created a run: %+v", fresh)
+			}
+		}
+		for _, repo := range []string{"a/b", "alias/repo", "c/d"} {
+			want := policy == repopolicy.Worktree || repo == "c/d"
+			if got := sched.workerHasCapacity("worker", caps, store.ReviewRequest{ID: "different", Repo: repo}); got != want {
+				t.Fatalf("policy=%q repo=%s capacity=%v want=%v", policy, repo, got, want)
+			}
+		}
+		if sched.workerHasCapacity("worker", caps, busy) {
+			t.Fatal("same review session must never run concurrently")
+		}
+	}
+	hub.ClearInFlight("worker", busy.ID)
+	if id, _ := sched.pickReviewWorker(pending); id != "worker" {
+		t.Fatal("checkout not released after completion")
+	}
 }
 
 func TestSchedulerDoesNotClaimRecentlySeenDisconnectedWorker(t *testing.T) {

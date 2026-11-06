@@ -5,22 +5,29 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os/exec"
 	"strings"
 	"sync"
 	"text/template"
+
+	"saturnus/internal/repopolicy"
 )
 
 type ToolArgs struct {
-	Repo       string
-	PRNumber   int
-	PRURL      string
-	Title      string
-	BaseBranch string
-	Worktree   string
-	Guide      string
-	ReviewID   string
-	HeadCommit string
+	Repo                string
+	PRNumber            int
+	PRURL               string
+	Title               string
+	BaseBranch          string
+	Worktree            string
+	Guide               string
+	ReviewID            string
+	HeadCommit          string
+	RepoCollisionPolicy repopolicy.Policy
+	// IsolationPrompt is filled by RenderCommand. Custom templates may place it
+	// explicitly; otherwise it is prepended to the final (prompt) argument.
+	IsolationPrompt string
 	// SessionID, when set, makes the rendered command resume that tool session
 	// (opencode run --session <id>) so a retry/continue appends to the previous
 	// review conversation instead of starting fresh.
@@ -46,7 +53,7 @@ type ToolArgs struct {
 
 const maxResultBytes = 512 * 1024
 
-var DefaultCommandTemplate = `run --auto {{if .SessionID}}--session {{.SessionID}} {{end}}--title "saturnus-review-{{.ReviewID}}" "{{if .RetryNote}}{{.RetryNote | shellquote}}{{else}}Review GitHub PR {{.Repo}}#{{.PRNumber}} ({{.PRURL}}). The repository is already checked out at {{.Worktree}}. Fetch and check out the PR head yourself, then review the changes. Focus on correctness, security and style; be concise with file:line references.{{if .Guide}} Review guidelines: {{.Guide | shellquote}}{{end}}{{end}} Finish with a structured review. The very last block must be exactly:
+var DefaultCommandTemplate = `run --auto --format json {{if .SessionID}}--session {{.SessionID}} {{end}}--title "saturnus-review-{{.ReviewID}}" "{{.IsolationPrompt | shellquote}}{{if .RetryNote}}{{.RetryNote | shellquote}}{{else}}Review GitHub PR {{.Repo}}#{{.PRNumber}} ({{.PRURL}}). The repository is already checked out at {{.Worktree}}. {{if .IsolationPrompt}}Prepare the PR head in the isolated worktree as instructed above, then review the changes.{{else}}Fetch and check out the PR head yourself, then review the changes.{{end}} Focus on correctness, security and style; be concise with file:line references.{{if .Guide}} Review guidelines: {{.Guide | shellquote}}{{end}}{{end}} Finish with a structured review. The very last block must be exactly:
 
 REVIEW SUMMARY:
 PR summary: <what the PR does in 2-3 sentences>
@@ -80,6 +87,12 @@ Read the attached GitHub inline discussion for each finding and evaluate the aut
 {{.PriorFindings | shellquote}}{{end}}"`
 
 func RenderCommand(templateText string, args ToolArgs) ([]string, error) {
+	policy, err := repopolicy.Parse(string(args.RepoCollisionPolicy))
+	if err != nil {
+		return nil, err
+	}
+	args.RepoCollisionPolicy = policy
+	args.IsolationPrompt = IsolationPrompt(policy, args.Worktree, args.ReviewID)
 	tmpl, err := template.New("review").Funcs(template.FuncMap{"shellquote": shellquote}).Parse(templateText)
 	if err != nil {
 		return nil, err
@@ -91,6 +104,15 @@ func RenderCommand(templateText string, args ToolArgs) ([]string, error) {
 	argv, err := splitCommand(buf.String())
 	if err != nil {
 		return nil, err
+	}
+	if args.IsolationPrompt != "" {
+		if len(argv) == 0 {
+			return nil, errors.New("worktree policy requires a command with a final prompt argument")
+		}
+		last := len(argv) - 1
+		if !strings.Contains(argv[last], args.IsolationPrompt) {
+			argv[last] = args.IsolationPrompt + argv[last]
+		}
 	}
 	if args.SessionTitle != "" && args.SessionTitle != SessionTitle(args.ReviewID, "") {
 		// Honor context titles even for existing templates that still construct
@@ -168,21 +190,10 @@ func splitCommand(line string) ([]string, error) {
 // writers, so os/exec drains them before Wait returns; using StdoutPipe here
 // instead would race with Wait and occasionally lose buffered output.
 func Run(ctx context.Context, tool string, args []string, dir string, sink func(string)) (string, error) {
-	cmd := exec.CommandContext(ctx, tool, args...)
-	cmd.Dir = dir
-	setupProcessGroup(cmd)
-
 	var mu sync.Mutex
 	var buf strings.Builder
 	w := &sinkWriter{buf: &buf, mu: &mu, sink: sink}
-	cmd.Stdout = w
-	cmd.Stderr = w
-
-	if err := cmd.Start(); err != nil {
-		return "", err
-	}
-
-	runErr := cmd.Wait()
+	runErr := runProcess(ctx, tool, args, dir, w, w)
 
 	mu.Lock()
 	out := buf.String()
@@ -191,6 +202,17 @@ func Run(ctx context.Context, tool string, args []string, dir string, sink func(
 		out = out[:maxResultBytes] + "\n...[truncated]"
 	}
 	return out, runErr
+}
+
+func runProcess(ctx context.Context, tool string, args []string, dir string, stdout, stderr io.Writer) error {
+	cmd := exec.CommandContext(ctx, tool, args...)
+	cmd.Dir = dir
+	setupProcessGroup(cmd)
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	return cmd.Wait()
 }
 
 // sinkWriter accumulates output (bounded to maxResultBytes) and forwards every

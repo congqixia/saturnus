@@ -18,6 +18,7 @@ import (
 
 	"saturnus/internal/ghinfo"
 	"saturnus/internal/repoconfig"
+	"saturnus/internal/repopolicy"
 	"saturnus/internal/reviewworker"
 	"saturnus/internal/store"
 )
@@ -38,10 +39,15 @@ func main() {
 	reposFile := flag.String("repos-file", os.Getenv("SATURNUS_REVIEW_REPOS_FILE"), "JSON file mapping owner/repo to local checkout path (mutually exclusive with -repos)")
 	gh := flag.Bool("gh", envBool("SATURNUS_REVIEW_GH", true), "worker has gh available")
 	maxConcurrent := flag.Int("max-concurrent", envInt("SATURNUS_WORKER_MAX_CONCURRENT", 1), "concurrent review jobs")
+	policyRaw := flag.String("repo-collision-policy", env("SATURNUS_REVIEW_REPO_COLLISION_POLICY", "mutex"), "same-repo review policy: mutex or worktree")
 	logDir := flag.String("log-dir", os.Getenv("SATURNUS_REVIEW_LOG_DIR"), "job transcript log directory")
 	flag.Parse()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	policy, err := repopolicy.Parse(*policyRaw)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	repos, err := loadRepos(*reposRaw, *reposFile)
 	if err != nil {
@@ -64,7 +70,7 @@ func main() {
 		}
 		log.Printf("GitHub CLI version=%s auth=%s token_expiry=%s", github.Version, github.AuthStatus, github.ExpiryStatus)
 	}
-	agent, err := register(*serverURL, *workerID, *registerKey, *tool, repos, *gh, *maxConcurrent, github)
+	agent, err := register(*serverURL, *workerID, *registerKey, *tool, repos, *gh, *maxConcurrent, github, policy)
 	if err != nil {
 		log.Fatalf("register with server: %v", err)
 	}
@@ -73,20 +79,21 @@ func main() {
 	}
 
 	w := reviewworker.New(reviewworker.Config{
-		ServerURL:     strings.TrimRight(*serverURL, "/"),
-		WorkerID:      agent.ID,
-		Token:         agent.WorkerToken,
-		Tool:          *tool,
-		Repos:         repos,
-		GH:            *gh,
-		GitHub:        github,
-		MaxConcurrent: *maxConcurrent,
-		LogDir:        *logDir,
+		ServerURL:           strings.TrimRight(*serverURL, "/"),
+		WorkerID:            agent.ID,
+		Token:               agent.WorkerToken,
+		Tool:                *tool,
+		Repos:               repos,
+		GH:                  *gh,
+		GitHub:              github,
+		MaxConcurrent:       *maxConcurrent,
+		RepoCollisionPolicy: policy,
+		LogDir:              *logDir,
 	})
 	defer w.Close()
 
-	log.Printf("saturnus-worker %s registered with %s (host=%s, tool=%s, repos=%d, max_concurrent=%d)",
-		agent.ID, *serverURL, host, *tool, len(repos), *maxConcurrent)
+	log.Printf("saturnus-worker %s registered with %s (host=%s, tool=%s, repos=%d, max_concurrent=%d, repo_collision_policy=%s)",
+		agent.ID, *serverURL, host, *tool, len(repos), *maxConcurrent, policy)
 	if err := w.Run(ctx); err != nil {
 		log.Fatalf("%v", err)
 	}
@@ -105,7 +112,7 @@ func loadRepos(inline, file string) (map[string]string, error) {
 
 // register POSTs the worker's identity and capabilities and returns the agent
 // with its issued worker token.
-func register(serverURL, workerID, registerKey, tool string, repos map[string]string, gh bool, maxConcurrent int, github *ghinfo.Info) (store.Agent, error) {
+func register(serverURL, workerID, registerKey, tool string, repos map[string]string, gh bool, maxConcurrent int, github *ghinfo.Info, policy repopolicy.Policy) (store.Agent, error) {
 	host, _ := os.Hostname()
 	req := registerRequest{
 		Agent: store.Agent{
@@ -116,13 +123,14 @@ func register(serverURL, workerID, registerKey, tool string, repos map[string]st
 			Version: env("SATURNUS_WORKER_VERSION", "dev"),
 		},
 		Capabilities: store.WorkerCapabilities{
-			Repos:         repos,
-			Tool:          tool,
-			ToolVersion:   env("SATURNUS_REVIEW_TOOL_VERSION", ""),
-			GH:            gh,
-			ContextReset:  true,
-			GitHub:        github,
-			MaxConcurrent: maxConcurrent,
+			Repos:               repos,
+			Tool:                tool,
+			ToolVersion:         env("SATURNUS_REVIEW_TOOL_VERSION", ""),
+			GH:                  gh,
+			ContextReset:        true,
+			GitHub:              github,
+			MaxConcurrent:       maxConcurrent,
+			RepoCollisionPolicy: policy,
 		},
 		RegisterKey: registerKey,
 	}

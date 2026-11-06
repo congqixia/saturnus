@@ -134,7 +134,7 @@ func TestRemoteRetryReceivesFreshInlineReplies(t *testing.T) {
 	args, err := RenderCommand(payload.CommandTemplate, ToolArgs{
 		ReviewID: req.ID, SessionID: payload.SessionID, RetryNote: "Continue reviewing.", PriorFindings: payload.PriorFindings,
 	})
-	if err != nil || len(args) != 7 {
+	if err != nil || len(args) != 9 {
 		t.Fatalf("inline feedback broke command rendering: args=%v err=%v", args, err)
 	}
 	prompt := args[len(args)-1]
@@ -197,8 +197,12 @@ func TestLocalReviewReceivesInlineRepliesWithoutResultCallback(t *testing.T) {
 	}
 	tool := filepath.Join(t.TempDir(), "review-tool")
 	if err := os.WriteFile(tool, []byte(`#!/bin/sh
-if [ "$1 $2" = 'session list' ]; then
+if [ "$1" = --version ]; then
+  echo 1.19.0
+elif [ "$1 $2" = 'session list' ]; then
   echo '[]'
+elif [ "$1" = export ]; then
+  printf '{"info":{"id":"%s","title":"saturnus-review-rvw_inline","directory":"%s"}}\n' "$2" "$PWD"
 else
   for arg in "$@"; do printf '%s\n' "$arg"; done
 fi

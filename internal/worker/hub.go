@@ -123,6 +123,18 @@ func (h *Hub) InFlightCount(workerID string) int {
 	return len(h.inFlight[workerID])
 }
 
+// InFlightReviews snapshots dispatched review IDs, including reaction jobs and
+// jobs reported by a worker after reconnecting.
+func (h *Hub) InFlightReviews(workerID string) []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	ids := make([]string, 0, len(h.inFlight[workerID]))
+	for id := range h.inFlight[workerID] {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
 // SetInFlight replaces a worker's tracked in-flight set (used on hello after a
 // reconnect to reconcile ownership).
 func (h *Hub) SetInFlight(workerID string, reviewIDs []string) {

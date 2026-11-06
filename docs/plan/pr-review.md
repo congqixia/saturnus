@@ -463,6 +463,7 @@ requester is DM'd the task link so they can open it directly. Requires
 | SATURNUS_REVIEW_TOOL | opencode | executable |
 | SATURNUS_REVIEW_COMMAND_TEMPLATE | see above | command args template |
 | SATURNUS_REVIEW_MAX_CONCURRENT | 1 | worker count |
+| SATURNUS_REVIEW_REPO_COLLISION_POLICY | mutex | executor-local same-repo policy: `mutex` serializes reviews/retries/actions, `worktree` instructs the tool to use one detached worktree per review; see README for configuration and custom-template requirements |
 | SATURNUS_REVIEW_TIMEOUT | 15m | per-review timeout |
 | SATURNUS_REVIEW_CREATE_TASK | 0 | create Feishu task |
 | SATURNUS_REVIEW_TASK_DUE_HOURS | 24 | task due offset |

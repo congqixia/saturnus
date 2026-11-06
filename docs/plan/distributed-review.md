@@ -78,6 +78,20 @@ Server 在启动、注册或认证元数据更新时以及每小时检查一次�
   2. **session 亲和**（见 4.4）：retry/reaction 必须优先回到 `review_runs.session_id` 对应的原 worker；
   3. **负载均衡**：选 in-flight 少于 `max_concurrent` 的 worker。
 
+实际执行支持 worker 本地配置 `SATURNUS_REVIEW_REPO_COLLISION_POLICY`：默认
+`mutex`，同 worker 的相同 repo/checkout 任务（含 retry、reaction）互斥；
+`worktree` 则通过每次工具 prompt 要求该 review 使用独享 detached worktree。
+Worker 注册时通过 `capabilities.repo_collision_policy` 上报策略，调度器在
+mutex 下让碰撞任务保持 pending，worker 本地再用可取消锁兜底；worktree 下
+允许同 repo 不同 review 并行，但同 review 的会话仍串行。本地 fallback
+执行器使用 server 上同名变量，策略和 worker 独立。详见 README。
+
+Session 绑定从执行工具自身的 `--format json` stdout 事件读取根 `sessionID`，
+不再在执行结束后扫描最近 session 推断归属。续用前在执行 host 按明确 ID
+导出元数据，校验 root、review/context title 和 checkout；OpenCode 1.x 使用
+`export <id>` + `info.directory`，2.x（含 2.2.5）使用 `session export <id>` +
+`info.location.directory`。校验失败直接停止，保留历史并提示 reset。
+
 ### 4.3 WebSocket 控制协议
 
 ```

@@ -13,20 +13,22 @@ import (
 	"saturnus/internal/keylock"
 	"saturnus/internal/lark"
 	"saturnus/internal/repoconfig"
+	"saturnus/internal/repopolicy"
 	"saturnus/internal/reviewlog"
 	"saturnus/internal/store"
 )
 
 type Config struct {
-	Enabled         bool
-	AllowedUsers    []string
-	ReviewerOpenID  string
-	ReviewerChatID  string
-	ReplyInThread   bool
-	Repos           map[string]string
-	Tool            string
-	CommandTemplate string
-	MaxConcurrent   int
+	Enabled             bool
+	AllowedUsers        []string
+	ReviewerOpenID      string
+	ReviewerChatID      string
+	ReplyInThread       bool
+	Repos               map[string]string
+	Tool                string
+	CommandTemplate     string
+	MaxConcurrent       int
+	RepoCollisionPolicy repopolicy.Policy
 	// DisableLocalFallback keeps reviews pending when no remote worker is
 	// available, without removing checkout mappings shared with Tasks.
 	DisableLocalFallback bool
@@ -151,6 +153,7 @@ type job struct {
 }
 
 type Service struct {
+	repoGuard repopolicy.Guard
 	syncLocks keylock.Map
 	store     *store.Store
 	lark      larkClient
@@ -205,6 +208,9 @@ func (s *Service) repoServed(repo string) bool {
 }
 
 func New(st *store.Store, lk larkClient, cfg Config) *Service {
+	if policy, err := repopolicy.Parse(string(cfg.RepoCollisionPolicy)); err == nil {
+		cfg.RepoCollisionPolicy = policy
+	}
 	if cfg.Tool == "" {
 		cfg.Tool = "opencode"
 	}
@@ -1431,6 +1437,17 @@ func (s *Service) startLocal(id string) (store.ReviewRequest, store.ReviewRun, e
 }
 
 func (s *Service) process(id string) {
+	pending, err := s.store.GetReview(id)
+	if err != nil || pending.Status != "pending" {
+		return
+	}
+	dir, _ := s.repoDirFor(pending.Repo)
+	unlock, err := s.repoGuard.Lock(s.ctx, s.cfg.RepoCollisionPolicy, pending.Repo, dir, id)
+	if err != nil {
+		logf("lock local review %s: %v", id, err)
+		return
+	}
+	defer unlock()
 	req, run, err := s.startLocal(id)
 	if err != nil {
 		logf("start local review %s: %v", id, err)
@@ -1503,21 +1520,22 @@ func (s *Service) process(id string) {
 	}
 	resultAPIURL := s.resultCallbackURL(req.ID, run.ID)
 	args, err := RenderCommand(s.cfg.CommandTemplate, ToolArgs{
-		Repo:          req.Repo,
-		PRNumber:      req.PRNumber,
-		PRURL:         req.PRURL,
-		Title:         req.Title,
-		BaseBranch:    req.BaseBranch,
-		Worktree:      repoRoot,
-		Guide:         guide,
-		ReviewID:      req.ID,
-		HeadCommit:    req.HeadCommit,
-		SessionID:     req.SessionID,
-		SessionTitle:  SessionTitle(req.ID, contextID),
-		RetryNote:     retryNote,
-		ResultAPIURL:  resultAPIURL,
-		ResultToken:   s.cfg.ResultToken,
-		PriorFindings: priorFindings,
+		RepoCollisionPolicy: s.cfg.RepoCollisionPolicy,
+		Repo:                req.Repo,
+		PRNumber:            req.PRNumber,
+		PRURL:               req.PRURL,
+		Title:               req.Title,
+		BaseBranch:          req.BaseBranch,
+		Worktree:            repoRoot,
+		Guide:               guide,
+		ReviewID:            req.ID,
+		HeadCommit:          req.HeadCommit,
+		SessionID:           req.SessionID,
+		SessionTitle:        SessionTitle(req.ID, contextID),
+		RetryNote:           retryNote,
+		ResultAPIURL:        resultAPIURL,
+		ResultToken:         s.cfg.ResultToken,
+		PriorFindings:       priorFindings,
 	})
 	if err != nil {
 		s.finish(&req, "failed", "", "render command: "+err.Error())
@@ -1564,8 +1582,9 @@ func (s *Service) process(id string) {
 	}
 
 	reviewlog.Event{Name: "tool_started", Component: "server", Kind: "review", ReviewID: req.ID, RunID: run.ID, WorkerID: "local", Repo: req.Repo, PRNumber: req.PRNumber, Status: "reviewing", Tool: s.cfg.Tool, LogPath: logFile.Name()}.Log()
-	output, runErr := Run(ctx, s.cfg.Tool, args, repoRoot, sink)
-	if sessionID := s.captureSessionID(repoRoot, req.ID); sessionID != "" {
+	result, runErr := RunWithSession(ctx, s.cfg.Tool, args, repoRoot, SessionIdentity{ReviewID: req.ID, ContextID: contextID, SessionID: req.SessionID}, sink)
+	output := result.Output
+	if sessionID := result.SessionID; sessionID != "" {
 		req.SessionID = sessionID
 		if err := s.store.SetReviewSession(req.ID, sessionID); err != nil {
 			logf("store review session review_id=%s: %v", req.ID, err)
@@ -2093,6 +2112,18 @@ func (s *Service) processReaction(id string) {
 		s.notifyReaction(reac)
 		return
 	}
+	dir, _ := s.repoDirFor(req.Repo)
+	unlock, err := s.repoGuard.Lock(s.ctx, s.cfg.RepoCollisionPolicy, req.Repo, dir, req.ID)
+	if err != nil {
+		logf("lock local reaction %s: %v", id, err)
+		return
+	}
+	defer unlock()
+	// A duplicate local queue entry may have completed while waiting.
+	reac, err = s.store.GetReaction(id)
+	if err != nil || reac.Status != "pending" {
+		return
+	}
 	reac.Status = "running"
 	reac.WorkerID = ""
 	if _, err := s.store.UpdateReaction(reac); err != nil {
@@ -2144,7 +2175,7 @@ func (s *Service) processReaction(id string) {
 		s.notifyReaction(reac)
 		return
 	}
-	args := []string{"run", "--auto", "--session", sessionID, "--title", SessionTitle(req.ID, contextID), reac.Instruction}
+	args := []string{"run", "--auto", "--session", sessionID, "--format", "json", "--title", SessionTitle(req.ID, contextID), IsolationPrompt(s.cfg.RepoCollisionPolicy, repoRoot, req.ID) + reac.Instruction}
 
 	var mu sync.Mutex
 	var progress string
@@ -2177,7 +2208,8 @@ func (s *Service) processReaction(id string) {
 	}
 
 	reviewlog.Event{Name: "tool_started", Component: "server", Kind: "reaction", ReviewID: req.ID, ReactionID: reac.ID, WorkerID: "local", Repo: req.Repo, PRNumber: req.PRNumber, Status: "running", Tool: s.cfg.Tool, LogPath: logFile.Name()}.Log()
-	output, runErr := Run(ctx, s.cfg.Tool, args, repoRoot, sink)
+	result, runErr := RunWithSession(ctx, s.cfg.Tool, args, repoRoot, SessionIdentity{ReviewID: req.ID, ContextID: contextID, SessionID: sessionID}, sink)
+	output := result.Output
 	clean := stripANSI(output)
 	if runErr != nil {
 		s.finishReaction(&reac, "failed", clean, runErr.Error())

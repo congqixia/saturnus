@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"saturnus/internal/ghinfo"
+	"saturnus/internal/repopolicy"
 	"saturnus/internal/store"
 )
 
@@ -42,12 +43,15 @@ func TestFileReposRegisteredAsWorkerCapabilities(t *testing.T) {
 	defer srv.Close()
 	expiry := time.Now().UTC().Add(6 * 24 * time.Hour)
 	info := &ghinfo.Info{Version: "2.86.0", Host: ghinfo.Host, TokenExpiresAt: &expiry, ExpiryStatus: "known"}
-	agent, err := register(srv.URL, "worker", "key", "opencode", repos, true, 2, info)
+	agent, err := register(srv.URL, "worker", "key", "opencode", repos, true, 2, info, repopolicy.Worktree)
 	if err != nil || agent.WorkerToken != "token" {
 		t.Fatalf("agent=%+v err=%v", agent, err)
 	}
 	select {
 	case req := <-requests:
+		if req.Capabilities.RepoCollisionPolicy != repopolicy.Worktree {
+			t.Fatalf("collision policy missing from registration: %+v", req.Capabilities)
+		}
 		if req.Capabilities.GitHub == nil || req.Capabilities.GitHub.Version != "2.86.0" || !req.Capabilities.GitHub.TokenExpiresAt.Equal(expiry) {
 			t.Fatalf("GitHub metadata missing from registration: %+v", req.Capabilities)
 		}

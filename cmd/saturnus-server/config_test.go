@@ -83,3 +83,15 @@ func TestRunRejectsRepoConfigBeforeOpeningStore(t *testing.T) {
 		})
 	}
 }
+
+func TestRunRejectsInvalidReviewCollisionPolicy(t *testing.T) {
+	t.Setenv("SATURNUS_REVIEW_REPO_COLLISION_POLICY", "unsafe")
+	dbPath := filepath.Join(t.TempDir(), "saturnus.db")
+	err := run(context.Background(), "127.0.0.1:0", dbPath, "")
+	if err == nil || !strings.Contains(err.Error(), "SATURNUS_REVIEW_REPO_COLLISION_POLICY") {
+		t.Fatalf("invalid policy was accepted: %v", err)
+	}
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatalf("store opened before policy validation: %v", err)
+	}
+}

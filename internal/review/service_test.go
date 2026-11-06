@@ -425,8 +425,8 @@ EOF
 	if got := svc.captureSessionID(repoDir, "rvw_x"); got != "ses_new" {
 		t.Fatalf("title match = %q, want ses_new", got)
 	}
-	if got := svc.captureSessionID(repoDir, "rvw_z"); got != "ses_new" {
-		t.Fatalf("fallback by dir recency = %q, want ses_new", got)
+	if got := svc.captureSessionID(repoDir, "rvw_z"); got != "" {
+		t.Fatalf("missing review must not borrow another review's session: %q", got)
 	}
 }
 
@@ -1349,10 +1349,10 @@ func TestParseRepoMap(t *testing.T) {
 // reactionToolScript writes a tool stub that answers "session list" with an
 // empty session list (so session capture finds nothing) and otherwise echoes
 // its argv one-per-line (so tests can assert the resume args and instruction).
-func reactionToolScript(t *testing.T) string {
+func reactionToolScript(t *testing.T, reviewID string) string {
 	t.Helper()
 	script := filepath.Join(t.TempDir(), "tool.sh")
-	content := "#!/bin/sh\ncase \"$1 $2\" in\n\"session list\") printf '%s\\n' '[]' ;;\n*) printf '%s\\n' \"$@\" ;;\nesac\n"
+	content := "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 1.19.0; exit; fi\nif [ \"$1\" = export ]; then printf '{\"info\":{\"id\":\"%s\",\"title\":\"saturnus-review-" + reviewID + "\",\"directory\":\"%s\"}}\\n' \"$2\" \"$PWD\"; exit; fi\ncase \"$1 $2\" in\n\"session list\") printf '%s\\n' '[]' ;;\n*) printf '%s\\n' \"$@\" ;;\nesac\n"
 	if err := os.WriteFile(script, []byte(content), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -1375,7 +1375,7 @@ func TestActRejectsInvalid(t *testing.T) {
 		AllowedUsers:   []string{"ou_me"},
 		ReviewerOpenID: "ou_r",
 		Repos:          map[string]string{"a/b": repoDir},
-		Tool:           reactionToolScript(t),
+		Tool:           reactionToolScript(t, ""),
 	})
 
 	// Disabled service.
@@ -1440,7 +1440,7 @@ func TestProcessReactionRunsToolResumingSession(t *testing.T) {
 		AllowedUsers:   []string{"ou_me"},
 		ReviewerOpenID: "ou_r",
 		Repos:          map[string]string{"a/b": repoDir},
-		Tool:           reactionToolScript(t),
+		Tool:           reactionToolScript(t, "rvw_a"),
 	})
 	thread, err := st.GetOrCreateReviewThread("oc_c", "om_1", "", nil)
 	if err != nil {
@@ -1498,7 +1498,9 @@ func TestProcessReactionFallsBackToCapturedSession(t *testing.T) {
 	script := filepath.Join(t.TempDir(), "tool.sh")
 	content := `#!/bin/sh
 case "$1 $2" in
+"--version ") echo 1.19.0 ;;
 "session list") printf '%s\n' '[{"id":"ses_new","title":"saturnus-review-rvw_cap","directory":"` + repoDir + `","updated":2000}]' ;;
+"export ses_new") printf '{"info":{"id":"ses_new","title":"saturnus-review-rvw_cap","directory":"%s"}}\n' "$PWD" ;;
 *) printf '%s\n' "$@" ;;
 esac
 `
@@ -1559,7 +1561,7 @@ func TestProcessReactionNotifiesReviewerChat(t *testing.T) {
 		AllowedUsers:   []string{"ou_me"},
 		ReviewerOpenID: "ou_r",
 		Repos:          map[string]string{"a/b": repoDir},
-		Tool:           reactionToolScript(t),
+		Tool:           reactionToolScript(t, "rvw_ntf"),
 	})
 	thread, err := st.GetOrCreateReviewThread("oc_c", "om_1", "", nil)
 	if err != nil {
@@ -1605,7 +1607,7 @@ func TestProcessReactionFailsWithoutSession(t *testing.T) {
 		Enabled:      true,
 		AllowedUsers: []string{"ou_me"},
 		Repos:        map[string]string{"a/b": repoDir},
-		Tool:         reactionToolScript(t),
+		Tool:         reactionToolScript(t, ""),
 	})
 	thread, err := st.GetOrCreateReviewThread("oc_c", "om_1", "", nil)
 	if err != nil {

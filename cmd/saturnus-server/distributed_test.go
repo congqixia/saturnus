@@ -66,19 +66,22 @@ func TestDistributedReviewEndToEnd(t *testing.T) {
 	tool := filepath.Join(t.TempDir(), "fake-review-tool")
 	script := `#!/bin/bash
 state="` + filepath.Join(filepath.Dir(tool), "sessions.json") + `"
+if [ "$1" = --version ]; then echo 1.19.0; exit 0; fi
 if [ "$1 $2" = "session list" ]; then
   if [ -f "$state" ]; then cat "$state"; else printf '[]\n'; fi
   exit 0
 fi
+if [ "$1" = export ]; then cat "$state.info"; exit 0; fi
 title=""
 previous=""
 for arg in "$@"; do
   if [ "$previous" = "--title" ]; then title="$arg"; fi
   previous="$arg"
 done
-case "$title" in
-  *-ctx_*) printf '[{"id":"ses-reset","title":"%s","directory":"%s","updated":1}]\n' "$title" "$PWD" > "$state" ;;
-esac
+session=ses_remote-1
+case "$title" in *-ctx_*) session=ses-reset ;; esac
+printf '{"info":{"id":"%s","title":"%s","directory":"%s"}}\n' "$session" "$title" "$PWD" > "$state.info"
+printf '{"type":"step_start","sessionID":"%s"}\n' "$session"
 url=$(printf '%s\n' "$@" | grep -oE 'https?://[^ ]*/api/reviews/[^ ]*/result[^ ]*' | head -n1)
 echo "FAKE-TOOL ARGS: $*"
 echo "REVIEW SUMMARY:"

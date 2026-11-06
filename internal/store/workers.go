@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"saturnus/internal/ghinfo"
+	"saturnus/internal/repopolicy"
 )
 
 // RoleReviewWorker marks an agent as a remote review executor.
@@ -19,13 +20,14 @@ const RoleReviewWorker = "review-worker"
 // runs, whether gh is available, and how many jobs it runs concurrently. It is
 // stored JSON-encoded on agents.capabilities.
 type WorkerCapabilities struct {
-	Repos         map[string]string `json:"repos"`
-	Tool          string            `json:"tool"`
-	ToolVersion   string            `json:"tool_version"`
-	GH            bool              `json:"gh"`
-	ContextReset  bool              `json:"context_reset,omitempty"`
-	GitHub        *ghinfo.Info      `json:"github,omitempty"`
-	MaxConcurrent int               `json:"max_concurrent"`
+	Repos               map[string]string `json:"repos"`
+	Tool                string            `json:"tool"`
+	ToolVersion         string            `json:"tool_version"`
+	GH                  bool              `json:"gh"`
+	ContextReset        bool              `json:"context_reset,omitempty"`
+	GitHub              *ghinfo.Info      `json:"github,omitempty"`
+	MaxConcurrent       int               `json:"max_concurrent"`
+	RepoCollisionPolicy repopolicy.Policy `json:"repo_collision_policy,omitempty"`
 }
 
 // UpdateWorkerGitHub refreshes metadata from an authenticated control channel.
